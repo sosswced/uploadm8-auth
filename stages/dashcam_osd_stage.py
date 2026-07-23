@@ -43,6 +43,9 @@ Env:
       even when ``DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY=true`` (evidence-first ops; higher GCV cost).
   ``DASHCAM_OSD_BACKFILL_TELEMETRY`` — ``true`` to backfill ctx.telemetry_data
                                        when no .map file (default ``true``).
+  ``DASHCAM_OSD_MAX_PLAUSIBLE_MPH`` — reject OCR speeds above this (default ``200``).
+  ``DASHCAM_OSD_SPEED_SPIKE_DELTA_MPH`` — drop singleton spikes this many mph
+      above the median (default ``45``).
 """
 
 from __future__ import annotations
@@ -134,6 +137,18 @@ _LATLON_RE = re.compile(
 )
 
 _SPEED_RE = re.compile(r"\b(\d{1,3})\s*(MPH|KMH|KPH|KM/H)\b", re.IGNORECASE)
+
+# Roadside / signage context — never treat these as vehicle HUD speed.
+_SPEED_LIMIT_CONTEXT_RE = re.compile(
+    r"(?:speed\s*limit|limit\s*(?:is|:)?\s*\d|maximum\s*speed|max\.?\s*speed|"
+    r"\bzone\s*\d{2,3}\b|\bmin(?:imum)?\s*speed\b|\badvised\s*speed\b|"
+    r"\bschool\s*zone\b|\bwork\s*zone\b)",
+    re.IGNORECASE,
+)
+
+# Absolute sanity bounds for passenger/dashcam HUD (mph after unit conversion).
+_SPEED_MPH_MIN = 0.0
+_SPEED_MPH_MAX_DEFAULT = 200.0
 
 # Heading: cardinal letters (N/NE/E/SE/S/SW/W/NW) or numeric bearing.
 _HEADING_RE = re.compile(
@@ -231,11 +246,11 @@ def _parse_latlon(line: str) -> Tuple[Optional[float], Optional[float]]:
     return lat, lon
 
 
-def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
-    """Return (mph, unit_string). KPH is converted to MPH for caller."""
-    m = _SPEED_RE.search(line)
-    if not m:
-        return None, None
+def _max_plausible_mph() -> float:
+    return _env_float("DASHCAM_OSD_MAX_PLAUSIBLE_MPH", _SPEED_MPH_MAX_DEFAULT, 80.0, 300.0)
+
+
+def _speed_match_to_mph(m: re.Match) -> Tuple[Optional[float], Optional[str]]:
     try:
         v = float(m.group(1))
     except ValueError:
@@ -246,6 +261,65 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     if unit in ("KMH", "KPH"):
         return v * 0.621371, "kph"
     return None, None
+
+
+def _latlon_span(line: str) -> Optional[Tuple[int, int]]:
+    m = _LATLON_RE.search(line)
+    if not m:
+        return None
+    return m.start(), m.end()
+
+
+def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
+    """Return (mph, unit_string). KPH is converted to MPH for caller.
+
+    Prefers the HUD speed token that follows a lat/lon pair (Escort/M8 order:
+    date → time → GPS → speed → driver). Rejects roadside speed-limit copy and
+    values outside a plausible dashcam range so OCR of signs / noise cannot
+    become the published peak.
+    """
+    if not line or _SPEED_LIMIT_CONTEXT_RE.search(line):
+        return None, None
+
+    matches = list(_SPEED_RE.finditer(line))
+    if not matches:
+        return None, None
+
+    gps_span = _latlon_span(line)
+    ranked: List[Tuple[int, float, str, re.Match]] = []
+    hi = _max_plausible_mph()
+    for m in matches:
+        mph, unit = _speed_match_to_mph(m)
+        if mph is None or unit is None:
+            continue
+        if not (_SPEED_MPH_MIN <= mph <= hi):
+            continue
+        # Prefer tokens after GPS (true HUD). Deprioritize tokens before GPS
+        # (often signage OCR that landed on the same strip/frame text blob).
+        if gps_span is not None:
+            priority = 0 if m.start() >= gps_span[1] else 2
+        else:
+            priority = 1
+        ranked.append((priority, mph, unit, m))
+
+    if not ranked:
+        return None, None
+    ranked.sort(key=lambda row: (row[0], -row[3].start()))
+    _prio, mph, unit, _m = ranked[0]
+    return mph, unit
+
+
+def _line_has_hud_anchor(line: str, *, lat: Optional[float], date: Optional[str], time: Optional[str]) -> bool:
+    """True when the OCR line looks like a dashcam HUD, not a roadside sign."""
+    if lat is not None:
+        return True
+    if date and time:
+        return True
+    # Escort-style compact line without a successful lat parse still often has
+    # a degree-marked coordinate token next to the speed.
+    if _LATLON_RE.search(line) or re.search(r"\d+\.\d{3,7}\s*" + _DEG, line):
+        return True
+    return False
 
 
 def _parse_heading(line: str) -> Optional[str]:
@@ -278,8 +352,19 @@ def _parse_driver(line: str) -> Optional[str]:
     return name
 
 
-def parse_osd_line(raw_text: str, *, t_s: Optional[float] = None) -> Dict[str, Any]:
-    """Parse one OCR'd HUD strip into a structured record."""
+def parse_osd_line(
+    raw_text: str,
+    *,
+    t_s: Optional[float] = None,
+    require_hud_anchor_for_speed: bool = False,
+) -> Dict[str, Any]:
+    """Parse one OCR'd HUD strip into a structured record.
+
+    When ``require_hud_anchor_for_speed`` is True (Vision full-frame OCR),
+    speed is kept only if the same line also has GPS/date+time HUD anchors.
+    Bottom-strip OCR already crops to the HUD band, so anchoring is optional
+    there — still recorded for aggregation quality.
+    """
     line = _scrub(_norm_minus(raw_text or "").replace("\n", " "))
     if not line:
         return {
@@ -291,21 +376,28 @@ def parse_osd_line(raw_text: str, *, t_s: Optional[float] = None) -> Dict[str, A
             "lon": None,
             "speed_mph": None,
             "speed_unit": None,
+            "speed_hud_anchored": False,
             "heading": None,
             "driver": None,
             "has_signal": False,
         }
     lat, lon = _parse_latlon(line)
+    date = _parse_date(line)
+    time = _parse_time(line)
     speed_mph, unit = _parse_speed(line)
+    hud_anchored = _line_has_hud_anchor(line, lat=lat, date=date, time=time)
+    if speed_mph is not None and require_hud_anchor_for_speed and not hud_anchored:
+        speed_mph, unit = None, None
     rec: Dict[str, Any] = {
         "t_s": t_s,
         "raw": line[:300],
-        "date": _parse_date(line),
-        "time": _parse_time(line),
+        "date": date,
+        "time": time,
         "lat": lat,
         "lon": lon,
         "speed_mph": round(speed_mph, 1) if speed_mph is not None else None,
         "speed_unit": unit,
+        "speed_hud_anchored": bool(speed_mph is not None and hud_anchored),
         "heading": _parse_heading(line),
         "driver": _parse_driver(line),
     }
@@ -460,6 +552,148 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     return r * 2 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
 
 
+def _gps_implied_peak_mph(samples: List[Dict[str, Any]]) -> Optional[float]:
+    """Peak ground speed implied by successive GPS fixes (miles / hours)."""
+    pts: List[Tuple[float, float, float]] = []
+    for s in samples:
+        la, lo, t = s.get("lat"), s.get("lon"), s.get("t_s")
+        if la is None or lo is None or t is None:
+            continue
+        try:
+            pts.append((float(la), float(lo), float(t)))
+        except (TypeError, ValueError):
+            continue
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda p: p[2])
+    peak = 0.0
+    for a, b in zip(pts, pts[1:]):
+        dt = b[2] - a[2]
+        if dt < 0.4:
+            continue
+        if dt > 30.0:
+            # Large gaps are unreliable for instantaneous speed.
+            continue
+        dist = _haversine_miles(a[0], a[1], b[0], b[1])
+        mph = dist / (dt / 3600.0)
+        if mph > peak:
+            peak = mph
+    return round(peak, 1) if peak > 0 else None
+
+
+def _select_trusted_speeds(
+    with_signal: List[Dict[str, Any]],
+) -> Tuple[List[float], List[Dict[str, Any]], Dict[str, Any]]:
+    """Pick speeds safe to publish; drop OCR outliers / signage ghosts.
+
+    Rules (in order):
+      1. Prefer HUD-anchored samples when any exist.
+      2. Drop values above plausible max.
+      3. Drop singleton spikes far above the median of the trusted set.
+      4. Require peak confirmation (2+ samples near peak) unless GPS motion
+         corroborates a similar peak.
+    """
+    meta: Dict[str, Any] = {
+        "speed_samples_raw": 0,
+        "speed_samples_trusted": 0,
+        "speed_rejected_unanchored": 0,
+        "speed_rejected_outlier": 0,
+        "speed_rejected_unconfirmed_peak": 0,
+        "gps_implied_peak_mph": None,
+    }
+    candidates = [s for s in with_signal if s.get("speed_mph") is not None]
+    meta["speed_samples_raw"] = len(candidates)
+    if not candidates:
+        return [], [], meta
+
+    anchored = [s for s in candidates if s.get("speed_hud_anchored")]
+    pool = anchored if anchored else candidates
+    if anchored and len(anchored) < len(candidates):
+        meta["speed_rejected_unanchored"] = len(candidates) - len(anchored)
+
+    hi = _max_plausible_mph()
+    pool = [
+        s for s in pool
+        if _SPEED_MPH_MIN <= float(s["speed_mph"]) <= hi
+    ]
+    if not pool:
+        return [], [], meta
+
+    speeds = sorted(float(s["speed_mph"]) for s in pool)
+    mid = speeds[len(speeds) // 2]
+    # Spike gate: a lone OCR digitation error (e.g. 146 vs 46) sits far above
+    # the median; keep values within a generous but finite band.
+    spike_delta = _env_float("DASHCAM_OSD_SPEED_SPIKE_DELTA_MPH", 45.0, 20.0, 100.0)
+    filtered: List[Dict[str, Any]] = []
+    for s in pool:
+        v = float(s["speed_mph"])
+        if len(speeds) >= 3 and v > mid + spike_delta:
+            meta["speed_rejected_outlier"] += 1
+            continue
+        filtered.append(s)
+    if not filtered:
+        # Fall back to the median sample rather than publishing nothing / a spike.
+        nearest = min(pool, key=lambda s: abs(float(s["speed_mph"]) - mid))
+        filtered = [nearest]
+
+    gps_peak = _gps_implied_peak_mph(with_signal)
+    meta["gps_implied_peak_mph"] = gps_peak
+
+    vals = [float(s["speed_mph"]) for s in filtered]
+    peak = max(vals)
+    mid_trusted = sorted(vals)[len(vals) // 2]
+    near = [v for v in vals if v >= peak - 8.0]
+    confirmed = len(near) >= 2
+    # Normal clip max (not a wild OCR tip): peak sits near the distribution.
+    if not confirmed and len(vals) >= 2 and peak <= mid_trusted + 20.0:
+        confirmed = True
+    if not confirmed and gps_peak is not None and peak <= gps_peak * 1.35 + 8.0:
+        confirmed = True
+    if not confirmed and len(vals) == 1 and gps_peak is None:
+        # Single read is publishable only when the same OCR line carried HUD
+        # anchors (GPS/date+time). Bare "65 MPH" signage stays rejected.
+        confirmed = bool(filtered[0].get("speed_hud_anchored"))
+    if not confirmed and len(near) < 2:
+        # Demote unconfirmed peak to the next-best confirmed cluster, or drop
+        # entirely when the only reads are uncorroborated (signage / OCR noise).
+        meta["speed_rejected_unconfirmed_peak"] += 1
+        demoted = [v for v in vals if v < peak - 0.01]
+        if demoted:
+            peak2 = max(demoted)
+            filtered = [s for s in filtered if float(s["speed_mph"]) <= peak2 + 0.01]
+            vals = [float(s["speed_mph"]) for s in filtered]
+        else:
+            filtered = []
+            vals = []
+
+    meta["speed_samples_trusted"] = len(filtered)
+    return vals, filtered, meta
+
+
+def _speed_series_from_trusted(speed_samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compact time-series of trusted HUD speeds for timeline / caption prompts."""
+    series: List[Dict[str, Any]] = []
+    for s in speed_samples:
+        try:
+            mph = float(s.get("speed_mph"))
+        except (TypeError, ValueError):
+            continue
+        if mph < 0:
+            continue
+        try:
+            t_s = float(s.get("t_s") if s.get("t_s") is not None else 0.0)
+        except (TypeError, ValueError):
+            t_s = 0.0
+        series.append({
+            "t_s": round(t_s, 3),
+            "mph": round(mph, 1),
+            "speed_mph": round(mph, 1),
+            "hud_anchored": bool(s.get("speed_hud_anchored")),
+        })
+    series.sort(key=lambda row: row["t_s"])
+    return series
+
+
 def _aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Reduce per-frame parses to a clip-level summary."""
     with_signal = [s for s in samples if s.get("has_signal")]
@@ -479,18 +713,37 @@ def _aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 return v
         return None
 
-    speeds = [float(s["speed_mph"]) for s in with_signal if s.get("speed_mph") is not None]
+    speeds, speed_samples, speed_meta = _select_trusted_speeds(with_signal)
     max_speed = max(speeds) if speeds else 0.0
     max_at_s: Optional[float] = None
-    for s in with_signal:
+    for s in speed_samples:
         if s.get("speed_mph") is not None and float(s["speed_mph"]) >= max_speed - 0.01:
             max_at_s = s.get("t_s")
             break
     avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else 0.0
 
     # Speed unit: report what the dashcam itself displayed (we always store mph)
-    units = [s.get("speed_unit") for s in with_signal if s.get("speed_unit")]
+    units = [s.get("speed_unit") for s in speed_samples if s.get("speed_unit")]
+    if not units:
+        units = [s.get("speed_unit") for s in with_signal if s.get("speed_unit")]
     unit_detected = max(set(units), key=units.count) if units else None
+
+    # Per-fix speed on the path: use trusted value when the frame was kept,
+    # else nearest trusted sample by time (never re-inject rejected spikes).
+    trusted_by_id = {id(s): float(s["speed_mph"]) for s in speed_samples}
+    trusted_timeline = [
+        (float(s.get("t_s") or 0.0), float(s["speed_mph"]))
+        for s in speed_samples
+        if s.get("speed_mph") is not None
+    ]
+
+    def _trusted_speed_for(sample: Dict[str, Any]) -> float:
+        if id(sample) in trusted_by_id:
+            return trusted_by_id[id(sample)]
+        if not trusted_timeline:
+            return 0.0
+        t = float(sample.get("t_s") or 0.0)
+        return min(trusted_timeline, key=lambda row: abs(row[0] - t))[1]
 
     gps_path: List[List[float]] = []
     last_lat: Optional[float] = None
@@ -503,9 +756,12 @@ def _aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         if last_lat is not None and last_lon is not None:
             if _haversine_miles(last_lat, last_lon, la, lo) < 0.005:
                 continue
-        gps_path.append([round(la, 6), round(lo, 6),
-                         round(float(s.get("speed_mph") or 0.0), 1),
-                         float(s.get("t_s") or 0.0)])
+        gps_path.append([
+            round(la, 6),
+            round(lo, 6),
+            round(_trusted_speed_for(s), 1),
+            float(s.get("t_s") or 0.0),
+        ])
         last_lat, last_lon = la, lo
 
     drivers = [s.get("driver") for s in with_signal if s.get("driver")]
@@ -532,8 +788,12 @@ def _aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "max_speed_mph": round(max_speed, 1),
         "max_speed_at_s": max_at_s,
+        # Alias used by timeline builder (historical key name).
+        "max_speed_t_s": max_at_s,
         "avg_speed_mph": avg_speed,
         "speed_unit_detected": unit_detected,
+        "speed_quality": speed_meta,
+        "speed_series": _speed_series_from_trusted(speed_samples),
         "gps_path": gps_path,
         "driver_name": driver_name,
         "engine": "gcv",
@@ -667,7 +927,11 @@ def _vision_osd_context(ctx: JobContext) -> Dict[str, Any]:
                 t_s = float(idx)
         else:
             t_s = float(idx)
-        samples.append(parse_osd_line(chunk, t_s=t_s))
+        # Full-frame Vision OCR includes road signs; require HUD anchors so
+        # "SPEED LIMIT 65 MPH" never becomes the published peak.
+        samples.append(
+            parse_osd_line(chunk, t_s=t_s, require_hud_anchor_for_speed=True)
+        )
 
     osd = _aggregate(samples)
     if osd.get("gps_path"):
@@ -675,9 +939,14 @@ def _vision_osd_context(ctx: JobContext) -> Dict[str, Any]:
         osd["source"] = "vision_stage"
         osd["vision_ocr_chars"] = len(ocr)
         return osd
-    # Speed-only path: Vision saw MPH/KMH tokens but no parseable GPS fixes.
+    # Speed-only path: Vision saw MPH/KMH on HUD-anchored lines but no GPS.
+    # Require at least one hud-anchored speed sample (already enforced above).
     peak = float(osd.get("max_speed_mph") or 0)
-    if peak > 0 or any(s.get("speed_mph") for s in osd.get("samples") or []):
+    anchored_speeds = [
+        s for s in (osd.get("samples") or [])
+        if s.get("speed_mph") is not None and s.get("speed_hud_anchored")
+    ]
+    if peak > 0 and anchored_speeds:
         osd["engine"] = "vision_gcv_ocr"
         osd["source"] = "vision_stage_speed_only"
         osd["vision_ocr_chars"] = len(ocr)
@@ -706,13 +975,19 @@ async def backfill_telemetry_from_vision_osd(ctx: JobContext, *, enrich_geo: boo
         cur = dict(cur)
         prev_peak = float(cur.get("max_speed_mph") or 0)
         od_peak = float(osd.get("max_speed_mph") or 0)
-        if od_peak > prev_peak:
+        # Vision speed-only merge: fill empty peaks, or replace only when the
+        # Vision peak agrees with an existing read (within 8 mph). Never let a
+        # higher uncorroborated OCR value overwrite a lower trusted peak.
+        if prev_peak <= 0 and od_peak > 0:
             cur["max_speed_mph"] = od_peak
+        elif od_peak > 0 and prev_peak > 0 and abs(od_peak - prev_peak) <= 8.0:
+            cur["max_speed_mph"] = max(prev_peak, od_peak)
         cur["vision_osd_speed_fallback"] = osd
         ctx.dashcam_osd_context = cur
         logger.info(
-            "[dashcam_osd] merged Vision OCR peak speed (no GPS path): %.1f mph",
-            od_peak,
+            "[dashcam_osd] merged Vision OCR peak speed (no GPS path): %.1f mph (prev=%.1f)",
+            float(cur.get("max_speed_mph") or 0),
+            prev_peak,
         )
         return True
     if not did:
@@ -920,9 +1195,18 @@ async def run_dashcam_osd_stage(ctx: JobContext) -> JobContext:
             try:
                 v_peak = float(vision_osd.get("max_speed_mph") or 0.0)
                 s_peak = float(osd.get("max_speed_mph") or 0.0)
-                if v_peak > s_peak:
+                # Only adopt Vision peak when strip OCR had no trusted speed,
+                # or Vision peak is within a small band of strip peak (agreeing
+                # reads). Never inflate strip peak with a lone higher OCR hit.
+                adopt_vision_peak = False
+                if s_peak <= 0 and v_peak > 0:
+                    adopt_vision_peak = True
+                elif v_peak > 0 and abs(v_peak - s_peak) <= 8.0 and v_peak > s_peak:
+                    adopt_vision_peak = True
+                if adopt_vision_peak:
                     osd["max_speed_mph"] = vision_osd.get("max_speed_mph")
                     osd["max_speed_at_s"] = vision_osd.get("max_speed_at_s")
+                    osd["avg_speed_mph"] = vision_osd.get("avg_speed_mph", osd.get("avg_speed_mph"))
             except (TypeError, ValueError):
                 pass
             if not osd.get("driver_name") and vision_osd.get("driver_name"):
@@ -975,4 +1259,5 @@ __all__ = [
     "DASHCAM_OSD_STAGE_ENABLED",
     "parse_osd_line",
     "run_dashcam_osd_stage",
+    "backfill_telemetry_from_vision_osd",
 ]

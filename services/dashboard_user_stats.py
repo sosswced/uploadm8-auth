@@ -42,6 +42,11 @@ _QUEUE_VIEW_SQL_LITERAL = "(" + ", ".join(f"'{s}'" for s in QUEUE_VIEW_STATUSES)
 logger = logging.getLogger(__name__)
 
 
+def _dashboard_stats_uid(user: Mapping[str, Any]) -> str:
+    """Count uploads/accounts against the billing owner (same scope as shell uploads list)."""
+    return str(user.get("billing_user_id") or user["id"])
+
+
 def _engagement_scope_from_rollup(cr: Mapping[str, Any]) -> str:
     """Honest scope label — never claim all_time for provisional/fallback KPIs."""
     rule = str((cr or {}).get("rollup_rule") or "")
@@ -278,7 +283,7 @@ async def build_dashboard_stats_payload(
     wallet: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Single-connection path (legacy callers). Prefer ``dashboard_stats_for_user`` for production."""
-    uid = user["id"]
+    uid = _dashboard_stats_uid(user)
     stats = await conn.fetchrow(
         f"""
             SELECT COUNT(*)::int AS total,
@@ -430,7 +435,7 @@ async def _dashboard_stats_on_conn(
     When ``pool`` is provided, the heavy rollup uses a separate checkout + timeout
     so cancellation cannot poison ``conn``.
     """
-    uid = user["id"]
+    uid = _dashboard_stats_uid(user)
     win_start, win_end = engagement_time_window_for_analytics_range("all", now=_now_utc())
 
     async def q_stats(c: Any) -> Any:
@@ -701,10 +706,17 @@ async def fetch_dashboard_stats_for_user_id(
 
     ``light=True`` skips canonical engagement (quota/counts only) for fast first paint.
     Full path runs rollup on a separate pool checkout with timeout.
+
+    Attaches workspace billing context so monthly quota counts the same uploads as
+    ``GET /api/shell/bootstrap`` / ``GET /api/uploads`` (owner ``billing_user_id``).
     """
+    from core.deps import _attach_workspace_context
+
     async with pool.acquire() as conn:
         user = await require_verified_user_on_conn(conn, user_id)
-        wallet = await get_wallet(conn, user_id)
+        user = await _attach_workspace_context(conn, user, None)
+        bill_id = _dashboard_stats_uid(user)
+        wallet = await get_wallet(conn, bill_id)
         plan = get_plan(user.get("subscription_tier", "free"))
         return await _dashboard_stats_on_conn(
             conn, user, plan, wallet, light=light, pool=pool

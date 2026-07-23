@@ -108,27 +108,34 @@ def _derive_pace(ctx: JobContext) -> str:
 
 def map_ui_caption_style_for_strategy(style: str) -> str:
     """
-    Map settings-page captionStyle (story | punchy | factual) to policy / M8 style slugs.
+    Map settings-page captionStyle to policy / M8 style slugs.
     Policy JSON uses e.g. story, hook, educational; unknown values fall back to story.
     """
-    s = _safe_slug(style)
+    from core.caption_creative import normalize_caption_style
+
+    s = normalize_caption_style(style)
     if s == "punchy":
         return "hook"
     if s == "factual":
         return "factual"
-    if s in ("story", "hook", "educational"):
-        return s
+    # diary/listicle/freestyle have no dedicated policy keys; M8 directives carry shape.
+    if s in ("diary", "listicle", "freestyle"):
+        return "story"
     return "story"
 
 
 def map_ui_caption_tone_for_strategy(tone: str) -> str:
     """
-    Map settings-page captionTone (hype | calm | cinematic | authentic) to policy slugs.
+    Map settings-page captionTone to policy slugs.
     Rules in content_style_policy.json use e.g. bold, professional, authentic.
     """
-    t = _safe_slug(tone)
-    if t == "hype":
+    from core.caption_creative import normalize_caption_tone
+
+    t = normalize_caption_tone(tone)
+    if t in ("hype", "chaotic"):
         return "bold"
+    if t in ("documentary", "dry"):
+        return "professional"
     if t in ("calm", "cinematic", "authentic"):
         return t
     return "authentic"
@@ -139,7 +146,9 @@ def map_ui_caption_voice_to_persona(voice: str) -> str:
     Map settings-page captionVoice to M8 _persona_system_prompt keys:
     storyteller | creator_coach | hype_friend | expert_analyst
     """
-    v = _safe_slug(voice).replace("-", "_")
+    from core.caption_creative import normalize_caption_voice
+
+    v = normalize_caption_voice(voice)
     return {
         "default": "storyteller",
         "mentor": "creator_coach",
@@ -147,6 +156,9 @@ def map_ui_caption_voice_to_persona(voice: str) -> str:
         "best_friend": "storyteller",
         "teacher": "creator_coach",
         "cinematic_narrator": "storyteller",
+        "radio_host": "hype_friend",
+        "journalist": "expert_analyst",
+        "passenger": "storyteller",
     }.get(v, "storyteller")
 
 

@@ -400,32 +400,41 @@ async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> O
 # Status Updates (used by worker.py)
 # ============================================================
 
-def _platform_results_json(ctx: JobContext) -> Optional[str]:
+def _platform_results_payload(ctx: JobContext) -> Optional[list]:
+    """Return a Python list for asyncpg jsonb binding.
+
+    Pass the list (not ``json.dumps``) so codecs that always ``json.dumps`` the
+    parameter do not double-encode into a JSON *string* row. That double-encode
+    made the UI treat platform_results as empty and stuck on Awaiting confirmation.
+    """
     if not ctx.platform_results:
         return None
-    return json.dumps(
-        [
-            {
-                "platform": r.platform,
-                "success": r.success,
-                "token_row_id": getattr(r, "token_row_id", None),
-                "account_id": getattr(r, "account_id", None),
-                "account_name": getattr(r, "account_name", None),
-                "account_username": getattr(r, "account_username", None),
-                "account_avatar": getattr(r, "account_avatar", None),
-                "platform_video_id": r.platform_video_id,
-                "platform_url": r.platform_url,
-                "publish_id": r.publish_id,
-                "error_code": r.error_code,
-                "error_message": r.error_message,
-                "verify_status": r.verify_status,
-                "http_status": r.http_status,
-                "views": r.views,
-                "likes": r.likes,
-            }
-            for r in ctx.platform_results
-        ]
-    )
+    return [
+        {
+            "platform": r.platform,
+            "success": r.success,
+            "token_row_id": getattr(r, "token_row_id", None),
+            "account_id": getattr(r, "account_id", None),
+            "account_name": getattr(r, "account_name", None),
+            "account_username": getattr(r, "account_username", None),
+            "account_avatar": getattr(r, "account_avatar", None),
+            "platform_video_id": r.platform_video_id,
+            "platform_url": r.platform_url,
+            "publish_id": r.publish_id,
+            "error_code": r.error_code,
+            "error_message": r.error_message,
+            "verify_status": r.verify_status,
+            "http_status": r.http_status,
+            "views": r.views,
+            "likes": r.likes,
+        }
+        for r in ctx.platform_results
+    ]
+
+
+# Back-compat alias (tests / older callers).
+def _platform_results_json(ctx: JobContext) -> Optional[list]:
+    return _platform_results_payload(ctx)
 
 
 async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
@@ -470,7 +479,7 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
 
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as completed."""
-    platform_results_json = _platform_results_json(ctx)
+    platform_results_payload = _platform_results_payload(ctx)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -492,7 +501,7 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             ctx.finished_at or datetime.now(timezone.utc),
             ctx.error_code,
             ctx.error_message,
-            platform_results_json,
+            platform_results_payload,
             ctx.compute_seconds,
             ctx.thumbnail_r2_key or None,
         )
@@ -509,7 +518,7 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
     """
     from services.deferred_publish_schedule import next_due_scheduled_time
 
-    platform_results_json = _platform_results_json(ctx)
+    platform_results_payload = _platform_results_payload(ctx)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -546,7 +555,7 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
                 WHERE id = $1
                 """,
                 ctx.upload_id,
-                platform_results_json,
+                platform_results_payload,
                 next_anchor,
             )
             return
@@ -572,7 +581,7 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
                 WHERE id = $1
                 """,
                 ctx.upload_id,
-                platform_results_json,
+                platform_results_payload,
             )
             return
 
@@ -585,7 +594,7 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
             WHERE id = $1
             """,
             ctx.upload_id,
-            platform_results_json,
+            platform_results_payload,
         )
 
 
@@ -1665,7 +1674,12 @@ async def update_publish_attempt_verified(
 
 
 async def load_pending_verifications(pool: asyncpg.Pool, limit: int = 50) -> List[dict]:
-    """Load publish attempts that need verification polling."""
+    """Load publish attempts that need verification polling.
+
+    Includes legacy ``unknown`` rows (older code parked API blips there and
+    never retried — left UI stuck on Awaiting confirmation). Re-check those
+    at most every 5 minutes within the 24h window.
+    """
     try:
         async with pool.acquire() as conn:
             try:
@@ -1675,8 +1689,18 @@ async def load_pending_verifications(pool: asyncpg.Pool, limit: int = 50) -> Lis
                     FROM publish_attempts pa
                     JOIN uploads u ON u.id = pa.upload_id
                     WHERE pa.status = 'accepted'
-                      AND (pa.verify_status IS NULL OR pa.verify_status = 'pending')
                       AND pa.created_at > NOW() - INTERVAL '24 hours'
+                      AND (
+                            pa.verify_status IS NULL
+                            OR pa.verify_status = 'pending'
+                            OR (
+                                pa.verify_status = 'unknown'
+                                AND (
+                                    pa.verified_at IS NULL
+                                    OR pa.verified_at < NOW() - INTERVAL '5 minutes'
+                                )
+                            )
+                      )
                     ORDER BY pa.created_at ASC
                     LIMIT $1
                     """,

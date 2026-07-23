@@ -109,9 +109,15 @@ PREF_PACKAGES: Tuple[Dict[str, Any], ...] = (
     },
     {
         "id": "drive_trill",
-        "label": "Drive / Trill",
-        "description": "Analyze .map telemetry when uploaded; optional Trill AI enhancement.",
+        "label": "Drive Insights",
+        "description": (
+            "Pair each video with a .map file for speed, curves, and route data — "
+            "captions, Trill scoring, and optional AI enhancement. "
+            "Dashcam OSD is separate (does not cascade with Drive Analysis)."
+        ),
         "master": "trillEnabled",
+        # Dashcam OSD is intentionally omitted: it can backfill without Trill master
+        # and must not be force-enabled/disabled via package cascade.
         "members": ("trillEnabled", "aiServiceTelemetry", "trillAiEnhance"),
         "starter_opt_in": True,
     },
@@ -369,7 +375,8 @@ def _preview_notes(key: str, new_value: bool, prefs: Mapping[str, Any], tier: st
     if new_value and key == "trillEnabled":
         return (
             "Telemetry insights run only when you upload a .map file with the video. "
-            "Trill AI enhance uses extra AI credits."
+            "Trill AI enhance uses extra AI credits. "
+            "Dashcam OSD stays independent under Drive Insights if you want HUD OCR."
         )
     if not new_value and key == "useAudioContext" and _prefs_bool(prefs, "autoCaptions"):
         return "Captions may be lower quality without audio context."

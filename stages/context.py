@@ -1412,21 +1412,55 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if place_bits:
         clauses.append("Location context: " + " near ".join(place_bits[:2]) + (f" ({place_bits[-1]})" if len(place_bits) > 2 else "") + ".")
 
-    # Motion/vehicle/person facts.
+    # Motion/vehicle/person facts — peak uses same resolver as hydration enforcer.
     motion_bits: List[str] = []
-    max_speed = 0.0
+    tel_max = 0.0
+    osd_max = 0.0
     if tel:
         try:
-            max_speed = max(max_speed, float(getattr(tel, "max_speed_mph", 0) or 0))
+            tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
         except (TypeError, ValueError):
-            pass
+            tel_max = 0.0
     if isinstance(osd, dict):
         try:
-            max_speed = max(max_speed, float(osd.get("max_speed_mph") or 0))
+            osd_max = float(osd.get("max_speed_mph") or 0)
         except (TypeError, ValueError):
-            pass
+            osd_max = 0.0
+    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+    series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
+    max_speed, _speed_src = trusted_peak_speed_mph(
+        telemetry_max=tel_max,
+        osd_max=osd_max,
+        series_peak=series_peak,
+    )
     if max_speed >= 5:
         motion_bits.append(f"peak speed about {int(round(max_speed))} MPH")
+    # Surface trusted HUD sample speeds so captions don't only see a single peak.
+    if isinstance(osd, dict):
+        series = osd.get("speed_series") if isinstance(osd.get("speed_series"), list) else []
+        sample_mph: List[int] = []
+        for entry in series[:8]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                v = float(entry.get("mph") or entry.get("speed_mph") or 0)
+            except (TypeError, ValueError):
+                continue
+            if v >= 5:
+                sample_mph.append(int(round(v)))
+        # Dedupe while preserving order.
+        seen_mph: set = set()
+        unique_mph: List[int] = []
+        for v in sample_mph:
+            if v in seen_mph:
+                continue
+            seen_mph.add(v)
+            unique_mph.append(v)
+        if unique_mph:
+            motion_bits.append(
+                "HUD speed samples: " + ", ".join(f"{v} MPH" for v in unique_mph[:5])
+            )
     if isinstance(osd, dict) and osd.get("driver_name"):
         motion_bits.append(f"driver label {str(osd.get('driver_name')).strip()[:40]}")
 
@@ -1684,15 +1718,24 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                 f"HUD end {str(ls.get('date') or '').strip()} {str(ls.get('time') or '').strip()}".strip(),
             )
         try:
-            max_mph_osd = float(osd.get("max_speed_mph") or 0)
+            raw_osd_peak = float(osd.get("max_speed_mph") or 0)
         except (TypeError, ValueError):
-            max_mph_osd = 0.0
+            raw_osd_peak = 0.0
+        from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+        max_mph_osd, _ = trusted_peak_speed_mph(
+            osd_max=raw_osd_peak,
+            series_peak=osd_series_peak_mph(osd),
+        )
+        peak_t = osd.get("max_speed_at_s")
+        if peak_t is None:
+            peak_t = osd.get("max_speed_t_s")
         if max_mph_osd >= 5:
-            _add(osd.get("max_speed_t_s") or 0.0, "osd_speed", f"OSD peak {int(round(max_mph_osd))} MPH")
+            _add(peak_t or 0.0, "osd_speed", f"OSD peak {int(round(max_mph_osd))} MPH")
         speed_series = osd.get("speed_series") if isinstance(osd, dict) else None
         if isinstance(speed_series, list) and speed_series:
-            step = max(1, len(speed_series) // 5)
-            for entry in speed_series[::step][:5]:
+            step = max(1, len(speed_series) // 6)
+            for entry in speed_series[::step][:6]:
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -1701,15 +1744,29 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                     s_mph = 0.0
                 if s_mph <= 0:
                     continue
-                _add(entry.get("t_s") or entry.get("ts_s") or 0.0, "osd_speed_beat", f"{int(round(s_mph))} MPH")
+                _add(
+                    entry.get("t_s") or entry.get("ts_s") or 0.0,
+                    "osd_speed_beat",
+                    f"{int(round(s_mph))} MPH",
+                )
         gps_path = osd.get("gps_path") if isinstance(osd, dict) else None
         if isinstance(gps_path, list) and gps_path:
             step = max(1, len(gps_path) // 4)
             for i, pt in enumerate(gps_path[::step][:4]):
                 if isinstance(pt, (list, tuple)) and len(pt) >= 2:
                     try:
-                        lat = float(pt[0]); lon = float(pt[1])
-                        _add(0.0, "osd_gps", f"GPS waypoint {i + 1}: {lat:.4f}, {lon:.4f}")
+                        lat = float(pt[0])
+                        lon = float(pt[1])
+                        spd = float(pt[2]) if len(pt) >= 3 else 0.0
+                        t_s = float(pt[3]) if len(pt) >= 4 else 0.0
+                        if spd >= 5:
+                            _add(
+                                t_s,
+                                "osd_gps",
+                                f"{int(round(spd))} MPH @ {lat:.4f}, {lon:.4f}",
+                            )
+                        else:
+                            _add(t_s, "osd_gps", f"GPS waypoint {i + 1}: {lat:.4f}, {lon:.4f}")
                     except (TypeError, ValueError):
                         continue
 

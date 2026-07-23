@@ -114,6 +114,12 @@ _GENERIC_CAPTION_PATTERNS: List[re.Pattern[str]] = [
         r"\bon the open road\b",
         r"\b(?:roads?|highways?) less travel(?:l)?ed\b",
         r"\bwhere the road takes (?:me|us|you)\b",
+        # Observed M8 filler that ignores timeline/hydration
+        r"\bhigh[- ]energy,?\s+first[- ]person\s+dashcam\b",
+        r"\bthe video is a\s+(?:high[- ]energy|tense|exciting)\b",
+        r"\bfrom inside a moving vehicle\b",
+        r"\bcapturing a tense and confrontational journey\b",
+        r"\bdashcam recording from inside\b",
         # Extremely short titles that are pure mood (no proper noun, no number)
         r"^(?:road|drive|journey|adventure|highway|moment|vibes?|cruise|escape)\.?$",
     )
@@ -410,25 +416,45 @@ def _clean_video_label(raw: Any) -> str:
 
 
 def _vision_ocr_peak_mph(ocr: str) -> float:
-    """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD)."""
+    """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD).
+
+    Rejects roadside SPEED LIMIT copy and singleton OCR spikes (e.g. 154 when
+    the HUD samples are 87–92) so false peaks never enter caption anchors.
+    """
     if not ocr:
         return 0.0
-    best = 0.0
+    if re.search(r"speed\s*limit|maximum\s*speed|school\s*zone|work\s*zone", ocr, re.I):
+        # Still allow HUD-like lines elsewhere in the blob; strip limit lines.
+        ocr = re.sub(
+            r"[^\n]*(?:speed\s*limit|maximum\s*speed|school\s*zone|work\s*zone)[^\n]*",
+            " ",
+            ocr,
+            flags=re.I,
+        )
+    vals: List[float] = []
     for m in re.finditer(r"\b(\d{1,3})\s*(?:mph|mi/h)\b", ocr, re.IGNORECASE):
         try:
             v = float(m.group(1))
         except (TypeError, ValueError):
             continue
-        if 5.0 <= v <= 220.0:
-            best = max(best, v)
+        if 5.0 <= v <= 200.0:
+            vals.append(v)
     for m in re.finditer(r"\b(\d{1,3})\s*(?:kmh|km/h)\b", ocr, re.IGNORECASE):
         try:
             v = float(m.group(1)) * 0.621371
         except (TypeError, ValueError):
             continue
-        if 5.0 <= v <= 220.0:
-            best = max(best, v)
-    return best
+        if 5.0 <= v <= 200.0:
+            vals.append(v)
+    if not vals:
+        return 0.0
+    vals.sort()
+    mid = vals[len(vals) // 2]
+    # Drop singleton spikes far above the median of OCR speed hits.
+    trusted = [v for v in vals if v <= mid + 45.0]
+    if not trusted:
+        trusted = [mid]
+    return max(trusted)
 
 
 def collect_evidence(ctx: JobContext) -> EvidencePool:
@@ -466,18 +492,22 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         except (TypeError, ValueError):
             osd_max = osd_avg = 0.0
 
-    if tel_max > 0:
-        pool.max_speed_mph = tel_max
-        pool.avg_speed_mph = tel_avg if tel_avg > 0 else tel_max
-        pool.speed_source = "telemetry"
-    elif osd_max > 0:
-        pool.max_speed_mph = osd_max
-        pool.avg_speed_mph = osd_avg if osd_avg > 0 else osd_max
-        pool.speed_source = "osd"
-    elif vision_peak > 0:
-        pool.max_speed_mph = vision_peak
-        pool.avg_speed_mph = vision_peak
-        pool.speed_source = "vision_ocr"
+    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+    series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
+    peak, src = trusted_peak_speed_mph(
+        telemetry_max=tel_max,
+        osd_max=osd_max,
+        series_peak=series_peak,
+        vision_peak=vision_peak,
+    )
+    if peak >= 5:
+        pool.max_speed_mph = peak
+        pool.avg_speed_mph = (
+            tel_avg if src == "telemetry" and tel_avg > 0
+            else (osd_avg if src.startswith("osd") and osd_avg > 0 else peak)
+        )
+        pool.speed_source = src
 
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         drv = osd.get("driver_name")

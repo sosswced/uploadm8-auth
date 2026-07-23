@@ -131,8 +131,9 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "horsepower", "turbo", "supercar", "hypercar", "offroad", "jeep",
         ],
         "tone": (
-            "High-energy, petrolhead. Use car culture vocabulary. "
-            "Speed, freedom, and mechanical passion — make them feel the RPMs."
+            "Grounded driving content: prefer HUD speeds, place names, driver labels, "
+            "and named tracks over generic petrolhead filler. Match intensity to the "
+            "actual footage — a calm cruise stays calm; a real high-speed beat can surge."
         ),
         "hook_templates": [
             "This is what {speed} mph feels like 🔥",
@@ -534,96 +535,22 @@ _CATEGORY_PRIORITY = [
 ]
 
 
-# Caption energy / register (user captionTone). Topic-agnostic: jargon and
-# examples must always come from visible content + transcript, not from a
-# assumed niche.
+# Legacy narrative-prompt directives — derived from core.caption_creative
+# (single source). Do not hardcode parallel style/tone/voice lists here.
+from core.caption_creative import (
+    STYLE_DIRECTIVES as _CC_STYLE,
+    TONE_DIRECTIVES as _CC_TONE,
+    VOICE_DIRECTIVES as _CC_VOICE,
+)
+
 TONE_DIRECTIVES: Dict[str, str] = {
-    "hype": (
-        "High momentum and conviction: strong verbs, tight clauses, forward pull. "
-        "You may use emphatic punctuation sparingly. "
-        "Scale intensity to the subject—finance, grief, or slow crafts get "
-        "'quiet hype' (urgent clarity) rather than party-bro shouting. "
-        "Never invent stakes or drama not supported by the video."
-    ),
-    "calm": (
-        "Measured, breathable pacing; let concrete details do the work. "
-        "Prefer understatement over exclamation. "
-        "Works for any subject: tutorials, newsy explainers, intimate vlogs, "
-        "technical demos—same cool, trustworthy register."
-    ),
-    "cinematic": (
-        "Scene-led, sensory language: light, shadow, motion, scale, texture—only "
-        "what the frames support. Present tense where it heightens immediacy. "
-        "Trailer-like rhythm without melodrama or clichés that could apply to "
-        "any video; every line should tether to something visible or said."
-    ),
-    "authentic": (
-        "Human, direct, first-person or close second-person; plain words over "
-        "marketing speak. "
-        "Sound like a real person in any niche—parenting, code, sports, "
-        "small business—without filler ('okay guys', 'here's the thing' spam). "
-        "One honest observation beats a generic hook."
-    ),
+    k: str(v.get("register") or "") for k, v in _CC_TONE.items()
 }
-
-# High-level speaker persona (user captionVoice). Static prose instructions only.
-# Must adapt vocabulary to the actual topic; persona is delivery, not a fake niche.
 VOICE_PROFILES: Dict[str, str] = {
-    "default": (
-        "Balanced creator voice: clear hook, specific middle, satisfying close. "
-        "Confident but not performative; match slang and terminology to what "
-        "the content actually is (chef terms for food, dev terms for code, etc.)."
-    ),
-    "mentor": (
-        "Experienced guide: 'you'-oriented, encouraging, zero condescension. "
-        "Implied expertise through specifics, not credentials flex. "
-        "End with a usable takeaway when the video teaches or demonstrates something."
-    ),
-    "hypebeast": (
-        "Peak short-form energy: clipped sentences, rhythm, occasional bold word "
-        "choice—still believable. "
-        "Slang only if it fits the subject and platform; avoid empty viral filler. "
-        "Excitement must trace back to what is literally on screen or in audio."
-    ),
-    "best_friend": (
-        "Warm, unfiltered peer: conversational fragments OK, light humor if "
-        "the content allows. "
-        "Self-aware without derailing; relatable across any hobby or life slice. "
-        "Never mean-spirited or faux-chaos."
-    ),
-    "teacher": (
-        "Educator clarity: one central idea, logical mini-arc, minimal jargon "
-        "unless the audience clearly expects it from the visuals. "
-        "If the clip is not instructional, still be precise—teach what "
-        "happened or what to notice, not a life lesson unrelated to the footage."
-    ),
-    "cinematic_narrator": (
-        "Third-person or omniscient trailer voice: declarative, image-stacking, "
-        "slightly elevated register. "
-        "Still anchored to real events in the clip—no epic narration of "
-        "nothing happening. Save flourish for genuine peaks in the footage."
-    ),
+    k: str(v.get("persona") or "") for k, v in _CC_VOICE.items()
 }
-
-# Caption STYLE = structural architecture of the line (how it is built). Topic-agnostic;
-# every fact/number/word still comes from the evidence blocks, never invented.
 STYLE_DIRECTIVES: Dict[str, str] = {
-    "story": (
-        "Build a 3-beat micro-arc — setup (earliest visible beat) → turn (the peak moment: "
-        "top speed, climax object, landmark, or loudest audio cue) → payoff (a late beat that "
-        "resolves or reframes). Connective momentum between beats; no bullet fragments. "
-        "Open and close on a different beat than the other variants so each reads like a fresh retelling."
-    ),
-    "punchy": (
-        "Front-load the single most arresting concrete fact in the first 3 words (number, place, "
-        "named object, speed). One or two short telegraphic lines; cut every connective and hedge. "
-        "Impact, then stop — no narrative ramp. Rotate which evidence token leads across variants."
-    ),
-    "factual": (
-        "Lead with the single most impressive verifiable data point in the evidence (peak MPH, a count, "
-        "a spec, a precise place/road, a date, an artist/title). Data-forward, zero fluff, no adjectives "
-        "the evidence does not support: state the metric, then one tight grounded line of context."
-    ),
+    k: str(v.get("blueprint") or "") for k, v in _CC_STYLE.items()
 }
 
 
@@ -1011,6 +938,26 @@ def _build_narrative_prompt(
             ctx.output_artifacts = {}
         ctx.output_artifacts["hydration_story"] = hydration_story
         context_lines.append(hydration_story)
+    try:
+        from stages.context import build_video_story_timeline
+
+        _tl = build_video_story_timeline(ctx, max_events=12) or []
+        _tl_bits: List[str] = []
+        for ev in _tl[:8]:
+            if not isinstance(ev, dict):
+                continue
+            txt = str(ev.get("text") or "").strip()
+            if not txt:
+                continue
+            try:
+                t_s = float(ev.get("t_seconds") if ev.get("t_seconds") is not None else 0)
+            except (TypeError, ValueError):
+                t_s = 0.0
+            _tl_bits.append(f"t={t_s:.0f}s {txt[:120]}")
+        if _tl_bits:
+            context_lines.append("Timeline spine: " + " | ".join(_tl_bits))
+    except Exception:
+        pass
     title_hint = strip_stray_hashtag_json_blob(str(ctx.title or ""))
     if title_hint:
         context_lines.append(f"User title hint: {title_hint}")
@@ -1607,19 +1554,15 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         generate_caption = True
 
     # ── Style/tone preferences ───────────────────────────────────────────────
-    caption_style = str(us.get("captionStyle") or us.get("caption_style") or "story").lower()
-    if caption_style not in ("story", "punchy", "factual"):
-        caption_style = "story"
+    from core.caption_creative import (
+        normalize_caption_style,
+        normalize_caption_tone,
+        normalize_caption_voice,
+    )
 
-    caption_tone = str(us.get("captionTone") or us.get("caption_tone") or "authentic").lower()
-    if caption_tone not in ("hype", "calm", "cinematic", "authentic"):
-        caption_tone = "authentic"
-
-    caption_voice = str(us.get("captionVoice") or us.get("caption_voice") or "default").lower()
-    if caption_voice not in (
-        "default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator",
-    ):
-        caption_voice = "default"
+    caption_style = normalize_caption_style(us.get("captionStyle") or us.get("caption_style"))
+    caption_tone = normalize_caption_tone(us.get("captionTone") or us.get("caption_tone"))
+    caption_voice = normalize_caption_voice(us.get("captionVoice") or us.get("caption_voice"))
 
     hashtag_style = str(us.get("aiHashtagStyle") or us.get("ai_hashtag_style") or "mixed").lower()
     if hashtag_style not in (

@@ -27,6 +27,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import asyncpg
 import httpx
 
+from core.caption_creative import (
+    CAPTION_STYLES as M8_CAPTION_STYLES,
+    CAPTION_TONES as M8_CAPTION_TONES,
+    CAPTION_VOICES as M8_CAPTION_VOICES,
+    STYLE_DIRECTIVES as M8_STYLE_DIRECTIVES,
+    TONE_DIRECTIVES as M8_TONE_DIRECTIVES,
+    VOICE_DIRECTIVES as M8_VOICE_DIRECTIVES,
+    evidence_matrix_cell_specs as _evidence_matrix_cell_specs,
+    style_directive as _m8_style_directive,
+    tone_directive as _m8_tone_directive,
+    voice_directive as _m8_voice_directive,
+)
 from core.helpers import strip_stray_hashtag_json_blob
 from core.vision_labels import (
     is_generic_vision_label,
@@ -96,34 +108,6 @@ def m8_evidence_matrix_enabled(user_settings: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-def _evidence_matrix_cell_specs(style_ui: str, tone_ui: str, voice_ui: str) -> List[Tuple[str, str, str]]:
-    """
-    Deduped list of (caption_style, caption_tone, caption_voice) triples:
-    - Part A: story/punchy/factual x each voice with user's tone held constant.
-    - Part B: authentic/hype/calm/cinematic with user's style+voice (adds tones not covered as constant).
-    """
-    styles = ("story", "punchy", "factual")
-    voices = ("default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator")
-    tones = ("authentic", "hype", "calm", "cinematic")
-    style_ui = (style_ui or "story").lower()
-    tone_ui = (tone_ui or "authentic").lower()
-    voice_ui = (voice_ui or "default").lower()
-    seen: set[Tuple[str, str, str]] = set()
-    out: List[Tuple[str, str, str]] = []
-    for s in styles:
-        for v in voices:
-            key = (s, tone_ui, v)
-            if key not in seen:
-                seen.add(key)
-                out.append(key)
-    for t in tones:
-        key = (style_ui, t, voice_ui)
-        if key not in seen:
-            seen.add(key)
-            out.append(key)
-    return out
-
-
 def _sanitize_evidence_matrix(raw: Any, expected_max: int) -> Optional[Dict[str, Any]]:
     """Normalize model matrix output; TikTok-oriented short captions."""
     if not isinstance(raw, dict):
@@ -191,7 +175,147 @@ _GENERIC_PATTERNS = [
     r"\b(?:travel|highway|cloud) (?:vibes?|watching)\b",
     r"\bnature(?:'s)? (?:beauty|symphony)\b",
     r"\b(?:explore|discover) more\b",
+    r"\bhigh[- ]energy,?\s+first[- ]person\s+dashcam\b",
+    r"\bthe video is a\s+(?:high[- ]energy|tense|exciting)\b",
+    r"\bfrom inside a moving vehicle\b",
+    r"\bcapturing a tense and confrontational journey\b",
+    r"\bdashcam recording from inside\b",
 ]
+
+
+def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
+    """Compressed hydration + timeline spine placed above the full Scene Graph JSON.
+
+    Keeps MPH samples, place, music, and ordered beats visible even when the
+    24k scene-graph dump truncates later fields.
+    """
+    lines: List[str] = []
+    story = str(
+        scene_graph.get("hydration_story")
+        or scene_graph.get("scene_story")
+        or ""
+    ).strip()
+    if story:
+        lines.append(f"SCENE STORY: {story[:1100]}")
+
+    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+    osd = scene_graph.get("dashcam_osd") or {}
+    geo = scene_graph.get("geo") or {}
+    music = scene_graph.get("music") or {}
+    fact_bits: List[str] = []
+    if isinstance(osd, dict):
+        if osd.get("driver_name"):
+            fact_bits.append(f"driver={osd.get('driver_name')}")
+        try:
+            geo_peak = float((geo or {}).get("max_speed_mph") or 0) if isinstance(geo, dict) else 0.0
+        except (TypeError, ValueError):
+            geo_peak = 0.0
+        try:
+            raw_osd_peak = float(osd.get("max_speed_mph") or 0)
+        except (TypeError, ValueError):
+            raw_osd_peak = 0.0
+        peak, _ = trusted_peak_speed_mph(
+            telemetry_max=geo_peak,
+            osd_max=raw_osd_peak,
+            series_peak=osd_series_peak_mph(osd),
+        )
+        if peak >= 5:
+            fact_bits.append(f"peak={int(round(peak))} MPH")
+        series = osd.get("speed_series") if isinstance(osd.get("speed_series"), list) else []
+        sample_bits: List[str] = []
+        for entry in series[:6]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                mph = float(entry.get("mph") or entry.get("speed_mph") or 0)
+            except (TypeError, ValueError):
+                continue
+            if mph < 5:
+                continue
+            try:
+                t_s = float(entry.get("t_s") or 0)
+            except (TypeError, ValueError):
+                t_s = 0.0
+            sample_bits.append(f"{int(round(mph))}mph@{t_s:.0f}s")
+        if sample_bits:
+            fact_bits.append("HUD speeds: " + ", ".join(sample_bits))
+        fs = osd.get("first_seen") or {}
+        ls = osd.get("last_seen") or {}
+        if isinstance(fs, dict) and (fs.get("date") or fs.get("time")):
+            fact_bits.append(
+                f"HUD start={str(fs.get('date') or '')} {str(fs.get('time') or '')}".strip()
+            )
+        if isinstance(ls, dict) and (ls.get("date") or ls.get("time")):
+            fact_bits.append(
+                f"HUD end={str(ls.get('date') or '')} {str(ls.get('time') or '')}".strip()
+            )
+    for key in ("city", "state", "road", "display", "gazetteer_place"):
+        v = (geo or {}).get(key) if isinstance(geo, dict) else None
+        if v:
+            fact_bits.append(f"{key}={v}")
+            break
+    if isinstance(music, dict):
+        artist = str(music.get("artist") or "").strip()
+        title = str(music.get("title") or "").strip()
+        if artist and title:
+            fact_bits.append(f"music={artist} — {title}")
+        elif artist or title:
+            fact_bits.append(f"music={artist or title}")
+    if fact_bits:
+        lines.append("HYDRATION FACTS: " + " | ".join(fact_bits[:12]))
+
+    timeline = scene_graph.get("timeline") or []
+    if isinstance(timeline, list) and timeline:
+        # Prefer a spine: earliest, a mid speed beat, peak-ish, latest.
+        def _t(ev: Any) -> float:
+            if not isinstance(ev, dict):
+                return 0.0
+            try:
+                return float(ev.get("t_seconds") if ev.get("t_seconds") is not None else ev.get("t_s") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        ordered = sorted(
+            [e for e in timeline if isinstance(e, dict) and str(e.get("text") or "").strip()],
+            key=_t,
+        )
+        picks: List[Dict[str, Any]] = []
+        if ordered:
+            picks.append(ordered[0])
+            speedish = [
+                e for e in ordered
+                if str(e.get("kind") or "").startswith("osd")
+                or "MPH" in str(e.get("text") or "").upper()
+            ]
+            if speedish:
+                picks.append(speedish[len(speedish) // 2])
+                picks.append(speedish[-1])
+            if len(ordered) > 2:
+                picks.append(ordered[len(ordered) // 2])
+            picks.append(ordered[-1])
+        # Dedupe by text
+        seen: set = set()
+        spine_lines: List[str] = []
+        for ev in picks:
+            txt = str(ev.get("text") or "").strip()
+            if not txt or txt in seen:
+                continue
+            seen.add(txt)
+            spine_lines.append(f"  t={_t(ev):.0f}s [{ev.get('kind') or 'beat'}] {txt[:160]}")
+            if len(spine_lines) >= 8:
+                break
+        if spine_lines:
+            lines.append("TIMELINE SPINE (use these beats; do not invent sequence):\n" + "\n".join(spine_lines))
+
+    if not lines:
+        return ""
+    return (
+        "\nHYDRATION + TIMELINE BRIEF (read first — denser than the JSON dump; titles/captions "
+        "must weave these facts instead of generic dashcam wrappers):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
 
 def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     """Single structured snapshot used by M8 prompts and ranking."""
@@ -256,14 +380,47 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     if isinstance(osd_ctx, dict) and osd_ctx and not osd_ctx.get("skipped"):
         fs = osd_ctx.get("first_seen") or {}
         ls = osd_ctx.get("last_seen") or {}
+        series = osd_ctx.get("speed_series") if isinstance(osd_ctx.get("speed_series"), list) else []
+        from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+        try:
+            raw_osd_peak = float(osd_ctx.get("max_speed_mph") or 0)
+        except (TypeError, ValueError):
+            raw_osd_peak = 0.0
+        # OSD field stays OSD-sourced (series-capped). Map peak lives on geo.*.
+        trusted_peak, peak_src = trusted_peak_speed_mph(
+            telemetry_max=0.0,
+            osd_max=raw_osd_peak,
+            series_peak=osd_series_peak_mph(osd_ctx),
+        )
+        # Prefer series avg when we capped a spike; else keep OSD avg.
+        try:
+            raw_avg = float(osd_ctx.get("avg_speed_mph") or 0)
+        except (TypeError, ValueError):
+            raw_avg = 0.0
+        series_vals = [
+            float(e.get("mph") or e.get("speed_mph") or 0)
+            for e in series
+            if isinstance(e, dict)
+        ]
+        series_vals = [v for v in series_vals if v >= 5]
+        avg_out = raw_avg
+        if peak_src.endswith("series_cap") and series_vals:
+            avg_out = round(sum(series_vals) / len(series_vals), 1)
+        elif trusted_peak >= 5 and raw_avg <= 0:
+            avg_out = trusted_peak
         osd_d = {
             "engine": osd_ctx.get("engine"),
             "frames_sampled": osd_ctx.get("frames_sampled"),
             "frames_with_signal": osd_ctx.get("frames_with_signal"),
             "coverage_pct": osd_ctx.get("coverage_pct"),
-            "max_speed_mph": osd_ctx.get("max_speed_mph"),
-            "avg_speed_mph": osd_ctx.get("avg_speed_mph"),
+            "max_speed_mph": round(trusted_peak, 1) if trusted_peak >= 5 else 0.0,
+            "max_speed_raw_mph": round(raw_osd_peak, 1) if raw_osd_peak >= 5 else None,
+            "max_speed_source": peak_src or None,
+            "max_speed_at_s": osd_ctx.get("max_speed_at_s") or osd_ctx.get("max_speed_t_s"),
+            "avg_speed_mph": avg_out if avg_out >= 5 else 0.0,
             "speed_unit_detected": osd_ctx.get("speed_unit_detected"),
+            "speed_series": series[:12],
             "driver_name": osd_ctx.get("driver_name"),
             "telemetry_backfilled": bool(osd_ctx.get("telemetry_backfilled")),
             "gps_fix_count": len(osd_ctx.get("gps_path") or []),
@@ -520,173 +677,6 @@ def _style_prompt(style: str, tone: str) -> str:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Elite, UI-keyed creative directives for the M8 engine.
-#
-# WHY: the settings page exposes 3 caption styles, 4 tones, and 6 voices/personas.
-# Previously M8 collapsed all of them into one generic sentence (`_style_prompt`)
-# and a 3-way persona (`_persona_system_prompt`), so distinct UI selections produced
-# near-identical copy. These libraries are keyed on the RAW UI values so every
-# selection injects a structurally different blueprint into the prompt — making
-# output visibly change with each choice while staying evidence-grounded.
-#
-# Contract for every directive: topic-agnostic delivery only. Vocabulary, stakes,
-# and specifics MUST come from the Scene Graph evidence, never invented.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Caption STYLE = the structural architecture of the line (how it is built).
-M8_STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
-    "story": {
-        "label": "STORY — narrative arc",
-        "blueprint": (
-            "Build a 3-beat micro-arc straight from scene_graph.timeline: "
-            "(1) SETUP — open on the earliest grounded beat (place / first on-screen text / opening label); "
-            "(2) TURN — pivot on the peak beat (top MPH, climax object, landmark, or loudest audio cue); "
-            "(3) PAYOFF — close on a late beat that resolves or reframes. "
-            "Caption length 150–280 characters. Connective momentum between beats; no bullet fragments. "
-            "Each variant must enter and exit the arc at a different beat so the 5 variants feel like 5 retellings, "
-            "not one caption reworded."
-        ),
-    },
-    "punchy": {
-        "label": "PUNCHY — hook in first 3 words",
-        "blueprint": (
-            "Front-load the single most arresting CONCRETE fact in the first 3 words "
-            "(a number, a place, a named object, a speed). One or two short lines, telegraphic rhythm, "
-            "cut every connective and hedge ('just', 'really', 'kind of'). Under 120 characters. "
-            "No narrative ramp — impact then stop. Across the 5 variants, rotate WHICH evidence token leads "
-            "(speed → place → object → audio → trill) so no two hooks open on the same word class."
-        ),
-    },
-    "factual": {
-        "label": "FACTUAL — lead with the strongest stat",
-        "blueprint": (
-            "Lead with the single most impressive VERIFIABLE data point in the evidence — peak MPH, a count, "
-            "a spec, a precise place/road, a date, an artist/title. Data-forward, zero fluff, no adjectives that "
-            "evidence does not support. 100–200 characters. State the metric, then one tight line of grounded context. "
-            "Across the 5 variants, lead with a different verified figure/spec each time; never repeat the same "
-            "headline metric as variant 1."
-        ),
-    },
-}
-
-# Caption TONE = the emotional register / energy the copy is delivered in.
-M8_TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
-    "authentic": {
-        "label": "AUTHENTIC — real talk, first-person, no fluff",
-        "register": (
-            "Human and direct; first-person or close second-person; plain words over marketing speak. "
-            "Sound like a real person who was actually there. One honest observation beats a manufactured hook. "
-            "Ban influencer filler ('okay guys', 'here's the thing', 'let me tell you'). No exclamation inflation."
-        ),
-    },
-    "hype": {
-        "label": "HYPE — high energy, power words, stop-the-scroll",
-        "register": (
-            "High momentum and conviction: strong verbs, tight clauses, forward pull, occasional emphatic word — "
-            "still believable. Scale the intensity to the actual subject (a quiet craft gets urgent clarity, not "
-            "party-bro shouting). Every spike of energy must trace to something literally on screen or in the audio. "
-            "Never invent stakes the footage does not earn."
-        ),
-    },
-    "cinematic": {
-        "label": "CINEMATIC — poetic, atmospheric, film-trailer feel",
-        "register": (
-            "Scene-led, sensory language: light, shadow, motion, scale, texture — only what the frames support. "
-            "Present tense where it heightens immediacy; trailer-like rhythm without melodrama or clichés that could "
-            "apply to any clip. Every image must tether to a visible detail or a spoken line. Restraint over purple prose."
-        ),
-    },
-    "calm": {
-        "label": "CALM — measured, confident, let the footage speak",
-        "register": (
-            "Measured, breathable pacing; let concrete details carry the weight. Understatement over exclamation; "
-            "cool, trustworthy register. No urgency theatrics. Confidence shown through specificity, not volume."
-        ),
-    },
-}
-
-# Caption VOICE / PERSONA = who is speaking (diction, point of view, sign-off).
-M8_VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
-    "default": {
-        "label": "DEFAULT — balanced, platform-friendly creator",
-        "persona": (
-            "Balanced creator voice: clear hook, specific middle, satisfying close. Confident but not performative. "
-            "Match slang and terminology to what the content actually is (chef terms for food, dev terms for code, "
-            "driver terms for a drive). Neutral, broadly likeable point of view."
-        ),
-    },
-    "mentor": {
-        "label": "MENTOR — wise, educational, authority",
-        "persona": (
-            "Experienced guide: 'you'-oriented, encouraging, zero condescension. Imply expertise through precise "
-            "specifics, never a credentials flex. When the clip teaches or demonstrates anything, land one usable "
-            "takeaway. Calm authority — the voice of someone who has done this many times."
-        ),
-    },
-    "hypebeast": {
-        "label": "HYPEBEAST — all-caps energy, slang, viral",
-        "persona": (
-            "Peak short-form energy: clipped sentences, rhythm, street/viral cadence, sparing ALL-CAPS on the one "
-            "word that matters. Slang only when it fits the subject and platform — never empty viral filler "
-            "('this is insane', 'no way'). All the hype must trace to a real on-screen or audio moment."
-        ),
-    },
-    "best_friend": {
-        "label": "BEST FRIEND — casual, real, relatable",
-        "persona": (
-            "Warm, unfiltered peer texting you about something cool: conversational fragments OK, light self-aware "
-            "humor when the content allows, relatable aside. Never mean-spirited or faux-chaos. Reads like a friend, "
-            "not a brand. Second-person ('you') and shared-moment framing welcome."
-        ),
-    },
-    "teacher": {
-        "label": "TEACHER — clear, informative, structured",
-        "persona": (
-            "Educator clarity: one central idea, a logical mini-arc, minimal jargon unless the visuals clearly expect "
-            "it. If the clip is not instructional, still be precise — teach what happened or what to notice in the "
-            "footage, not an unrelated life lesson. Structure and signposting over flourish."
-        ),
-    },
-    "cinematic_narrator": {
-        "label": "CINEMATIC — film narrator, epic, atmospheric",
-        "persona": (
-            "Third-person / omniscient trailer narrator: declarative, image-stacking, slightly elevated register. "
-            "Anchored to real events in the clip — no epic narration of nothing happening. Reserve the biggest "
-            "flourish for the genuine peak in the footage. Think voiceover, not influencer."
-        ),
-    },
-}
-
-# Strategy-slug → UI-voice fallback, so policy/strategy persona overrides still
-# resolve to one of the rich UI voice directives instead of going generic.
-_M8_PERSONA_SLUG_TO_VOICE_UI: Dict[str, str] = {
-    "storyteller": "cinematic_narrator",
-    "creator_coach": "mentor",
-    "hype_friend": "hypebeast",
-    "expert_analyst": "teacher",
-}
-
-
-def _m8_style_directive(style_ui: str) -> Dict[str, str]:
-    return M8_STYLE_DIRECTIVES.get((style_ui or "").lower().strip(), M8_STYLE_DIRECTIVES["story"])
-
-
-def _m8_tone_directive(tone_ui: str) -> Dict[str, str]:
-    return M8_TONE_DIRECTIVES.get((tone_ui or "").lower().strip(), M8_TONE_DIRECTIVES["authentic"])
-
-
-def _m8_voice_directive(voice_ui: str) -> Dict[str, str]:
-    v = (voice_ui or "").lower().strip().replace("-", "_")
-    if v in M8_VOICE_DIRECTIVES:
-        return M8_VOICE_DIRECTIVES[v]
-    # voice_ui may actually be a collapsed strategy persona slug — remap it.
-    mapped = _M8_PERSONA_SLUG_TO_VOICE_UI.get(v)
-    if mapped and mapped in M8_VOICE_DIRECTIVES:
-        return M8_VOICE_DIRECTIVES[mapped]
-    return M8_VOICE_DIRECTIVES["default"]
-
-
 def _m8_creative_directive_block(style_ui: str, tone_ui: str, voice_ui: str) -> str:
     """Compose the three UI-keyed directives into one elite, self-differentiating
     creative brief. This is the primary driver of how copy reads, so that every
@@ -841,18 +831,34 @@ def _build_m8_prompt(
         else "Set title to null for all platforms that do not need titles."
     )
 
-    title_evidence_contract = """
+    freestyle = (caption_style or "").lower().strip() == "freestyle"
+    if freestyle:
+        title_evidence_contract = """
+TITLE EVIDENCE BUILD CONTRACT (FREESTYLE — invent SHAPE, not FACTS):
+1. You may invent any title STRUCTURE (question, mid-scene entry, music braid, diary stamp,
+   stacked beats). Length rails are soft (YouTube ~40–80 chars OK).
+2. FACTS still come ONLY from scene_graph / HYDRATION + TIMELINE BRIEF:
+     geo, trusted HUD MPH samples (prefer sample speeds over a lone suspicious peak),
+     trill.bucket, vision/OCR/landmarks, music artist/title, driver, HUD date/time, timeline beats.
+3. NEVER invent place, speed, song, or driver. NEVER use generic wrappers
+     ("The video is a high-energy first-person dashcam…").
+4. Prefer a real HUD speed SAMPLE from the brief/timeline when present; do not escalate
+     a single OCR spike above the sample cluster.
+5. TikTok title = null. YouTube/IG/FB titles must still feel platform-native and distinct.
+"""
+    else:
+        title_evidence_contract = """
 TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
 1. Build titles ONLY from these scene_graph fields (and their direct synonyms):
      - geo.road, geo.city, geo.state, geo.gazetteer_place, geo.protected_area_name
-     - geo.max_speed_mph (formatted as "<N> MPH"), telemetry/osd peak speeds
+     - trusted HUD / telemetry MPH (prefer speed_series / timeline samples over a lone peak)
      - trill.bucket (e.g. "Cruise", "Active", "Spirited", "Aggressive", "Reckless")
      - dominant tokens from vision.labels / video_intelligence.object_tracks /
        video_intelligence.on_screen_text / vision.landmarks / vision.logos
      - music.artist, music.title, music.genre — ARTIST or TITLE words ONLY,
        NEVER paraphrased lyrics or transcript phrases.
      - dashcam_osd.driver_name and dashcam_osd.first_seen.date when present.
-     - scene_graph.timeline beats (place / on_screen_text / landmark fragments).
+     - scene_graph.timeline beats (place / on_screen_text / landmark / osd_speed fragments).
 2. TITLES MUST NOT CONTAIN:
      - Any 4-word window that appears verbatim (case-insensitive) in
        transcript.text or transcript.segments[*].text.
@@ -863,35 +869,38 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
        when present in the source clip.
      - Generic clickbait openers: "POV:", "Wait until", "You won't believe",
        "This is why", "Watch this", "Insane", "Crazy" (used alone), "OMG".
+     - Generic dashcam wrappers: "The video is a…", "high-energy first-person dashcam",
+       "from inside a moving vehicle".
 3. PLATFORM TITLE SHAPES:
-     - YouTube: 50–70 chars, Capitalized Headline Style, keyword-front-loaded
-       (place / road / speed / Trill bucket leading); end with concrete noun
-       (e.g. "I-5", "Yellowstone", "Mustang GT", "Cruise Run").
+     - YouTube: 45–75 chars, Capitalized Headline Style, keyword-front-loaded
+       (place / road / speed sample / music / Trill bucket leading); end with concrete noun.
      - TikTok: title = null (caption-led platform).
-     - Instagram / Facebook: 25–40 char punchy headline-style; nouns over verbs.
+     - Instagram / Facebook: 25–45 char punchy headline-style; nouns over verbs.
 4. PER-PLATFORM VARIANCE:
      - YouTube title and Instagram/Facebook title MUST share at most 30% token
-       overlap. If you start from the same evidence cluster, swap the leading
-       cluster (geo → speed → trill → visual-object → music) for the smaller
-       platform. The ranker WILL penalize duplicate titles.
+       overlap. Swap the leading evidence cluster (geo → speed → music → trill → visual).
 5. EVIDENCE FALLBACK:
      - If none of the allowed fields are populated, return null for title on
        every platform. NEVER invent a place, speed, song, or driver name.
 """
 
-    caption_rule = (
-        "Write captions only when generate_caption is true; otherwise use empty string."
-        if not generate_caption
-        else (
-            "Write vivid, specific captions grounded in Scene Graph evidence. "
-            "When transcript.text is present, reflect real speech: topics, jokes, questions, or emotional beats "
-            "(paraphrase; do not invent lines). When music.title / music.artist / music.genre are set, weave in "
-            "factual listening context without claiming false ownership when music.copyright_risk is true "
-            "or transcript indicates third-party lyrics. "
-            "When audio_environment (sound_profile, yamnet_events, top_sound_class) is populated, mention "
-            "concrete sounds (crowd, engine, rain, studio, conversation hubbub, etc.) where it strengthens the hook."
+    if not generate_caption:
+        caption_rule = "Write captions only when generate_caption is true; otherwise use empty string."
+    else:
+        caption_rule = (
+            "Write vivid, specific captions grounded in the HYDRATION + TIMELINE BRIEF and Scene Graph. "
+            "Weave at least two concrete beats (HUD time/speed sample, place, driver, music, OCR) into the prose — "
+            "do NOT describe the medium ('The video is a high-energy first-person dashcam…'). "
+            "When transcript.text is present, reflect real speech themes (paraphrase; do not invent lines). "
+            "When music.title / music.artist are set, weave factual listening context "
+            "(respect copyright_risk / third-party lyrics). "
+            "When audio_environment is populated, mention 1–2 concrete sounds where it strengthens the hook."
         )
-    )
+        if freestyle:
+            caption_rule += (
+                " FREESTYLE: invent a fresh caption shape; length and arc are optional; "
+                "evidence density is mandatory."
+            )
 
     sg = json.dumps(scene_graph, indent=2)[:24000]
 
@@ -914,12 +923,14 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
         claims_section = ""
     if must_use:
         bullets = "\n".join(f"  - {tok}" for tok in must_use)
+        need_n = 1 if freestyle else 2
         must_use_block = (
             "\nMUST_USE EVIDENCE SHORTLIST (these tokens are FACTS from this clip — "
-            "every winning caption AND title MUST contain at least 2 of these verbatim):\n"
+            f"every winning caption AND title MUST contain at least {need_n} of these verbatim):\n"
             f"{bullets}\n"
-            "Variants that fail to use ≥2 of these tokens will be REJECTED by the ranker "
+            f"Variants that fail to use ≥{need_n} of these tokens will be REJECTED by the ranker "
             "with a -200 score and CANNOT win, regardless of how good the prose sounds.\n"
+            "Prefer HUD speed SAMPLE tokens from the timeline/brief over a single suspicious peak.\n"
         )
         evidence_clusters: List[str] = []
         if any(("MPH" in t) or ("mph" in t) for t in must_use):
@@ -1021,14 +1032,15 @@ CAPTION EVIDENCE MATRIX (TikTok-style micro-captions, SAME frames + scene graph)
   {order_h}
 - Each cell: caption_style, caption_tone, caption_voice (match row), tiktok_caption (45-320 chars),
   hashtags (0-6 strings without #) grounded in the same evidence as the main task.
-- Block A: styles story,punchy,factual x each UI voice with tone FIXED to "{caption_tone}".
-- Block B: tones authentic,hype,calm,cinematic with style FIXED to "{caption_style}" and voice FIXED to "{caption_voice_ui}".
+- Sweep EVERY registered style (tone+voice fixed to user), EVERY registered tone (style+voice fixed),
+  and EVERY registered voice (style+tone fixed). Do not invent style/tone/voice keys outside the order list.
 - REGURGITATE at least one concrete token from vision, OCR, geo, transcript, VI timeline, or telemetry per cell when present.
 - No duplicate captions; vary hook while staying truthful.
 """
         matrix_close = ',\n  "caption_evidence_matrix": {\n    "cells": []\n  }'
 
     hydration_contract_block = m8_hydration_contract_block(ctx, generate_hashtags=generate_hashtags)
+    hydration_timeline_brief = _build_hydration_timeline_brief(scene_graph)
 
     return f"""You are {M8_ENGINE_AI_DISPLAY} - UploadM8's M8_ENGINE multimodal publishing brain
 (version {M8_ENGINE_VERSION}). You combine evidence from the scene graph with M8_ENGINE AI priors when provided.
@@ -1042,18 +1054,18 @@ emotional_tone from audio context when present, GPS/lat-lon + place names, telem
 dashcam_osd HUD facts (speed/date/GPS/driver) when present,
 Google Video Intelligence (full-clip labels + segment timeline when present),
 merged multi-frame Vision (union labels + OCR from several moments), faces, landmark hints, and video understanding.
-Use scene_graph.hydration_story as the short factual scene paragraph: it is the preferred backbone for chaining
+Read the HYDRATION + TIMELINE BRIEF first — it is denser and more reliable than skimming the JSON.
+Use scene_graph.hydration_story as the short factual scene paragraph: preferred backbone for chaining
 time, place, visual subjects, music, speech, and analysis into one grounded story beat.
-Use scene_graph.timeline (when present) as the ORDERED list of beats in this video — each entry is
-{{t_seconds, kind, text}}. Treat it as the source of truth for sequence: hook from an early beat (low t_seconds),
-land the climax from a peak beat (e.g. osd_speed / object / on_screen_text / landmark), and tie back to a
-late beat for the closer. Captions and titles must reference at least one beat token verbatim (place name,
-MPH number, on-screen text fragment, landmark, or driver) when the timeline contains them.
+Use scene_graph.timeline (when present) as the ORDERED list of beats — each entry is
+{{t_seconds, kind, text}}. Hook from an early beat, climax from a mid/peak beat (osd_speed_beat /
+trusted MPH sample / music / landmark), closer from a late beat. Titles/captions must cite at least
+one beat token verbatim when the timeline has them.
 When trend_intel.summary / trend_intel.rows are present, treat them as **recent search-title shape** for the niche only —
 borrow pacing and topic nouns, never copy titles or pretend this video matches an unrelated viral clip.
 Do NOT write from transcript alone when other fields are populated. Prefer nouns from labels + geo + OCR over generic hype.
-If dashcam_osd.gps_fix_count or geo fields are populated, each title/caption pair must include at least one
-real route/HUD/place anchor: speed in MPH, road/city/state/protected-area/gazetteer place, Trill bucket, or driver name.
+If dashcam_osd or geo fields are populated, each title/caption pair must include at least one
+real route/HUD/place anchor: a trusted MPH sample, road/city/state, Trill bucket, driver, or song.
 
 CAPTION + HASHTAG AUDIO DISCIPLINE: If transcript.text is non-empty, the caption hook should acknowledge what is
 actually said (themes, names, punchlines) without fabricated quotes. If music.* identifies a track, captions and
@@ -1061,6 +1073,7 @@ hashtags may reference artist/title/genre tokens for discovery while respecting 
 ANTI-GENERIC RULES. If audio_environment or fusion_narrative describe ambience, fold 1–2 audible cues into prose
 and hashtag tokens so posts match how the clip sounds, not only how it looks.
 
+{hydration_timeline_brief}
 SCENE GRAPH (evidence - do not invent beyond it; you may interpret visually grounded details):
 {sg}
 
@@ -1263,15 +1276,42 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
         seen.add(key)
         out.append(s)
 
-    # 1. Speed (HUD / .map) — highest-info short anchor
+    # 1. Speed (HUD / .map) — shared trusted-peak resolver (telemetry wins)
+    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
     osd = scene_graph.get("dashcam_osd") or {}
     geo = scene_graph.get("geo") or {}
-    max_mph = osd.get("max_speed_mph") or geo.get("max_speed_mph")
-    if max_mph:
+    series_vals: List[float] = []
+    for entry in (osd.get("speed_series") or []) if isinstance(osd, dict) else []:
+        if not isinstance(entry, dict):
+            continue
         try:
-            _push(f"{int(round(float(max_mph)))} MPH")
+            v = float(entry.get("mph") or entry.get("speed_mph") or 0)
         except (TypeError, ValueError):
-            pass
+            continue
+        if v >= 5:
+            series_vals.append(v)
+    series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
+    try:
+        geo_peak = float(geo.get("max_speed_mph") or 0)
+    except (TypeError, ValueError):
+        geo_peak = 0.0
+    try:
+        osd_peak = float(osd.get("max_speed_mph") or 0) if isinstance(osd, dict) else 0.0
+    except (TypeError, ValueError):
+        osd_peak = 0.0
+    # geo.max_speed_mph is usually telemetry-backed; treat as telemetry when present.
+    peak_f, _src = trusted_peak_speed_mph(
+        telemetry_max=geo_peak,
+        osd_max=osd_peak,
+        series_peak=series_peak,
+    )
+    if peak_f >= 5:
+        _push(f"{int(round(peak_f))} MPH")
+    if len(series_vals) >= 2:
+        mid = series_vals[len(series_vals) // 2]
+        if abs(mid - peak_f) >= 5:
+            _push(f"{int(round(mid))} MPH")
 
     # 2. Place (road, gazetteer, city/state, protected area)
     if geo.get("road"):
@@ -1662,14 +1702,15 @@ def score_variant(
     scene_graph: Dict[str, Any],
     historical_signals: Optional[Dict[str, Any]] = None,
     must_use: Optional[List[str]] = None,
+    *,
+    min_must_use: int = 2,
 ) -> Tuple[float, str]:
     """
     Return (score, rationale). Higher is better.
     historical_signals: optional per-platform priors from DB/analytics (future).
-    must_use: shortlist of evidence tokens that the variant MUST cover ≥2 of.
-              Passing must_use=[] disables the hard-fail floor (used when no
-              evidence is available at all — defense via hydration_enforcer
-              still runs in those cases).
+    must_use: shortlist of evidence tokens that the variant MUST cover
+              (≥ min_must_use; freestyle uses 1). Passing must_use=[] disables
+              the hard-fail floor.
     """
     caption = str(variant.get("caption") or "")
     title = str(variant.get("title") or "") if variant.get("title") is not None else ""
@@ -1691,7 +1732,9 @@ def score_variant(
     # mechanism that makes "Cruise under vast skies"-style template copy
     # literally unable to win — no length/hook bonus can recover from -200.
     if must_use:
-        cov = _evidence_coverage_score(caption, title, must_use)
+        cov = _evidence_coverage_score(
+            caption, title, must_use, min_required=max(1, int(min_must_use))
+        )
         base += cov
         coverage_note = f" (evidence_coverage={cov:+.0f})"
     else:
@@ -1731,6 +1774,13 @@ def rank_and_select(
     platforms_block = (parsed.get("platforms") or {}) if isinstance(parsed, dict) else {}
     must_use_base = build_must_use_shortlist(scene_graph)
     must_use = merge_m8_must_use_tokens(must_use_base, ctx, max_tokens=12)
+    style_ui = ""
+    if ctx is not None:
+        us = getattr(ctx, "user_settings", None) or {}
+        style_ui = str(us.get("captionStyle") or us.get("caption_style") or "").lower()
+    if not style_ui:
+        style_ui = str(((strategy or {}).get("outputs") or {}).get("caption_style") or "").lower()
+    min_must = 1 if style_ui == "freestyle" else 2
 
     for pl in scene_graph.get("platforms") or []:
         pl = str(pl).lower()
@@ -1742,7 +1792,9 @@ def rank_and_select(
         for v in variants[:12]:
             if not isinstance(v, dict):
                 continue
-            sc, why = score_variant(pl, v, scene_graph, historical_signals, must_use=must_use)
+            sc, why = score_variant(
+                pl, v, scene_graph, historical_signals, must_use=must_use, min_must_use=min_must
+            )
             item = {
                 "variant_index": v.get("variant_index"),
                 "title": v.get("title"),

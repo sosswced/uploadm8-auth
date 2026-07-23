@@ -34,9 +34,11 @@ class UserPreferencesUpdate(BaseModel):
     email_notifications: bool = Field(True, alias="emailNotifications")
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
     # Caption & AI (stored in users.preferences; worker caption_stage reads these)
-    caption_style: Literal["story", "punchy", "factual"] = Field("story", alias="captionStyle")
-    caption_tone: Literal["hype", "calm", "cinematic", "authentic"] = Field("authentic", alias="captionTone")
-    caption_voice: Literal["default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator"] = Field("default", alias="captionVoice")
+    # Allowlists live in core.caption_creative — keep str here so new knobs
+    # do not require Literal churn; routers normalize against the registry.
+    caption_style: str = Field("story", alias="captionStyle")
+    caption_tone: str = Field("authentic", alias="captionTone")
+    caption_voice: str = Field("default", alias="captionVoice")
     caption_frame_count: int = Field(6, ge=2, le=12, alias="captionFrameCount")
     # Thumbnail ML / pipeline (stored in users.preferences; worker thumbnail_stage reads these)
     thumbnail_selection_mode: Optional[Literal["ai", "sharpness"]] = Field(

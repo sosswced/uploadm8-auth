@@ -48,6 +48,77 @@ VERIFY_LOCK_TTL_SECONDS = int(
     )
 )
 
+# Retryable verify outcomes must stay "pending" so load_pending_verifications
+# keeps polling. Terminal outcomes stop the loop.
+_TERMINAL_VERIFY_STATUSES = frozenset({"confirmed", "rejected", "failed"})
+
+
+def _is_terminal_verify_status(status: Optional[str]) -> bool:
+    return str(status or "").strip().lower() in _TERMINAL_VERIFY_STATUSES
+
+
+def _next_verify_status(
+    platform: str,
+    raw_status: str,
+    *,
+    has_video_id: bool,
+) -> str:
+    """
+    Map platform API outcomes to a durable verify_status.
+
+    ``unknown`` / missing-token blips must NOT park the attempt forever —
+    that left TikTok rows stuck on "Awaiting confirmation" in the UI.
+    """
+    plat = str(platform or "").strip().lower()
+    status = str(raw_status or "").strip().lower()
+
+    if status == "rejected" or status == "failed":
+        return status if status in _TERMINAL_VERIFY_STATUSES else "rejected"
+
+    if plat == "tiktok":
+        # TikTok Step B is only done when PUBLISH_COMPLETE *and* we have video_id
+        # (sync-analytics / UI need the real id, not publish_id).
+        if status == "confirmed" and has_video_id:
+            return "confirmed"
+        return "pending"
+
+    if plat == "youtube":
+        if status == "confirmed":
+            return "confirmed"
+        if status == "pending":
+            return "pending"
+        # unknown → keep polling within the age window
+        return "pending"
+
+    # Instagram / Facebook: publish already stores media/post id as platform_post_id.
+    if has_video_id:
+        return "confirmed"
+    return "pending"
+
+
+def _tiktok_items_to_update(pr_list: Any, publish_id: Optional[str]) -> list:
+    """Pick TikTok platform_results rows to stamp with the confirmed video_id."""
+    if not isinstance(pr_list, list):
+        return []
+    tiktoks = [
+        i
+        for i in pr_list
+        if isinstance(i, dict) and str(i.get("platform") or "").strip().lower() == "tiktok"
+    ]
+    if not tiktoks:
+        return []
+    pub = str(publish_id or "").strip()
+    if pub:
+        by_pub = [i for i in tiktoks if str(i.get("publish_id") or "").strip() == pub]
+        if by_pub:
+            return by_pub
+    awaiting = [
+        i
+        for i in tiktoks
+        if not str(i.get("platform_video_id") or i.get("video_id") or "").strip()
+    ]
+    return awaiting or tiktoks[:1]
+
 
 async def verify_tiktok(publish_id: str, token_data: dict):
     """
@@ -177,8 +248,10 @@ async def verify_single_attempt(
         pass
 
     if not token_data:
-        # Can't verify without token — mark unknown
-        await db_stage.update_publish_attempt_verified(db_pool, attempt_id, "unknown")
+        # Token missing/revoked — keep pending so reconnect can finish confirmation.
+        logger.debug("Verify %s/%s: no token — leave pending", platform, attempt_id)
+        if prev_verify != "pending":
+            await db_stage.update_publish_attempt_verified(db_pool, attempt_id, "pending")
         return
 
     # Decrypt if needed
@@ -188,20 +261,40 @@ async def verify_single_attempt(
         pass
 
     # Platform-specific verification
-    verify_status = "unknown"
+    raw_status = "unknown"
     tiktok_video_id: Optional[str] = None
 
     if platform == "tiktok" and publish_id:
-        verify_status, tiktok_video_id = await verify_tiktok(publish_id, token_data)
+        raw_status, tiktok_video_id = await verify_tiktok(publish_id, token_data)
     elif platform == "youtube" and platform_post_id:
-        verify_status = await verify_youtube(platform_post_id, token_data)
+        raw_status = await verify_youtube(platform_post_id, token_data)
+    elif platform in ("instagram", "facebook") and platform_post_id:
+        # Publish already stored the media/post id — treat as confirmed live.
+        raw_status = "confirmed"
+    elif platform in ("instagram", "facebook"):
+        raw_status = "pending"
     else:
-        # Instagram/Facebook verification not yet implemented
-        verify_status = "unknown"
+        raw_status = "unknown"
 
-    # Update publish_attempts row
-    await db_stage.update_publish_attempt_verified(db_pool, attempt_id, verify_status)
-    logger.debug(f"Verify {platform}/{attempt_id}: {verify_status}")
+    has_video_id = bool(
+        (tiktok_video_id and str(tiktok_video_id).strip())
+        or (platform_post_id and str(platform_post_id).strip() and platform != "tiktok")
+    )
+    verify_status = _next_verify_status(
+        platform, raw_status, has_video_id=has_video_id
+    )
+
+    # Persist status (pending stays pending so the loop keeps polling).
+    if verify_status != prev_verify or _is_terminal_verify_status(verify_status):
+        await db_stage.update_publish_attempt_verified(db_pool, attempt_id, verify_status)
+    logger.debug(
+        "Verify %s/%s: raw=%s → %s video_id=%s",
+        platform,
+        attempt_id,
+        raw_status,
+        verify_status,
+        bool(tiktok_video_id),
+    )
 
     # When TikTok confirms, save the real video_id back into platform_results on the uploads row.
     # The initial publish only returns a publish_id — the video_id is only available after
@@ -217,29 +310,43 @@ async def verify_single_attempt(
                     if row:
                         import json as _json
                         pr = row["platform_results"]
-                        pr_list = _json.loads(pr) if isinstance(pr, str) else (pr or [])
-                        if isinstance(pr_list, list):
+                        pr_list = pr
+                        for _ in range(4):
+                            if isinstance(pr_list, str):
+                                try:
+                                    pr_list = _json.loads(pr_list)
+                                except Exception:
+                                    pr_list = []
+                                    break
+                            else:
+                                break
+                        if not isinstance(pr_list, list):
+                            pr_list = []
+                        targets = _tiktok_items_to_update(pr_list, publish_id)
+                        if targets:
                             updated = False
-                            for item in pr_list:
-                                if isinstance(item, dict) and item.get("platform") == "tiktok":
-                                    item["platform_video_id"] = tiktok_video_id
-                                    item["video_id"] = tiktok_video_id
-                                    uname = (item.get("account_username") or "").strip().lstrip("@")
-                                    if not uname and isinstance(token_data, dict):
-                                        uname = (
-                                            str(token_data.get("_account_username") or "")
-                                            .strip()
-                                            .lstrip("@")
-                                        )
-                                    tt_url = _tiktok_web_video_url(tiktok_video_id, uname)
-                                    item["platform_url"] = tt_url
-                                    item["url"] = tt_url
-                                    tiktok_post_url = tt_url
-                                    updated = True
+                            for item in targets:
+                                item["platform_video_id"] = tiktok_video_id
+                                item["video_id"] = tiktok_video_id
+                                item["verify_status"] = "confirmed"
+                                uname = (item.get("account_username") or "").strip().lstrip("@")
+                                if not uname and isinstance(token_data, dict):
+                                    uname = (
+                                        str(token_data.get("_account_username") or "")
+                                        .strip()
+                                        .lstrip("@")
+                                    )
+                                tt_url = _tiktok_web_video_url(tiktok_video_id, uname)
+                                item["platform_url"] = tt_url
+                                item["url"] = tt_url
+                                tiktok_post_url = tt_url
+                                updated = True
                             if updated:
                                 await conn.execute(
                                     "UPDATE uploads SET platform_results = $1::jsonb, updated_at = NOW() WHERE id = $2",
-                                    _json.dumps(pr_list), upload_id
+                                    # Pass list — codecs that always dumps() must not see a pre-dumped str.
+                                    pr_list,
+                                    upload_id,
                                 )
                                 logger.info(
                                     f"Saved TikTok video_id={tiktok_video_id} back to "

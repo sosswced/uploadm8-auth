@@ -932,11 +932,15 @@ async def _backfill_tiktok_video_ids(
     updated = 0
     for row in upload_rows:
         pr = row["platform_results"]
-        if isinstance(pr, str):
-            try:
-                pr = json.loads(pr)
-            except Exception:
-                pr = []
+        for _ in range(4):
+            if isinstance(pr, str):
+                try:
+                    pr = json.loads(pr)
+                except Exception:
+                    pr = []
+                    break
+            else:
+                break
         if not isinstance(pr, list):
             pr = []
 
@@ -1011,7 +1015,9 @@ async def _backfill_tiktok_video_ids(
                    SET platform_results = $1::jsonb, updated_at = NOW()
                  WHERE id = $2::uuid
                 """,
-                json.dumps(pr), str(row["id"]),
+                # Pass list — codecs that always dumps() must not see a pre-dumped str.
+                pr,
+                str(row["id"]),
             )
             # Also promote catalog row source and link upload_id
             await conn.execute(

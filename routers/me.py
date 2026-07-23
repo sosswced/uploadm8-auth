@@ -1424,27 +1424,25 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
     if "ai_hashtag_style" in prefs and prefs["ai_hashtag_style"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
         prefs["ai_hashtag_style"] = "mixed"
 
-    # Caption & AI Settings — style / tone / voice (worker caption_stage reads these)
-    _CAPTION_STYLES = ("story", "punchy", "factual")
-    _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
-    _CAPTION_VOICES = (
-        "default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator",
+    # Caption & AI Settings — allowlists from core.caption_creative (single source).
+    from core.caption_creative import (
+        normalize_caption_style,
+        normalize_caption_tone,
+        normalize_caption_voice,
     )
+
     if "captionStyle" in prefs or "caption_style" in prefs:
-        v = str(prefs.get("captionStyle") or prefs.get("caption_style") or "story").strip().lower()
-        if v not in _CAPTION_STYLES:
-            v = "story"
-        prefs["captionStyle"] = prefs["caption_style"] = v
+        prefs["captionStyle"] = prefs["caption_style"] = normalize_caption_style(
+            prefs.get("captionStyle") or prefs.get("caption_style")
+        )
     if "captionTone" in prefs or "caption_tone" in prefs:
-        v = str(prefs.get("captionTone") or prefs.get("caption_tone") or "authentic").strip().lower()
-        if v not in _CAPTION_TONES:
-            v = "authentic"
-        prefs["captionTone"] = prefs["caption_tone"] = v
+        prefs["captionTone"] = prefs["caption_tone"] = normalize_caption_tone(
+            prefs.get("captionTone") or prefs.get("caption_tone")
+        )
     if "captionVoice" in prefs or "caption_voice" in prefs:
-        v = str(prefs.get("captionVoice") or prefs.get("caption_voice") or "default").strip().lower()
-        if v not in _CAPTION_VOICES:
-            v = "default"
-        prefs["captionVoice"] = prefs["caption_voice"] = v
+        prefs["captionVoice"] = prefs["caption_voice"] = normalize_caption_voice(
+            prefs.get("captionVoice") or prefs.get("caption_voice")
+        )
 
     _THUMB_SELECTION = ("ai", "sharpness")
     _THUMB_PIPELINE = frozenset(

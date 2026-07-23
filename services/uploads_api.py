@@ -21,11 +21,16 @@ logger = logging.getLogger("uploadm8-api")
 
 def _parse_platform_results_items(upload_row: dict) -> list:
     raw = upload_row.get("platform_results") or []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            raw = []
+    # Unwrap legacy double-encoded jsonb strings: '"[{...}]"' → list.
+    for _ in range(4):
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
+                break
+        else:
+            break
 
     if isinstance(raw, dict):
         return [{"platform": k, **v} for k, v in raw.items() if isinstance(v, dict)]

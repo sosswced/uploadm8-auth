@@ -578,7 +578,11 @@ async def get_user_preferences(
                 "digestEmails": bool(d.get("digest_emails", True)),
                 "scheduledAlertEmails": bool(d.get("scheduled_alert_emails", True)),
                 "aiServiceTelemetry": bool(d.get("ai_service_telemetry", True)),
-                "aiServiceDashcamOSD": bool(d.get("ai_service_dashcam_osd", True)),
+                "aiServiceDashcamOSD": bool(d.get("ai_service_dashcam_osd", False)),
+                "defaultVehicleMakeId": d.get("default_vehicle_make_id"),
+                "defaultVehicleModelId": d.get("default_vehicle_model_id"),
+                "default_vehicle_make_id": d.get("default_vehicle_make_id"),
+                "default_vehicle_model_id": d.get("default_vehicle_model_id"),
                 "aiServiceAudioSignals": bool(d.get("ai_service_audio_signals", True)),
                 "aiServiceMusicDetection": bool(d.get("ai_service_music_detection", True)),
                 "aiServiceAudioSummary": bool(d.get("ai_service_audio_summary", True)),
@@ -675,7 +679,9 @@ async def get_user_preferences(
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
             "thumbnailSelectionMode": "sharpness", "thumbnail_selection_mode": "sharpness",
             "thumbnailRenderPipeline": "auto", "thumbnail_render_pipeline": "auto",
-            "aiServiceDashcamOSD": True, "ai_service_dashcam_osd": True,
+            "aiServiceDashcamOSD": False, "ai_service_dashcam_osd": False,
+            "defaultVehicleMakeId": None, "defaultVehicleModelId": None,
+            "default_vehicle_make_id": None, "default_vehicle_model_id": None,
             "thumbnail_personas": [], "thumbnailPersonas": [],
         })
 

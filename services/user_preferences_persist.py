@@ -528,16 +528,12 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             k in p or sk in p for k, sk in zip(thumb_keys, thumb_snake)
         ) or any(k in p for k in studio_keys) or any(c in p or s in p for c, s in upload_ai_keys):
             try:
-                _CAPTION_STYLES = ("story", "punchy", "factual")
-                _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
-                _CAPTION_VOICES = (
-                    "default",
-                    "mentor",
-                    "hypebeast",
-                    "best_friend",
-                    "teacher",
-                    "cinematic_narrator",
+                from core.caption_creative import (
+                    normalize_caption_style,
+                    normalize_caption_tone,
+                    normalize_caption_voice,
                 )
+
                 users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", uid)
                 users_prefs: dict[str, Any] = {}
                 if users_prefs_row:
@@ -547,19 +543,16 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 if not isinstance(users_prefs, dict):
                     users_prefs = {}
                 if "captionStyle" in p or "caption_style" in p:
-                    v = str(p.get("captionStyle") or p.get("caption_style") or "story").strip().lower()
-                    users_prefs["captionStyle"] = users_prefs["caption_style"] = (
-                        v if v in _CAPTION_STYLES else "story"
+                    users_prefs["captionStyle"] = users_prefs["caption_style"] = normalize_caption_style(
+                        p.get("captionStyle") or p.get("caption_style")
                     )
                 if "captionTone" in p or "caption_tone" in p:
-                    v = str(p.get("captionTone") or p.get("caption_tone") or "authentic").strip().lower()
-                    users_prefs["captionTone"] = users_prefs["caption_tone"] = (
-                        v if v in _CAPTION_TONES else "authentic"
+                    users_prefs["captionTone"] = users_prefs["caption_tone"] = normalize_caption_tone(
+                        p.get("captionTone") or p.get("caption_tone")
                     )
                 if "captionVoice" in p or "caption_voice" in p:
-                    v = str(p.get("captionVoice") or p.get("caption_voice") or "default").strip().lower()
-                    users_prefs["captionVoice"] = users_prefs["caption_voice"] = (
-                        v if v in _CAPTION_VOICES else "default"
+                    users_prefs["captionVoice"] = users_prefs["caption_voice"] = normalize_caption_voice(
+                        p.get("captionVoice") or p.get("caption_voice")
                     )
                 if "captionFrameCount" in p or "caption_frame_count" in p:
                     try:

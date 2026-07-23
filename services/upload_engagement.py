@@ -50,6 +50,12 @@ def rollup_engagement_from_platform_results(
 
 def normalize_upload_platform_results_list(raw: Any) -> list:
     pr = safe_json(raw, [])
+    # Legacy rows may be double-encoded jsonb strings ('"[{...}]"').
+    for _ in range(3):
+        if isinstance(pr, str):
+            pr = safe_json(pr, [])
+        else:
+            break
     if isinstance(pr, dict):
         return [{"platform": k, **v} if isinstance(v, dict) else {"platform": k} for k, v in pr.items()]
     if isinstance(pr, list):

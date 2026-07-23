@@ -164,12 +164,20 @@ def clamp_pikzels_image_prompt(prompt: str) -> str:
 _THUMB_NOTES_PLACEHOLDERS = frozenset({"No AI — evidence-based brief", "Fallback brief"})
 
 # Per-platform aspect ratio for ``/v2/thumbnail/image``.
+# YouTube is landscape; IG / Facebook Reels / TikTok share vertical 9:16 — callers
+# should reuse one successful render across platforms with the same format.
 _PLATFORM_FORMAT: Dict[str, str] = {
     "youtube": "16:9",
     "instagram": "9:16",
     "facebook": "9:16",
     "tiktok": "9:16",
 }
+
+
+def pikzels_format_for_platform(platform: str) -> str:
+    """Pikzels ``format`` string for a publish platform (defaults to 16:9)."""
+    plat = str(platform or "").strip().lower()
+    return _PLATFORM_FORMAT.get(plat, "16:9")
 
 
 def studio_renderer_enabled() -> bool:

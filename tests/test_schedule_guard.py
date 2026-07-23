@@ -106,6 +106,16 @@ def test_should_auto_retry_transient_immediate_failed():
     assert should_auto_retry_upload(row) is True
 
 
+def test_should_auto_retry_stuck_ready_scheduled():
+    row = {
+        "status": "failed",
+        "schedule_mode": "scheduled",
+        "error_code": "STUCK_READY_TO_PUBLISH",
+        "output_artifacts": {},
+    }
+    assert should_auto_retry_upload(row) is True
+
+
 def test_should_not_auto_retry_hard_block():
     row = {
         "status": "failed",
@@ -114,6 +124,30 @@ def test_should_not_auto_retry_hard_block():
         "output_artifacts": {},
     }
     assert should_auto_retry_upload(row) is False
+
+
+def test_upload_is_overdue_ready_to_publish():
+    from datetime import datetime, timedelta, timezone
+
+    from services.retry_policy import upload_is_overdue_ready_to_publish
+
+    now = datetime(2026, 7, 19, 18, 0, tzinfo=timezone.utc)
+    due = now - timedelta(minutes=10)
+    assert upload_is_overdue_ready_to_publish(
+        {"status": "ready_to_publish", "scheduled_time": due},
+        grace_minutes=5,
+        now=now,
+    )
+    assert not upload_is_overdue_ready_to_publish(
+        {"status": "ready_to_publish", "scheduled_time": now - timedelta(minutes=2)},
+        grace_minutes=5,
+        now=now,
+    )
+    assert not upload_is_overdue_ready_to_publish(
+        {"status": "staged", "scheduled_time": due},
+        grace_minutes=5,
+        now=now,
+    )
 
 
 def test_repair_scheduled_without_time_uses_smart_path():

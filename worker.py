@@ -3681,11 +3681,24 @@ async def run_scheduler_loop() -> None:
                 # workers are already saturated.
                 free_slots = _process_slots_free()
                 from core.process_stats import blocks_new_process_job
+                from services.worker_admission import process_dispatch_limit
 
-                if blocks_new_process_job() or free_slots <= 0:
-                    dispatch_limit = 0
-                else:
-                    dispatch_limit = max(1, free_slots)
+                fleet_summary = None
+                try:
+                    from services.worker_fleet_snapshot import (
+                        fetch_worker_heartbeat_rows,
+                        summarize_fleet,
+                    )
+
+                    fleet_summary = summarize_fleet(await fetch_worker_heartbeat_rows(db_pool))
+                except Exception:
+                    fleet_summary = None
+
+                dispatch_limit = process_dispatch_limit(
+                    local_free_slots=free_slots,
+                    memory_blocks=blocks_new_process_job(),
+                    fleet=fleet_summary,
+                )
 
                 staged_jobs = await conn.fetch(
                     """
@@ -3836,16 +3849,67 @@ async def run_scheduler_loop() -> None:
     logger.info("Scheduler loop stopped")
 
 
+def upload_row_indicates_active_pipeline(
+    *,
+    status: Any,
+    processing_stage: Any,
+    updated_at: Any = None,
+    stale_after_minutes: int | None = None,
+) -> bool:
+    """
+    True when another worker has *entered* the pipeline for this upload.
+
+    ``status='processing'`` alone is NOT enough — ``/complete`` and enqueue set
+    that before the consumer runs. Skipping on status deadlocks the job
+    (stage stays null forever). ``claimed`` (set by mark_processing_started)
+    counts as active until a real stage overwrites it.
+    """
+    if str(status or "").strip().lower() != "processing":
+        return False
+    stage = str(processing_stage or "").strip()
+    if not stage:
+        return False
+    if stale_after_minutes is None:
+        try:
+            from services.worker_admission import active_pipeline_stale_minutes
+
+            stale_after_minutes = active_pipeline_stale_minutes()
+        except Exception:
+            stale_after_minutes = 90
+    if updated_at is not None and stale_after_minutes > 0:
+        try:
+            from datetime import datetime, timedelta, timezone
+
+            ts = updated_at
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - ts > timedelta(minutes=int(stale_after_minutes)):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 async def _upload_already_processing(upload_id: str) -> bool:
     if not upload_id or db_pool is None:
         return False
     try:
         async with db_pool.acquire() as conn:
-            st = await conn.fetchval(
-                "SELECT status FROM uploads WHERE id = $1::uuid",
+            row = await conn.fetchrow(
+                """
+                SELECT status, processing_stage, updated_at
+                  FROM uploads
+                 WHERE id = $1::uuid
+                """,
                 upload_id,
             )
-        return str(st or "").lower() == "processing"
+        if not row:
+            return False
+        return upload_row_indicates_active_pipeline(
+            status=row["status"],
+            processing_stage=row["processing_stage"],
+            updated_at=row["updated_at"],
+        )
     except Exception:
         return False
 
@@ -5043,6 +5107,11 @@ async def _ensure_worker_heartbeat_schema() -> None:
             "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS active_publish_jobs JSONB",
             "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS hostname TEXT",
             "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS git_commit TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS memory_pct REAL",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS memory_pressure TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS heavy_slots_in_use INT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS load_1m REAL",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS admission_blocked BOOLEAN",
         ):
             await conn.execute(ddl)
 
@@ -5051,13 +5120,13 @@ def _heartbeat_runtime_snapshot() -> dict:
     """Collect memory, slot usage, and active jobs for this worker instance."""
     from core.process_stats import (
         format_semaphore_slots,
+        observability_sample,
         render_instance_context,
-        sample_memory_mb,
         worker_config_snapshot,
     )
     from services.worker_runtime_state import snapshot as runtime_snapshot
 
-    mem = sample_memory_mb()
+    obs = observability_sample()
     cfg = worker_config_snapshot()
     inst = render_instance_context()
     jobs = runtime_snapshot()
@@ -5065,7 +5134,8 @@ def _heartbeat_runtime_snapshot() -> dict:
     pub_slots = format_semaphore_slots(PUBLISH_CONCURRENCY, _publish_semaphore)
     heavy_slots = format_semaphore_slots(WORKER_HEAVY_PIPELINE_SLOTS, _heavy_semaphore)
     return {
-        "mem": mem,
+        "mem": obs,
+        "obs": obs,
         "cfg": cfg,
         "inst": inst,
         "jobs": jobs,
@@ -5167,7 +5237,13 @@ async def run_heartbeat_loop() -> None:
                             process_slots_in_use = $4,
                             publish_slots_in_use = $5,
                             active_process_jobs = $6::jsonb,
-                            active_publish_jobs = $7::jsonb
+                            active_publish_jobs = $7::jsonb,
+                            memory_pct = $8,
+                            memory_pressure = $9,
+                            heavy_slots_in_use = $10,
+                            load_1m = $11,
+                            admission_blocked = $12,
+                            memory_limit_mb = COALESCE($13, memory_limit_mb)
                         WHERE worker_id = $1
                         """,
                         WORKER_ID,
@@ -5177,6 +5253,12 @@ async def run_heartbeat_loop() -> None:
                         snap["pub_slots"]["in_use"],
                         json.dumps(jobs.get("active_process_jobs") or []),
                         json.dumps(jobs.get("active_publish_jobs") or []),
+                        mem.get("pct_of_limit"),
+                        mem.get("memory_pressure"),
+                        snap["heavy_slots"]["in_use"],
+                        mem.get("load_1m"),
+                        bool(mem.get("admission_blocked")),
+                        mem.get("limit_mb"),
                     )
             pct = mem.get("pct_of_limit")
             if pct is not None and pct >= mem_warn_pct:
@@ -5184,12 +5266,14 @@ async def run_heartbeat_loop() -> None:
                 if now - last_mem_warn_at >= 60:
                     last_mem_warn_at = now
                     logger.warning(
-                        "Memory pressure | rss=%sMB peak=%sMB limit=%sMB pct=%s%% | "
+                        "Memory pressure | rss=%sMB peak=%sMB limit=%sMB pct=%s%% pressure=%s load1=%s | "
                         "process_slots=%s/%s heavy=%s/%s | active_process=%s active_publish=%s | jobs=%s",
                         mem.get("rss_mb"),
                         mem.get("peak_rss_mb"),
                         mem.get("limit_mb"),
                         pct,
+                        mem.get("memory_pressure"),
+                        mem.get("load_1m"),
                         snap["proc_slots"]["in_use"],
                         snap["proc_slots"]["total"],
                         snap["heavy_slots"]["in_use"],
@@ -5198,6 +5282,17 @@ async def run_heartbeat_loop() -> None:
                         jobs.get("publish_count"),
                         [j.get("upload_id") for j in (jobs.get("active_process_jobs") or [])[:5]],
                     )
+                    if mem.get("memory_pressure") == "hard":
+                        try:
+                            import sentry_sdk
+
+                            sentry_sdk.capture_message(
+                                f"Worker hard memory pressure {pct}% "
+                                f"(rss={mem.get('rss_mb')} limit={mem.get('limit_mb')})",
+                                level="warning",
+                            )
+                        except Exception:
+                            pass
         except Exception as e:
             # Don't crash the loop on transient DB issues — supervisor would
             # restart us, but heartbeat misses are themselves the signal admin
@@ -5254,6 +5349,30 @@ async def main() -> None:
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
+
+    try:
+        from core.sentry_init import init_sentry_for_worker
+
+        init_sentry_for_worker()
+        try:
+            import sentry_sdk
+
+            from core.process_stats import render_instance_context, worker_config_snapshot
+
+            inst = render_instance_context()
+            cfg = worker_config_snapshot()
+            sentry_sdk.set_tag("component", "worker")
+            sentry_sdk.set_tag("worker_lane", str(cfg.get("worker_lane") or "full"))
+            if inst.get("instance_id"):
+                sentry_sdk.set_tag("render_instance_id", str(inst["instance_id"])[:64])
+            if inst.get("service_id"):
+                sentry_sdk.set_tag("render_service_id", str(inst["service_id"])[:64])
+            if inst.get("git_commit"):
+                sentry_sdk.set_tag("git_commit", str(inst["git_commit"])[:12])
+        except Exception:
+            pass
+    except Exception as _sentry_e:
+        logger.warning("Sentry worker init skipped: %s", _sentry_e)
 
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")

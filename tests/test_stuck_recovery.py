@@ -191,6 +191,89 @@ def test_recover_stuck_ready_immediate_null_schedule_does_not_fail(monkeypatch):
     assert stats["skipped"] >= 1
 
 
+def test_recover_stuck_ready_immediate_redispatches_when_due(monkeypatch):
+    idle = datetime.now(timezone.utc) - timedelta(minutes=35)
+    rows = [
+        {
+            "id": "u-ready-imm-due",
+            "user_id": "user-1",
+            "schedule_mode": "immediate",
+            "platforms": ["tiktok", "youtube"],
+            "schedule_metadata": None,
+            "scheduled_time": None,
+            "platform_results": None,
+            "target_accounts": None,
+            "processed_assets": {"tiktok": "x", "youtube": "y"},
+            "updated_at": idle,
+            "created_at": idle,
+        }
+    ]
+    conn = _FakeConn(rows)
+    dispatch = AsyncMock()
+    mark = AsyncMock()
+    monkeypatch.setattr(sr, "mark_schedule_incomplete_failed", mark)
+    monkeypatch.setattr(sr, "loud_upload_schedule_failure", AsyncMock())
+
+    async def _run():
+        return await sr.recover_stuck_ready_to_publish(
+            conn,
+            None,
+            dispatch_publish=dispatch,
+            redispatch_minutes=30,
+            fail_minutes=120,
+            limit=5,
+        )
+
+    stats = asyncio.run(_run())
+    assert stats["failed"] == 0
+    assert stats["redispatched"] == 1
+    dispatch.assert_awaited()
+
+
+def test_recover_stuck_ready_skips_when_nothing_due(monkeypatch):
+    """All platforms already handled — do not redispatch (empty-due burn loop)."""
+    idle = datetime.now(timezone.utc) - timedelta(minutes=35)
+    rows = [
+        {
+            "id": "u-ready-done",
+            "user_id": "user-1",
+            "schedule_mode": "immediate",
+            "platforms": ["tiktok", "youtube"],
+            "schedule_metadata": None,
+            "scheduled_time": None,
+            "platform_results": [
+                {"platform": "tiktok", "success": True},
+                {"platform": "youtube", "success": True},
+            ],
+            "target_accounts": None,
+            "processed_assets": {"tiktok": "x", "youtube": "y"},
+            "updated_at": idle,
+            "created_at": idle,
+        }
+    ]
+    conn = _FakeConn(rows)
+    dispatch = AsyncMock()
+    mark = AsyncMock()
+    monkeypatch.setattr(sr, "mark_schedule_incomplete_failed", mark)
+    monkeypatch.setattr(sr, "loud_upload_schedule_failure", AsyncMock())
+
+    async def _run():
+        return await sr.recover_stuck_ready_to_publish(
+            conn,
+            None,
+            dispatch_publish=dispatch,
+            redispatch_minutes=30,
+            fail_minutes=120,
+            limit=5,
+        )
+
+    stats = asyncio.run(_run())
+    assert stats["redispatched"] == 0
+    assert stats["failed"] == 0
+    assert stats["skipped"] >= 1
+    dispatch.assert_not_awaited()
+
+
 def test_recover_stuck_ready_repairs_incomplete_metadata(monkeypatch):
     past = _utc(2026, 1, 1)
     rows = [

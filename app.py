@@ -103,6 +103,7 @@ from routers.meta_compliance import router as meta_compliance_router
 from routers.analytics import router as analytics_router
 from routers.admin import router as admin_router
 from routers.admin_catalog import router as admin_catalog_router
+from routers.admin_workers import router as admin_workers_router
 from routers.admin_contract import (
     admin_compat_router,
     marketing_router as admin_marketing_contract_router,
@@ -335,6 +336,7 @@ async def lifespan(app: FastAPI):
     trill_maintenance_task = None
     ml_engine_task = None
     marketing_automation_task = None
+    fleet_watchdog_task = None
     if core.state.db_pool:
         from services.trill_background import run_trill_maintenance_loop
 
@@ -356,6 +358,13 @@ async def lifespan(app: FastAPI):
             run_marketing_automation_loop(core.state.db_pool, core.state.redis_client)
         )
         logger.info("Marketing automation loop started (self-gates on MARKETING_AUTOMATION_ENABLED)")
+
+        from services.worker_fleet_watchdog import run_worker_fleet_watchdog_loop
+
+        fleet_watchdog_task = asyncio.create_task(
+            run_worker_fleet_watchdog_loop(core.state.db_pool, core.state.redis_client)
+        )
+        logger.info("Worker fleet watchdog started (Render OOM / crash defense)")
 
     yield
 
@@ -383,6 +392,15 @@ async def lifespan(app: FastAPI):
         marketing_automation_task.cancel()
         try:
             await marketing_automation_task
+        except _asyncio.CancelledError:
+            pass
+
+    if fleet_watchdog_task:
+        import asyncio as _asyncio
+
+        fleet_watchdog_task.cancel()
+        try:
+            await fleet_watchdog_task
         except _asyncio.CancelledError:
             pass
 
@@ -622,6 +640,7 @@ app.include_router(meta_compliance_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
 app.include_router(admin_catalog_router)
+app.include_router(admin_workers_router)
 app.include_router(admin_marketing_contract_router)
 app.include_router(admin_ml_contract_router)
 app.include_router(admin_compat_router)

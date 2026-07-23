@@ -136,6 +136,35 @@ def blocks_new_process_job(sample: Optional[Dict[str, Optional[float]]] = None) 
     return memory_pressure_level(sample) != "ok"
 
 
+def sample_load_avg() -> Dict[str, Optional[float]]:
+    """Best-effort 1/5/15 load averages from /proc/loadavg (Linux/Render)."""
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as f:
+            parts = (f.read() or "").split()
+        if len(parts) >= 3:
+            return {
+                "load_1m": round(float(parts[0]), 2),
+                "load_5m": round(float(parts[1]), 2),
+                "load_15m": round(float(parts[2]), 2),
+            }
+    except (OSError, ValueError, IndexError):
+        pass
+    return {"load_1m": None, "load_5m": None, "load_15m": None}
+
+
+def observability_sample() -> Dict[str, Any]:
+    """Combined memory + load + pressure for heartbeat / admin live panels."""
+    mem = sample_memory_mb()
+    load = sample_load_avg()
+    pressure = memory_pressure_level(mem)
+    return {
+        **mem,
+        **load,
+        "memory_pressure": pressure,
+        "admission_blocked": pressure != "ok",
+    }
+
+
 def render_instance_context() -> Dict[str, Any]:
     return {
         "instance_id": (
@@ -153,10 +182,11 @@ def render_instance_context() -> Dict[str, Any]:
 
 
 def worker_config_snapshot() -> Dict[str, Any]:
+    # Defaults match worker.py Render-safe values (concurrency=1), not legacy 3/5.
     return {
         "worker_lane": (os.environ.get("WORKER_LANE") or "full").strip().lower(),
-        "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "3") or 3),
-        "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "5") or 5),
+        "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "1") or 1),
+        "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "1") or 1),
         "heavy_pipeline_slots": int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1") or 1),
         "async_publish_queue": os.environ.get("ASYNC_PUBLISH_QUEUE", "false"),
         "worker_pipeline_profile": os.environ.get("WORKER_PIPELINE_PROFILE") or None,

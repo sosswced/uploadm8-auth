@@ -78,6 +78,19 @@ async def worker_health():
         base["workers"] = fleet.get("workers")
         base["redis_queues"] = fleet.get("redis_queues")
         base["uploads"] = fleet.get("uploads")
+        try:
+            from services.worker_fleet_watchdog import evaluate_fleet_alerts
+
+            base["watchdog_alerts"] = [
+                {"incident_type": a.incident_type, "severity": a.severity, "subject": a.subject}
+                for a in evaluate_fleet_alerts(
+                    fleet.get("fleet") or {},
+                    fleet.get("uploads") or {},
+                    fleet.get("redis_queues") or {},
+                )
+            ]
+        except Exception:
+            base["watchdog_alerts"] = []
     else:
         redis_queues: dict = {}
         if core.state.redis_client:
@@ -118,13 +131,46 @@ async def worker_health():
     return base
 
 
+def _ops_bearer_authorized(request: Request) -> bool:
+    """Return True if Authorization matches METRICS/RENDER_OPS key."""
+    key = (
+        (os.environ.get("RENDER_OPS_API_KEY") or "").strip()
+        or (os.environ.get("METRICS_API_KEY") or "").strip()
+    )
+    if not key:
+        return False
+    return request.headers.get("authorization", "") == f"Bearer {key}"
+
+
+def _require_ops_metrics_auth(request: Request) -> None:
+    """Fail-closed on Render / when monitor keys exist; open only for local bare runs."""
+    key = (
+        (os.environ.get("RENDER_OPS_API_KEY") or "").strip()
+        or (os.environ.get("METRICS_API_KEY") or "").strip()
+    )
+    on_render = bool(os.environ.get("RENDER"))
+    from services.render_platform import render_api_configured
+
+    must_auth = bool(key) or on_render or render_api_configured()
+    if not must_auth:
+        return
+    if not key or not _ops_bearer_authorized(request):
+        raise HTTPException(403, "Forbidden — set METRICS_API_KEY (or RENDER_OPS_API_KEY)")
+
+
+@router.get("/api/ops/render-live")
+async def render_live_status(request: Request):
+    """Live Render worker events (Bearer METRICS_API_KEY / RENDER_OPS_API_KEY)."""
+    _require_ops_metrics_auth(request)
+    from services.render_platform import build_render_live_snapshot
+
+    return await build_render_live_snapshot(event_limit=20, include_logs=True, use_cache=True)
+
+
 @router.get("/metrics")
 async def metrics(request: Request):
     """Lightweight metrics for monitoring dashboards. Admin-only or internal."""
-    auth = request.headers.get("authorization", "")
-    metrics_key = os.environ.get("METRICS_API_KEY", "")
-    if metrics_key and auth != f"Bearer {metrics_key}":
-        raise HTTPException(403, "Forbidden")
+    _require_ops_metrics_auth(request)
     try:
         async with core.state.db_pool.acquire() as conn:
             total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
@@ -152,6 +198,7 @@ async def metrics(request: Request):
                 from stages.redis_job_queue import (
                     list_lengths,
                     process_stream_keys_ordered,
+                    stream_key_for_list,
                     stream_lengths,
                     use_redis_streams,
                 )
@@ -161,26 +208,67 @@ async def metrics(request: Request):
                     PROCESS_NORMAL_QUEUE,
                     PRIORITY_JOB_QUEUE,
                     UPLOAD_JOB_QUEUE,
+                    PUBLISH_PRIORITY_QUEUE,
+                    PUBLISH_NORMAL_QUEUE,
                 ]
                 redis_queues["use_streams"] = use_redis_streams()
                 redis_queues["lists"] = await list_lengths(core.state.redis_client, lp)
+                redis_queues["total_pending"] = sum(
+                    int(v or 0) for v in (redis_queues.get("lists") or {}).values()
+                )
                 if use_redis_streams():
                     sk = process_stream_keys_ordered(
                         PROCESS_PRIORITY_QUEUE,
                         PROCESS_NORMAL_QUEUE,
                         PRIORITY_JOB_QUEUE,
                         UPLOAD_JOB_QUEUE,
-                    )
+                    ) + [
+                        stream_key_for_list(PUBLISH_PRIORITY_QUEUE),
+                        stream_key_for_list(PUBLISH_NORMAL_QUEUE),
+                    ]
                     redis_queues["streams"] = await stream_lengths(core.state.redis_client, sk)
             except (RedisError, ImportError, TypeError, ValueError) as _rqe:
                 redis_queues["error"] = str(_rqe)
         worker_fleet = None
+        watchdog_alerts = []
+        render_summary = None
         try:
             from services.worker_fleet_snapshot import build_worker_fleet_snapshot
+            from services.worker_fleet_watchdog import evaluate_fleet_alerts
 
             worker_fleet = await build_worker_fleet_snapshot(core.state.db_pool, core.state.redis_client)
+            watchdog_alerts = [
+                {"incident_type": a.incident_type, "severity": a.severity, "subject": a.subject}
+                for a in evaluate_fleet_alerts(
+                    (worker_fleet or {}).get("fleet") or {},
+                    (worker_fleet or {}).get("uploads") or {},
+                    (worker_fleet or {}).get("redis_queues") or {},
+                )
+            ]
         except Exception:
             worker_fleet = None
+        try:
+            from services.render_platform import build_render_live_snapshot, render_api_configured
+
+            # Only poll Render when caller is authenticated (never from open local scrapes).
+            if render_api_configured() and _ops_bearer_authorized(request):
+                render_live = await build_render_live_snapshot(
+                    event_limit=10,
+                    include_logs=False,
+                    include_metrics=True,
+                    use_cache=True,
+                )
+                render_summary = {
+                    "health": render_live.get("health"),
+                    "summary": render_live.get("summary"),
+                    "instances": render_live.get("instances"),
+                    "latest_deploy": render_live.get("latest_deploy"),
+                    "metrics": render_live.get("metrics"),
+                    "cached": render_live.get("cached"),
+                }
+        except Exception:
+            render_summary = None
+        fleet_summary = (worker_fleet or {}).get("fleet") if worker_fleet else None
         return {
             "users": {"total": total_users, "active_24h": active_24h},
             "uploads": {
@@ -188,11 +276,19 @@ async def metrics(request: Request):
                 "processing": processing_now,
                 "queued": queued_now,
                 "failed_24h": failed_24h,
+                "ready_to_publish": (worker_fleet or {}).get("uploads", {}).get("ready_to_publish")
+                if worker_fleet
+                else None,
             },
             "db_pool": {"size": pool_size, "idle": pool_free},
             "redis_job_queues": redis_queues,
-            "worker_fleet": worker_fleet.get("fleet") if worker_fleet else None,
-            "workers": worker_fleet.get("workers") if worker_fleet else None,
+            # Backward-compatible: worker_fleet = summary (alive_count, etc.)
+            "worker_fleet": fleet_summary,
+            "fleet": fleet_summary,
+            "workers": (worker_fleet or {}).get("workers") if worker_fleet else None,
+            "worker_fleet_detail": worker_fleet,
+            "watchdog_alerts": watchdog_alerts,
+            "render": render_summary,
             "timestamp": _now_utc().isoformat(),
         }
     except (

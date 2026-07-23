@@ -31,8 +31,14 @@ def test_mark_processing_started_only_claims_queued_or_staged():
 
     claimed = asyncio.run(mark_processing_started(FakePool(), ctx))
     assert claimed is True
-    sql = executed[0][0].lower().replace("\n", " ").replace(" ", "")
-    assert "statusin('queued','staged')" in sql
+    sql = executed[0][0].lower().replace("\n", " ")
+    compact = sql.replace(" ", "")
+    assert "statusin('queued','staged')" in compact
+    # Orphan processing (stage never set) must also be claimable.
+    assert "status='processing'" in compact
+    assert "processing_stage" in sql
+    # Single-winner: empty stage becomes 'claimed' so a second worker loses the race.
+    assert "claimed" in sql
 
 
 def test_mark_processing_started_returns_false_when_no_row_updated():

@@ -1,0 +1,127 @@
+# UploadM8 — pipeline / ML / Redis (paste into Render Environment)
+# HF_TOKEN — keep your existing Render secret (do not duplicate in chat)
+
+# ── Memory budget (2 GB Standard worker — raise on Pro / 4 GB) ─────────────
+# Set RENDER_MEMORY_LIMIT_MB to your plan RAM so admission % is accurate.
+RENDER_MEMORY_LIMIT_MB=2048
+MEMORY_ADMIT_PCT=75
+MEMORY_HARD_PCT=88
+MEMORY_WARN_PCT=80
+MEMORY_ADMIT_WAIT_SEC=45
+
+# Worker lane & concurrency — ONE heavy encode at a time on 2 GB.
+# Two concurrent HD/4K FFmpeg jobs will OOM a Standard background worker.
+# Prod was previously at CONCURRENCY=2 / PUBLISH=5 → repeated Instance failed OOMs.
+# These are also pinned in render.yaml so blueprint sync cannot silently restore unsafe values.
+WORKER_LANE=full
+WORKER_CONCURRENCY=1
+WORKER_HEAVY_PIPELINE_SLOTS=1
+PUBLISH_CONCURRENCY=1
+USER_PROCESS_MAX_PARALLEL=1
+USER_PROCESS_MAX_PARALLEL_PRIORITY=1
+USER_SLOT_MAX_WAIT_SEC=600
+USER_SLOT_TTL_SEC=2700
+USER_SLOT_WAIT_INITIAL_SEC=2
+USER_SLOT_WAIT_MAX_SEC=30
+USER_SLOT_MAX_REQUEUE=3
+# Clear orphaned Redis user-slot counters on every worker boot (safe for 1 process worker).
+# Set to 0 only if you run multiple process workers sharing the same Redis.
+USER_SLOT_CLEAR_ON_START=1
+
+# FFmpeg — keep encode RAM/CPU modest on 2 GB
+FFMPEG_THREADS=1
+TRANSCODE_X264_PRESET=faster
+WATERMARK_SINGLE_PASS=true
+TWELVE_LABS_PARALLEL=false
+TRANSCODE_PRESERVE_HD_TIER=false
+
+# Stale / ready_to_publish recovery — avoid 30m redispatch burn loops
+STALE_PROCESSING_MINUTES=45
+STUCK_READY_REDISPATCH_MINUTES=60
+STUCK_READY_FAIL_MINUTES=90
+
+# Background polls — cut Service-Initiated bandwidth on small workers
+PLATFORM_POLL_CONCURRENCY=2
+PLATFORM_OAUTH_REFRESH_CONCURRENCY=1
+ANALYTICS_SYNC_BATCH_SIZE=5
+ANALYTICS_SYNC_INTERVAL_SECONDS=43200
+# Optional kill switches (default on): WORKER_ENABLE_ANALYTICS_SYNC=false etc.
+
+# Redis Streams (process + publish lanes)
+REDIS_JOB_USE_STREAMS=true
+REDIS_JOB_LEGACY_DRAIN=true
+REDIS_JOB_STREAM_GROUP=uploadm8_process
+STREAM_RECLAIM_INTERVAL_SEC=25
+STREAM_RECLAIM_MIN_IDLE_MS=120000
+STREAM_RECLAIM_COUNT=8
+
+# ── Live Render monitoring (API web service ONLY — not the worker) ──────────
+# ONE uniform trio. Do NOT set RENDER_SERVICE_ID / RENDER_INSTANCE_ID yourself
+# (Render injects those per service). Do NOT use ${RENDER_SERVICE_ID} placeholders.
+#
+#   RENDER_MONITOR_API_KEY      = Account Settings → API Keys → rnd_…
+#   RENDER_MONITOR_SERVICE_ID   = worker service URL/settings → srv-…
+#   RENDER_MONITOR_OWNER_ID     = workspace/owner id → tea_… (optional, OOM logs)
+#
+RENDER_MONITOR_API_KEY=rnd_xxxxxxxx
+RENDER_MONITOR_SERVICE_ID=srv-xxxxxxxx
+RENDER_MONITOR_OWNER_ID=tea_xxxxxxxx
+#
+# Legacy aliases (still accepted): RENDER_API_KEY, RENDER_WORKER_SERVICE_ID, RENDER_OWNER_ID
+# REQUIRED on Render for /metrics and /api/ops/render-live (fail-closed without a key):
+METRICS_API_KEY=change-me-long-random
+# RENDER_OPS_API_KEY=   # optional override; else METRICS_API_KEY
+RENDER_MONITOR_CACHE_TTL_SEC=30
+# Long encodes: don't treat stage as idle too early (default 90)
+ACTIVE_PIPELINE_STALE_MINUTES=90
+# Fleet watchdog (default on) — Discord/email when fleet dies or RAM spikes
+WORKER_FLEET_WATCHDOG_ENABLED=1
+WORKER_FLEET_WATCHDOG_INTERVAL_SEC=60
+WATCHDOG_RENDER_API_ENABLED=1
+WATCHDOG_QUEUE_PENDING_ALERT=8
+WATCHDOG_ALERT_DEDUPE_SECONDS=600
+# Worker Sentry (same DSN as API is fine — tagged component=worker)
+# SENTRY_DSN=https://…@….ingest.sentry.io/…
+# SENTRY_ENVIRONMENT=production
+# SENTRY_TRACES_SAMPLE_RATE=0.05
+
+# AI trace (prod: global on + tier list for selective)
+AI_TRACE_ENABLED=true
+AI_TRACE_TIERS=pro,studio,agency,master_admin,friends_family
+AI_TRACE_PER_STAGE=true
+AI_TRACE_PIPELINE_SUMMARY=true
+
+# ML engine — runs on API web service; keep interval long to avoid RAM spikes
+UM8_ML_ENGINE_ENABLED=1
+UM8_ML_ENGINE_RUN_CONTENT_SUCCESS=1
+UM8_ML_ENGINE_INTERVAL_SECONDS=86400
+UM8_HF_DATASET_REPO=cedy243/uploadm8-promo-targeting-v1
+UM8_HF_MODEL_REPO=cedy243/uploadm8-promo-uplift-v1
+UM8_HF_CONTENT_DATASET_REPO=cedy243/uploadm8-content-success-v1
+UM8_HF_CONTENT_MODEL_REPO=cedy243/uploadm8-content-success-model-v1
+UM8_TRACKIO_SPACE_PATH=cedy243/uploadm8-trackio
+
+# Marketing ML targeting
+MARKETING_ML_TARGETING_ENABLED=1
+UM8_PROMO_MIN_SCORE=0.35
+
+# Thumbnail Studio — durable R2 previews (~10 months). Also set Cloudflare R2
+# lifecycle so prefix thumbnail-studio/previews/ is NOT deleted before this many days.
+STUDIO_PREVIEW_RETENTION_DAYS=300
+STUDIO_PREVIEW_PRESIGN_TTL_SEC=604800
+
+# Pikzels credit burn controls (upload pipeline)
+# Defaults in code: text-brief OFF, hydration /edit OFF; one image call per aspect
+# (YT 16:9 + shared 9:16 for IG/FB/TikTok). Set to 1 only when you intentionally
+# want the extra paid calls.
+PIKZELS_TEXT_BRIEF_ON_UPLOAD=0
+THUMBNAIL_HYDRATION_PIKZELS_EDIT=0
+
+
+# If you still hit OOM after WORKER_CONCURRENCY=1:
+#   1) Upgrade worker to Pro (4 GB), OR
+#   2) Split WORKER_LANE=process / publish across two services, OR
+#   3) Set TRANSCODE_PRESERVE_HD_TIER=false to avoid 4K targets
+#
+# Autoscaling instance count does NOT fix OOM caused by CONCURRENCY>1 on 2GB —
+# each new instance can still OOM itself. Pin concurrency first, then scale out.

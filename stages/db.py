@@ -413,17 +413,38 @@ def _platform_results_json(ctx: JobContext) -> Optional[str]:
 
 
 async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
-    """Mark upload as processing. Only claims rows in queued/staged (never revives failed)."""
+    """Mark upload as processing (single-winner claim).
+
+    Claims ``queued`` / ``staged``, and also orphan ``processing`` rows that never
+    entered a pipeline stage (API/complete often sets status=processing before the
+    worker runs — refusing those claims deadlocks the job forever).
+
+    Atomically sets ``processing_stage='claimed'`` when stage is empty so two
+    workers cannot both win the orphan/queued race (UPDATE … WHERE stage='' ).
+    Never revives ``failed`` / terminal rows.
+    """
     async with pool.acquire() as conn:
         tag = await conn.execute(
             """
             UPDATE uploads
             SET status = 'processing',
-                processing_started_at = $2,
+                processing_started_at = COALESCE(processing_started_at, $2),
+                processing_stage = CASE
+                    WHEN COALESCE(NULLIF(BTRIM(processing_stage), ''), '') = ''
+                    THEN 'claimed'
+                    ELSE processing_stage
+                END,
                 error_code = NULL,
                 error_detail = NULL,
                 updated_at = NOW()
-            WHERE id = $1 AND status IN ('queued', 'staged')
+            WHERE id = $1
+              AND (
+                    status IN ('queued', 'staged')
+                    OR (
+                        status = 'processing'
+                        AND COALESCE(NULLIF(BTRIM(processing_stage), ''), '') = ''
+                    )
+                  )
             """,
             ctx.upload_id,
             ctx.started_at or datetime.now(timezone.utc),

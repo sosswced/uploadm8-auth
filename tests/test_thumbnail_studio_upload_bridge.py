@@ -89,6 +89,26 @@ def test_pikzels_warning_requested_but_skipped():
     assert diag["platform_render_methods"]["youtube"]["succeeded_with"] == "template"
 
 
+def test_pikzels_warning_insufficient_credits_from_provider_trace():
+    arts = {
+        "thumbnail_render_method": "",
+        "provider_error_trace": [
+            {
+                "provider": "pikzels",
+                "http_status": 402,
+                "provider_code": "insufficient_credits",
+                "message": "INSUFFICIENT_CREDITS: Your API balance is too low for this request.",
+            }
+        ],
+    }
+    warn = pikzels_template_thumbnail_warning(arts)
+    assert warn is not None
+    assert warn["code"] == "pikzels_insufficient_credits"
+    assert warn["skip_reason"] == "pikzels_insufficient_credits"
+    assert "insufficient credits" in warn["message"].lower()
+    assert "Settings were already fine" in warn["message"]
+
+
 def test_youtube_thumb_error_codes():
     from stages.publish_stage import _youtube_thumb_push_error_code
 

@@ -20,10 +20,29 @@ async def record_pikzels_template_render_incident(
     studio_report: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Fire when PIKZELS_API_KEY is configured but the upload used PIL template render.
+    Fire when PIKZELS_API_KEY is configured but the upload used PIL template /
+    raw-frame output instead of Studio.
+
+    Does **not** alert when ``thumbnail_render_method`` is missing/empty with no
+    studio report — that was Discord noise (empty skip_reason + ``{}`` report)
+    after successful publishes that never entered the styled block cleanly.
     """
-    if (render_method or "").strip().lower() not in ("template", "none", ""):
+    method = (render_method or "").strip().lower()
+    report = studio_report if isinstance(studio_report, dict) else {}
+    skip_reason = str(report.get("skip_reason") or "").strip()
+    requested_skipped = bool(report.get("pikzels_requested_but_skipped"))
+    fail_loud = bool(report.get("fail_loud"))
+
+    # Real fallbacks only — never page on blank method with empty diagnostics.
+    if method not in ("template", "none"):
+        if not (requested_skipped or fail_loud or skip_reason):
+            return
+        # Prefer an explicit method when we only have skip signals.
+        method = method or "none"
+
+    if method not in ("template", "none"):
         return
+
     try:
         from stages.pikzels_api import studio_renderer_enabled
     except Exception:
@@ -31,17 +50,22 @@ async def record_pikzels_template_render_incident(
     if not studio_renderer_enabled():
         return
 
-    skip_reason = ""
-    if isinstance(studio_report, dict):
-        skip_reason = str(studio_report.get("skip_reason") or "").strip()
+    # Require some diagnostic signal so ops can act (Settings / tier / persona).
+    if not skip_reason and not requested_skipped and not fail_loud and not report:
+        logger.debug(
+            "[%s] pikzels_template_fallback suppressed — no method/report diagnostics",
+            upload_id,
+        )
+        return
+
     body_lines = [
         f"upload_id={upload_id}",
-        f"thumbnail_render_method={render_method}",
+        f"thumbnail_render_method={method}",
         f"skip_reason={skip_reason or '(styled block skipped or studio ineligible)'}",
     ]
-    if isinstance(studio_report, dict):
+    if report:
         try:
-            body_lines.append("studio_render_report=" + json.dumps(studio_report, default=str)[:2000])
+            body_lines.append("studio_render_report=" + json.dumps(report, default=str)[:2000])
         except Exception:
             pass
 
@@ -57,9 +81,9 @@ async def record_pikzels_template_render_incident(
             details={
                 "upload_id": str(upload_id),
                 "user_id": user_id,
-                "thumbnail_render_method": render_method,
+                "thumbnail_render_method": method,
                 "skip_reason": skip_reason,
-                "studio_render_report": studio_report if isinstance(studio_report, dict) else {},
+                "studio_render_report": report,
             },
             user_id=user_id,
             upload_id=str(upload_id),
@@ -67,8 +91,9 @@ async def record_pikzels_template_render_incident(
             alert_discord=True,
         )
         logger.warning(
-            "[%s] pikzels_template_fallback ops incident (PIKZELS_API_KEY set, render=template) reason=%s",
+            "[%s] pikzels_template_fallback ops incident (PIKZELS_API_KEY set, render=%s) reason=%s",
             upload_id,
+            method,
             skip_reason or "unknown",
         )
     except Exception as e:
@@ -129,23 +154,40 @@ async def record_pikzels_render_failures_incident(
         body = lines or "Pikzels studio renderer did not return usable images."
         types_suffix = ":".join(f"{r['platform']}:{r['http_label']}" for r in rows[:4])[:80]
         pikzels_payment_required = all(str(r.get("http_label") or "") == "402" for r in rows)
+        # 402 = Pikzels API balance empty — still Discord so ops sees it; skip email spam.
+        incident_type = (
+            "pikzels_insufficient_credits"
+            if pikzels_payment_required
+            else (
+                f"pikzels_render_failed:{types_suffix}" if types_suffix else "pikzels_render_failed"
+            )
+        )[:120]
+        subject = (
+            f"Pikzels API out of credits ({len(rows)} platform(s)): {plat_summary}"
+            if pikzels_payment_required
+            else f"Pikzels render failed ({len(rows)} platform(s)): {plat_summary}"
+        )[:200]
+        if pikzels_payment_required:
+            body = (
+                "Top up the Pikzels account for PIKZELS_API_KEY, then re-upload.\n"
+                + (body or "")
+            )
         await record_operational_incident(
             db_pool,
             source="thumbnail",
-            incident_type=(
-                f"pikzels_render_failed:{types_suffix}" if types_suffix else "pikzels_render_failed"
-            )[:120],
-            subject=(f"Pikzels render failed ({len(rows)} platform(s)): {plat_summary}")[:200],
+            incident_type=incident_type,
+            subject=subject,
             body=body[:8000],
             details={
                 "upload_id": str(upload_id),
                 "user_id": str(user_id) if user_id else None,
                 "failures": rows,
+                "pikzels_insufficient_credits": pikzels_payment_required,
             },
             user_id=str(user_id) if user_id else None,
             upload_id=str(upload_id),
             alert_email=not pikzels_payment_required,
-            alert_discord=not pikzels_payment_required,
+            alert_discord=True,
         )
     except Exception as e:
         logger.debug("[%s] pikzels failure scan: %s", upload_id, e)

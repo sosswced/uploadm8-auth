@@ -107,31 +107,65 @@ def studio_thumb_diagnostics_from_artifacts(raw_artifacts: Any) -> Dict[str, Any
     }
 
 
+def _pikzels_credit_failure_from_artifacts(artifacts: Dict[str, Any]) -> bool:
+    """True when provider_error_trace / pikzels_render_failures show API out of credits."""
+    for key in ("pikzels_render_failures", "provider_error_trace"):
+        raw = artifacts.get(key)
+        rows: Any = raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                rows = json.loads(raw)
+            except Exception:
+                rows = None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            code = str(
+                row.get("provider_code") or row.get("reason") or row.get("error_code") or ""
+            ).strip().lower()
+            msg = str(row.get("message") or "").lower()
+            status = str(row.get("http_status") or "").strip()
+            if (
+                code in ("insufficient_credits", "pikzels_insufficient_credits")
+                or status == "402"
+                or "insufficient_credits" in msg
+                or "api balance is too low" in msg
+            ):
+                return True
+    return False
+
+
 def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str, str]]:
     """
     When the server has PIKZELS_API_KEY but this upload used PIL template render,
     return a short warning for queue/upload UI.
     """
+    artifacts = coerce_output_artifacts_dict(raw_artifacts)
     method = thumbnail_render_method_from_artifacts(raw_artifacts)
     report = _parse_studio_render_report(raw_artifacts)
     requested = bool(
         report.get("pikzels_requested_but_skipped")
-        or str(coerce_output_artifacts_dict(raw_artifacts).get("pikzels_requested_but_skipped") or "")
+        or str(artifacts.get("pikzels_requested_but_skipped") or "")
         in ("1", "true", "yes")
     )
+    credits_failed = _pikzels_credit_failure_from_artifacts(artifacts)
     if method in ("studio_renderer", "studio_winner_cover_direct") and not requested:
         return None
-    if method not in ("template", "none", "", "sticker_composite") and not requested:
+    if method not in ("template", "none", "", "sticker_composite") and not requested and not credits_failed:
         return None
     try:
         from services.pikzels_v2 import resolve_public_api_key
 
-        if not (resolve_public_api_key() or "").strip() and not requested:
+        if not (resolve_public_api_key() or "").strip() and not requested and not credits_failed:
             return None
     except Exception:
-        if not requested:
+        if not requested and not credits_failed:
             return None
     skip_reason = str(report.get("skip_reason") or "").strip()
+    if credits_failed and not skip_reason:
+        skip_reason = "pikzels_insufficient_credits"
     msg = (
         "Pikzels was requested for this upload but was not used "
         f"({method or 'no render'})."
@@ -141,7 +175,14 @@ def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str,
             "Turn on auto-thumbnails and Thumbnail Studio in Settings, and set render pipeline to Auto."
         )
     )
-    if skip_reason == "tier_lacks_ai_thumbnail_styling":
+    if skip_reason == "pikzels_insufficient_credits" or credits_failed:
+        msg = (
+            "Pikzels API returned insufficient credits (HTTP 402). "
+            "Top up the Pikzels account linked to PIKZELS_API_KEY, then re-upload "
+            "(UploadM8 Settings were already fine for this job)."
+        )
+        skip_reason = "pikzels_insufficient_credits"
+    elif skip_reason == "tier_lacks_ai_thumbnail_styling":
         msg = (
             "Your plan can store custom thumbnails but Pikzels AI styling needs Creator Pro or higher. "
             "Upgrade to generate Pikzels covers on upload."
@@ -152,7 +193,11 @@ def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str,
             "Open Thumbnail Studio → Personas → Link to Pikzels."
         )
     return {
-        "code": "pikzels_requested_skipped" if requested else "pikzels_template_fallback",
+        "code": (
+            "pikzels_insufficient_credits"
+            if skip_reason == "pikzels_insufficient_credits"
+            else ("pikzels_requested_skipped" if requested else "pikzels_template_fallback")
+        ),
         "message": msg,
         "settings_path": "settings.html#thumbnail-studio",
         "skip_reason": skip_reason,

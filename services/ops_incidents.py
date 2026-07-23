@@ -10,7 +10,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -35,21 +35,116 @@ def _discord_url() -> str:
     return (ERROR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL or "").strip()
 
 
-async def _send_discord_embed(title: str, description: str, color: int = 0xEF4444) -> None:
+async def _send_discord_embed(
+    title: str,
+    description: str,
+    color: int = 0xEF4444,
+    *,
+    fields: Optional[List[Dict[str, Any]]] = None,
+    footer: Optional[str] = None,
+) -> None:
     wh = _discord_url()
     if not wh:
         return
-    embed = {
+    embed: Dict[str, Any] = {
         "title": title[:256],
         "color": color,
         "description": description[:1800],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if fields:
+        embed["fields"] = [
+            {
+                "name": str(f.get("name") or "")[:256],
+                "value": str(f.get("value") or "")[:1024],
+                "inline": bool(f.get("inline", True)),
+            }
+            for f in fields[:25]
+            if f
+        ]
+    if footer:
+        embed["footer"] = {"text": str(footer)[:2048]}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(wh, json={"embeds": [embed]})
     except Exception as e:
         logger.warning("ops_incidents discord: %s", e)
+
+
+def _severity_color(severity: str) -> int:
+    s = (severity or "").lower()
+    if s == "critical":
+        return 0xEF4444
+    if s == "warning":
+        return 0xF59E0B
+    return 0x3B82F6
+
+
+def _watchdog_discord_fields(details: Dict[str, Any], incident_id: Any) -> List[Dict[str, Any]]:
+    fleet = details.get("fleet") if isinstance(details.get("fleet"), dict) else {}
+    fields: List[Dict[str, Any]] = []
+    if fleet:
+        fields.append(
+            {
+                "name": "Fleet",
+                "value": (
+                    f"alive={fleet.get('alive_count', '?')} "
+                    f"stale={fleet.get('stale_count', '?')} "
+                    f"dead={fleet.get('dead_count', '?')}"
+                ),
+                "inline": True,
+            }
+        )
+        fields.append(
+            {
+                "name": "Slots",
+                "value": (
+                    f"proc {fleet.get('process_slots_in_use', '?')}/{fleet.get('process_capacity', '?')} "
+                    f"· mem_warn={fleet.get('workers_memory_warn', '?')}"
+                ),
+                "inline": True,
+            }
+        )
+        if fleet.get("max_memory_rss_mb") is not None:
+            fields.append(
+                {
+                    "name": "Max RSS",
+                    "value": f"{fleet.get('max_memory_rss_mb')} MB",
+                    "inline": True,
+                }
+            )
+        if fleet.get("max_load_1m") is not None:
+            fields.append(
+                {
+                    "name": "Load 1m",
+                    "value": str(fleet.get("max_load_1m")),
+                    "inline": True,
+                }
+            )
+    if details.get("queues_pending") is not None:
+        fields.append(
+            {"name": "Redis pending", "value": str(details.get("queues_pending")), "inline": True}
+        )
+    render_summary = details.get("render_summary") if isinstance(details.get("render_summary"), dict) else {}
+    if render_summary.get("critical_count"):
+        fields.append(
+            {
+                "name": "Render critical",
+                "value": str(render_summary.get("critical_count")),
+                "inline": True,
+            }
+        )
+    ev = details.get("event") if isinstance(details.get("event"), dict) else None
+    if ev:
+        fields.append(
+            {
+                "name": "Render event",
+                "value": f"{ev.get('type')} @ {ev.get('timestamp')}",
+                "inline": False,
+            }
+        )
+    fields.append({"name": "Incident", "value": str(incident_id), "inline": False})
+    return fields
 
 
 async def _send_ops_email(subject: str, html_body: str) -> None:
@@ -206,10 +301,28 @@ async def record_operational_incident(
             pass
     if alert_discord and _discord_url():
         try:
-            await _send_discord_embed(
-                f"Ops: {itype}",
-                f"**{subj}**\n```json\n{json.dumps(det, indent=2, default=str)[:1200]}\n```\n`{new_id}`\n_Further '{itype}' alerts suppressed for {ttl}s._",
-            )
+            severity = str(det.get("severity") or ("critical" if "fail" in itype else "warning"))
+            color = _severity_color(severity)
+            fields = None
+            footer = None
+            if src == "worker_fleet_watchdog" or itype.startswith("render_event_"):
+                fields = _watchdog_discord_fields(det, new_id)
+                frontend = (os.environ.get("FRONTEND_URL") or "https://app.uploadm8.com").rstrip("/")
+                footer = f"{frontend}/admin-incidents.html?incident_id={new_id}"
+                await _send_discord_embed(
+                    f"🛡 Fleet: {itype}",
+                    f"**{subj}**\n{(bod or '')[:400]}",
+                    color=color,
+                    fields=fields,
+                    footer=footer,
+                )
+            else:
+                await _send_discord_embed(
+                    f"Ops: {itype}",
+                    f"**{subj}**\n```json\n{json.dumps(det, indent=2, default=str)[:1200]}\n```\n`{new_id}`\n"
+                    f"_Further '{itype}' alerts suppressed for {ttl}s._",
+                    color=color,
+                )
             discord_ok = True
         except Exception:
             pass

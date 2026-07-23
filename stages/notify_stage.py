@@ -1184,7 +1184,10 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_po
                     hint = pw.get("message") or ""
                     if pw.get("skip_reason"):
                         hint += f"\nReason: {pw['skip_reason']}"
-                    hint += "\nFix: Settings → Thumbnail Studio (enable auto-thumbnails + studio engine, pipeline Auto)."
+                    if pw.get("skip_reason") == "pikzels_insufficient_credits":
+                        hint += "\nFix: Top up Pikzels API credits (PIKZELS_API_KEY account)."
+                    else:
+                        hint += "\nFix: Settings → Thumbnail Studio (enable auto-thumbnails + studio engine, pipeline Auto)."
                     fields.append(
                         {
                             "name": "⚠️ Thumbnail Studio",

@@ -83,7 +83,7 @@ def test_pikzels_render_failures_skips_when_absent():
     mock_incident.assert_not_called()
 
 
-def test_pikzels_402_only_suppresses_email_alerts():
+def test_pikzels_402_only_suppresses_email_but_keeps_discord():
     artifacts = {
         "pikzels_render_failures": [
             {"platform": "youtube", "http_status": 402, "message": "quota"},
@@ -106,4 +106,6 @@ def test_pikzels_402_only_suppresses_email_alerts():
     mock_incident = asyncio.run(_run())
     kwargs = mock_incident.await_args.kwargs
     assert kwargs["alert_email"] is False
-    assert kwargs["alert_discord"] is False
+    assert kwargs["alert_discord"] is True
+    assert kwargs["incident_type"] == "pikzels_insufficient_credits"
+    assert "out of credits" in kwargs["subject"].lower()

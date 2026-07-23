@@ -77,6 +77,39 @@ def test_still_has_pending_until_all_targets_handled():
     assert not still_has_pending_publish_slots(upload, done, publish_targets=[("tiktok", None), ("youtube", None)])
 
 
+def test_still_has_pending_false_when_account_scoped_result_covers_bare_target():
+    """Regression: immediate TikTok publish wrote token_row_id but pending check used None."""
+    upload = {"schedule_mode": "immediate", "platforms": ["tiktok"]}
+    results = [
+        {
+            "platform": "tiktok",
+            "success": True,
+            "token_row_id": "710dd785-fcf1-472f-9b27-8e2e348047ca",
+            "account_id": "-000m0n2wq8CvaviqRKFF-AT6aGWaMEovNqE",
+            "publish_id": "v_pub_file~v2-1.example",
+        }
+    ]
+    assert still_has_pending_publish_slots(upload, results) is False
+    assert still_has_pending_publish_slots(upload, results, publish_targets=[("tiktok", None)]) is False
+    assert (
+        still_has_pending_publish_slots(
+            upload,
+            results,
+            publish_targets=[("tiktok", "710dd785-fcf1-472f-9b27-8e2e348047ca")],
+        )
+        is False
+    )
+    # Different account still pending
+    assert (
+        still_has_pending_publish_slots(
+            upload,
+            results,
+            publish_targets=[("tiktok", "other-token-uuid")],
+        )
+        is True
+    )
+
+
 def test_publish_target_already_done_respects_token():
     ctx = JobContext(
         job_id="j",
@@ -102,6 +135,24 @@ def test_non_smart_scheduled_all_at_once():
     due = platforms_due_for_publish(upload, now)
     assert due == frozenset({"tiktok", "youtube"})
     upload["platform_results"] = [{"platform": "tiktok", "success": True}]
+    # Remaining unhandled platforms stay due (partial publish retry).
+    assert platforms_due_for_publish(upload, now) == frozenset({"youtube"})
+
+
+def test_immediate_null_scheduled_time_is_due():
+    """Immediate + null scheduled_time must not return empty (Render redispatch loop)."""
+    now = _utc(2026, 7, 21, 3, 0)
+    upload = {
+        "schedule_mode": "immediate",
+        "platforms": ["tiktok", "youtube"],
+        "scheduled_time": None,
+        "platform_results": None,
+    }
+    assert platforms_due_for_publish(upload, now) == frozenset({"tiktok", "youtube"})
+    upload["platform_results"] = [
+        {"platform": "tiktok", "success": True},
+        {"platform": "youtube", "success": True},
+    ]
     assert platforms_due_for_publish(upload, now) == frozenset()
 
 

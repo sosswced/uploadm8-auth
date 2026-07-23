@@ -63,6 +63,11 @@ async def fetch_worker_heartbeat_rows(db_pool) -> List[dict]:
                     active_publish_jobs,
                     hostname,
                     git_commit,
+                    memory_pct,
+                    memory_pressure,
+                    heavy_slots_in_use,
+                    load_1m,
+                    admission_blocked,
                     EXTRACT(EPOCH FROM (NOW() - last_seen_at))::int AS seconds_since_last_beat,
                     EXTRACT(EPOCH FROM (NOW() - started_at))::int AS uptime_seconds
                 FROM worker_heartbeat
@@ -72,8 +77,44 @@ async def fetch_worker_heartbeat_rows(db_pool) -> List[dict]:
     except asyncpg.UndefinedTableError:
         return []
     except asyncpg.PostgresError as e:
-        logger.warning("worker_heartbeat fetch failed: %s", e)
-        return []
+        # Older DBs may lack observability columns — fall back to core columns.
+        if "memory_pct" in str(e) or "does not exist" in str(e).lower():
+            try:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT
+                            worker_id,
+                            last_seen_at,
+                            started_at,
+                            worker_concurrency,
+                            publish_concurrency,
+                            version,
+                            worker_lane,
+                            service_name,
+                            region,
+                            memory_rss_mb,
+                            memory_peak_mb,
+                            memory_limit_mb,
+                            heavy_pipeline_slots,
+                            process_slots_in_use,
+                            publish_slots_in_use,
+                            active_process_jobs,
+                            active_publish_jobs,
+                            hostname,
+                            git_commit,
+                            EXTRACT(EPOCH FROM (NOW() - last_seen_at))::int AS seconds_since_last_beat,
+                            EXTRACT(EPOCH FROM (NOW() - started_at))::int AS uptime_seconds
+                        FROM worker_heartbeat
+                        ORDER BY last_seen_at DESC
+                        """
+                    )
+            except asyncpg.PostgresError as e2:
+                logger.warning("worker_heartbeat fetch failed: %s", e2)
+                return []
+        else:
+            logger.warning("worker_heartbeat fetch failed: %s", e)
+            return []
 
     out: List[dict] = []
     for r in rows:
@@ -99,6 +140,9 @@ def summarize_fleet(workers: List[dict]) -> dict:
     proc_in_use = pub_in_use = 0
     max_rss = 0.0
     memory_warn = 0
+    admission_blocked = 0
+    hard_pressure = 0
+    max_load = 0.0
     for w in workers:
         st = w.get("status") or "unknown"
         if st == "alive":
@@ -116,8 +160,18 @@ def summarize_fleet(workers: List[dict]) -> dict:
             if rss > max_rss:
                 max_rss = rss
             limit = float(w.get("memory_limit_mb") or 0)
-            if limit and rss >= limit * 0.85:
+            pct = w.get("memory_pct")
+            if pct is None and limit and rss:
+                pct = 100.0 * rss / limit
+            if (limit and rss >= limit * 0.85) or (pct is not None and float(pct) >= 85):
                 memory_warn += 1
+            if w.get("admission_blocked") or (w.get("memory_pressure") or "") in ("soft", "hard"):
+                admission_blocked += 1
+            if (w.get("memory_pressure") or "") == "hard":
+                hard_pressure += 1
+            load = float(w.get("load_1m") or 0)
+            if load > max_load:
+                max_load = load
     return {
         "worker_count": len(workers),
         "alive_count": alive,
@@ -131,6 +185,9 @@ def summarize_fleet(workers: List[dict]) -> dict:
         "publish_slots_free": max(0, total_pub_cap - pub_in_use),
         "max_memory_rss_mb": round(max_rss, 1) if max_rss else None,
         "workers_memory_warn": memory_warn,
+        "workers_admission_blocked": admission_blocked,
+        "workers_hard_pressure": hard_pressure,
+        "max_load_1m": round(max_load, 2) if max_load else None,
     }
 
 

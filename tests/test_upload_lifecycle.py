@@ -82,6 +82,10 @@ def test_is_retryable_upload_policy():
     assert is_retryable_upload("pending") is False
     assert is_retryable_upload("processing", stale_processing=True) is True
     assert is_retryable_upload("processing", stale_processing=False) is False
+    assert is_retryable_upload("queued", stuck_queued=True) is True
+    assert is_retryable_upload("queued", stuck_queued=False) is False
+    assert is_retryable_upload("ready_to_publish") is False
+    assert is_retryable_upload("ready_to_publish", overdue_ready=True) is True
     # Hard-blocks must match classify_retry_error (API returns 409).
     assert is_retryable_upload("failed", error_code="PLATFORM_AUTH_FAILED") is False
     assert is_retryable_upload("failed", error_code="INSUFFICIENT_TOKENS") is False
@@ -90,6 +94,37 @@ def test_is_retryable_upload_policy():
     assert is_retryable_upload(
         "partial", error_code="PLATFORM_AUTH_FAILED", has_failed_platform=True
     ) is False
+
+
+def test_upload_is_stale_processing_null_started_at():
+    """Zombie processing with null processing_started_at must still count as stale."""
+    from datetime import datetime, timedelta, timezone
+
+    from services.retry_policy import upload_is_stale_processing, upload_is_stuck_queued
+
+    old = datetime.now(timezone.utc) - timedelta(days=10)
+    row = {
+        "status": "processing",
+        "processing_started_at": None,
+        "updated_at": old,
+        "created_at": old,
+    }
+    assert upload_is_stale_processing(row) is True
+    fresh = {
+        "status": "processing",
+        "processing_started_at": None,
+        "updated_at": datetime.now(timezone.utc),
+        "created_at": old,
+    }
+    assert upload_is_stale_processing(fresh) is False
+    assert upload_is_stale_processing({"status": "failed", "updated_at": old}) is False
+
+    stuck_q = {"status": "queued", "updated_at": old, "created_at": old}
+    assert upload_is_stuck_queued(stuck_q) is True
+    assert upload_is_stuck_queued(
+        {"status": "queued", "updated_at": datetime.now(timezone.utc)}
+    ) is False
+    assert upload_is_stuck_queued({"status": "processing", "updated_at": old}) is False
 
 
 def test_cancellable_statuses_match_cancel_policy():

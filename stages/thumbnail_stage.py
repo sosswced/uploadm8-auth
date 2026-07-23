@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,6 +59,7 @@ from services.thumbnail_sticker_render import render_sticker_composite, sticker_
 
 from .pikzels_api import (
     generate_pikzels_text_brief,
+    pikzels_format_for_platform,
     refine_thumbnail_with_pikzels_edit,
     render_thumbnail_with_studio_renderer,
     studio_renderer_enabled,
@@ -1243,6 +1245,72 @@ def _engine_explicitly_requested(us: Dict[str, Any]) -> bool:
     return False
 
 
+def _pikzels_failures_skip_reason(failures: List[Dict[str, Any]]) -> Optional[str]:
+    """Map per-platform Pikzels HTTP failures to a single studio skip_reason."""
+    if not failures:
+        return None
+    codes = {
+        str(f.get("reason") or f.get("provider_code") or "").strip().lower()
+        for f in failures
+        if isinstance(f, dict)
+    }
+    statuses = {
+        str(f.get("http_status") or "").strip()
+        for f in failures
+        if isinstance(f, dict)
+    }
+    if codes & {"insufficient_credits", "pikzels_insufficient_credits"} or (
+        statuses and statuses <= {"402"}
+    ):
+        return "pikzels_insufficient_credits"
+    if "prompt_too_long" in codes:
+        return "pikzels_prompt_too_long"
+    return "pikzels_http_error"
+
+
+def _finalize_styled_thumbnail_artifacts(
+    ctx: JobContext,
+    *,
+    studio_render_report: Dict[str, Any],
+    render_method: Optional[str],
+    platform_map: Dict[str, Any],
+    pikzels_render_failures: List[Dict[str, Any]],
+) -> None:
+    """Write styled-block diagnostics onto ctx and flush to DB before any raise."""
+    ctx.output_artifacts["thumbnail_render_method"] = render_method or "none"
+    ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
+    ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
+    ctx.output_artifacts["pikzels_requested_but_skipped"] = (
+        "1" if studio_render_report.get("pikzels_requested_but_skipped") else "0"
+    )
+    ctx.output_artifacts["platform_render_methods"] = json.dumps(
+        studio_render_report.get("platform_render_methods") or {}
+    )
+    if pikzels_render_failures:
+        ctx.output_artifacts["pikzels_render_failures"] = json.dumps(pikzels_render_failures)
+    try:
+        from services.diag_persist import schedule_persist_artifact_now
+
+        persist_keys = [
+            "studio_render_report",
+            "thumbnail_render_method",
+            "platform_thumbnail_map",
+            "pikzels_requested_but_skipped",
+            "platform_render_methods",
+        ]
+        if sticker_composite_enabled():
+            persist_keys.append("sticker_pack_json")
+        if pikzels_render_failures:
+            persist_keys.append("pikzels_render_failures")
+        if ctx.output_artifacts.get("thumbnail_error_code"):
+            persist_keys.extend(["thumbnail_error_code", "thumbnail_queue_badge"])
+        if ctx.output_artifacts.get("thumbnail_studio_similarity"):
+            persist_keys.append("thumbnail_studio_similarity")
+        schedule_persist_artifact_now(ctx, *persist_keys)
+    except Exception:
+        pass
+
+
 def _persona_explicitly_required(us: Dict[str, Any]) -> bool:
     if us.get("thumbnail_persona_required") or us.get("thumbnailPersonaRequired"):
         return True
@@ -1254,8 +1322,16 @@ def _persona_explicitly_required(us: Dict[str, Any]) -> bool:
 
 
 def _hydration_pikzels_edit_enabled() -> bool:
-    v = (os.environ.get("THUMBNAIL_HYDRATION_PIKZELS_EDIT") or "1").strip().lower()
-    return v not in ("0", "false", "off", "no", "disabled")
+    # Default OFF — a second /v2/thumbnail/edit per platform doubles Pikzels burn.
+    # Opt in with THUMBNAIL_HYDRATION_PIKZELS_EDIT=1 when credits allow.
+    v = (os.environ.get("THUMBNAIL_HYDRATION_PIKZELS_EDIT") or "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _upload_pikzels_text_brief_enabled() -> bool:
+    """Optional /v2/thumbnail/text call before image renders (costs credits)."""
+    v = (os.environ.get("PIKZELS_TEXT_BRIEF_ON_UPLOAD") or "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def _upload_requests_thumbnail_render(us: Dict[str, Any]) -> bool:
@@ -1608,10 +1684,14 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         ctx.output_artifacts["pikzels_requested_but_skipped"] = (
             "1" if studio_render_report.get("pikzels_requested_but_skipped") else "0"
         )
+        # So notify/ops never see blank thumbnail_render_method after a skip.
+        if not str(ctx.output_artifacts.get("thumbnail_render_method") or "").strip():
+            ctx.output_artifacts["thumbnail_render_method"] = "none"
         try:
             from services.diag_persist import schedule_persist_artifact_now
 
             schedule_persist_artifact_now(ctx, "studio_render_report")
+            schedule_persist_artifact_now(ctx, "thumbnail_render_method")
         except Exception:
             pass
         if studio_render_report.get("pikzels_api_key_configured"):
@@ -1636,13 +1716,18 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ):
         raw_brief: Dict[str, Any] = {}
         if pikzels_studio_eligible_for_styled_thumbnail(us, ctx.entitlements, require_auto_thumbnails=False):
-            text_brief = await generate_pikzels_text_brief(
-                source_title=ctx.get_effective_title() or ctx.filename or "UploadM8 video",
-                niche=category,
-                context_summary=ctx.get_thumbnail_brief_vars(category=category).get("fusion_summary", ""),
-            )
-            if text_brief:
-                raw_brief["pikzels_text_brief"] = text_brief
+            # Skip paid /v2/thumbnail/text by default — hydration + local brief is enough.
+            # Set PIKZELS_TEXT_BRIEF_ON_UPLOAD=1 to restore the extra creative call.
+            if _upload_pikzels_text_brief_enabled():
+                text_brief = await generate_pikzels_text_brief(
+                    source_title=ctx.get_effective_title() or ctx.filename or "UploadM8 video",
+                    niche=category,
+                    context_summary=ctx.get_thumbnail_brief_vars(category=category).get(
+                        "fusion_summary", ""
+                    ),
+                )
+                if text_brief:
+                    raw_brief["pikzels_text_brief"] = text_brief
         brief = _sanitize_thumbnail_brief(ctx, raw_brief, category, note="")
 
         trace_append(
@@ -1843,9 +1928,13 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             )
 
         pikzels_render_failures: List[Dict[str, Any]] = []
+        # One successful Pikzels JPEG per aspect (16:9 / 9:16) — reuse across platforms.
+        pikzels_aspect_cache: Dict[str, Path] = {}
+        pikzels_credits_exhausted = False
         skip_studio_set = {str(p).strip().lower() for p in (skip_studio_platforms or [])}
         for platform in platforms_to_render:
             plat_l = str(platform or "").strip().lower()
+            aspect_fmt = pikzels_format_for_platform(plat_l)
             # Studio winner cover_direct already wrote YT/FB JPEGs — keep them durable.
             if plat_l in skip_studio_set and platform_map.get(plat_l):
                 existing = Path(platform_map[plat_l])
@@ -1881,81 +1970,124 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                     if ok:
                         render_method = "sticker_composite"
                 elif step == "studio" and studio_ok:
-                    attempted_methods.append("studio_renderer")
-                    studio_attempted = True
-                    trace_append(ctx, "thumbnail_pikzels_attempt", {"platform": platform})
-                    ok = await render_thumbnail_with_studio_renderer(
-                        best_path,
-                        brief,
-                        platform,
-                        out_path,
-                        upload_id=str(ctx.upload_id),
-                        category=category,
-                        persona=persona_api,
-                        options=studio_opts,
-                        job_context=ctx,
-                    )
-                    if ok:
-                        render_method = "studio_renderer"
-                        hp = _thumbnail_hydration_edit_prompt(brief or {})
-                        skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
-                        if hp and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
-                            he_ok = await refine_thumbnail_with_pikzels_edit(
-                                out_path,
-                                hp,
-                                platform=platform,
-                                upload_id=str(ctx.upload_id),
-                            )
-                            studio_render_report["hydration_pikzels_edit"][platform] = bool(
-                                he_ok
-                            )
-                    else:
-                        logger.warning(
-                            "[thumb-renderer] Pikzels studio render failed for %s upload=%s — "
-                            "falling back to next render step (was: %s)",
-                            platform, ctx.upload_id, render_steps,
-                        )
-                        # Capture the last pikzels HTTP status from the provider-error trace so
-                        # the worker can emit a focused admin ops_incident. The trace lives in
-                        # ctx.output_artifacts["provider_error_trace"] as a JSON list.
-                        last_status: Any = "unknown"
-                        last_message = ""
-                        last_code = ""
+                    cached = pikzels_aspect_cache.get(aspect_fmt)
+                    if cached and cached.exists():
+                        attempted_methods.append("studio_renderer_aspect_reuse")
                         try:
-                            raw_trace = ctx.output_artifacts.get("provider_error_trace") if isinstance(ctx.output_artifacts, dict) else None
-                            if isinstance(raw_trace, str) and raw_trace.strip():
-                                _rows = json.loads(raw_trace)
-                                if isinstance(_rows, list):
-                                    for _r in reversed(_rows):
-                                        if isinstance(_r, dict) and str(_r.get("provider") or "").lower() == "pikzels":
-                                            last_status = _r.get("http_status", "unknown") or "unknown"
-                                            last_message = str(_r.get("message") or "")[:240]
-                                            last_code = str(_r.get("provider_code") or "").strip()
-                                            break
-                        except Exception:
-                            pass
-                        _snippet = ""
-                        try:
-                            _snippet = str(
-                                (_r.get("response_body_snippet") if isinstance(_r, dict) else "") or ""
+                            shutil.copyfile(cached, out_path)
+                            ok = out_path.exists() and out_path.stat().st_size >= MIN_THUMB_SIZE
+                        except OSError:
+                            ok = False
+                        if ok:
+                            render_method = "studio_renderer"
+                            trace_append(
+                                ctx,
+                                "thumbnail_pikzels_aspect_reuse",
+                                {"platform": platform, "format": aspect_fmt, "from": str(cached.name)},
                             )
-                        except Exception:
-                            _snippet = ""
-                        _combined = f"{last_message} {_snippet}".lower()
-                        _reason = last_code or (
-                            "prompt_too_long"
-                            if "prompt" in _combined and ("1200" in _combined or "1000" in _combined)
-                            else "pikzels_http_error"
-                        )
+                            studio_render_report.setdefault("aspect_reuse", {})[plat_l] = aspect_fmt
+                    elif pikzels_credits_exhausted:
+                        attempted_methods.append("studio_renderer_skipped_no_credits")
                         pikzels_render_failures.append({
                             "provider": "pikzels",
                             "status": "failed",
-                            "reason": _reason,
+                            "reason": "insufficient_credits",
                             "fallback": "template",
                             "platform": platform,
-                            "http_status": last_status,
-                            "message": (last_message or _snippet or "pikzels_http_error")[:500],
+                            "http_status": 402,
+                            "message": "Skipped — Pikzels API credits exhausted earlier in this job",
                         })
+                    else:
+                        attempted_methods.append("studio_renderer")
+                        studio_attempted = True
+                        trace_append(
+                            ctx,
+                            "thumbnail_pikzels_attempt",
+                            {"platform": platform, "format": aspect_fmt},
+                        )
+                        ok = await render_thumbnail_with_studio_renderer(
+                            best_path,
+                            brief,
+                            platform,
+                            out_path,
+                            upload_id=str(ctx.upload_id),
+                            category=category,
+                            persona=persona_api,
+                            options=studio_opts,
+                            job_context=ctx,
+                        )
+                        if ok:
+                            render_method = "studio_renderer"
+                            pikzels_aspect_cache[aspect_fmt] = out_path
+                            hp = _thumbnail_hydration_edit_prompt(brief or {})
+                            skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
+                            if hp and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
+                                he_ok = await refine_thumbnail_with_pikzels_edit(
+                                    out_path,
+                                    hp,
+                                    platform=platform,
+                                    upload_id=str(ctx.upload_id),
+                                )
+                                studio_render_report["hydration_pikzels_edit"][platform] = bool(
+                                    he_ok
+                                )
+                        else:
+                            logger.warning(
+                                "[thumb-renderer] Pikzels studio render failed for %s upload=%s — "
+                                "falling back to next render step (was: %s)",
+                                platform, ctx.upload_id, render_steps,
+                            )
+                            # Capture the last pikzels HTTP status from the provider-error trace so
+                            # the worker can emit a focused admin ops_incident. The trace lives in
+                            # ctx.output_artifacts["provider_error_trace"] as a JSON list.
+                            last_status: Any = "unknown"
+                            last_message = ""
+                            last_code = ""
+                            _r: Any = None
+                            try:
+                                raw_trace = ctx.output_artifacts.get("provider_error_trace") if isinstance(ctx.output_artifacts, dict) else None
+                                if isinstance(raw_trace, str) and raw_trace.strip():
+                                    _rows = json.loads(raw_trace)
+                                    if isinstance(_rows, list):
+                                        for _cand in reversed(_rows):
+                                            if isinstance(_cand, dict) and str(_cand.get("provider") or "").lower() == "pikzels":
+                                                _r = _cand
+                                                last_status = _cand.get("http_status", "unknown") or "unknown"
+                                                last_message = str(_cand.get("message") or "")[:240]
+                                                last_code = str(_cand.get("provider_code") or "").strip()
+                                                break
+                            except Exception:
+                                pass
+                            _snippet = ""
+                            try:
+                                _snippet = str(
+                                    (_r.get("response_body_snippet") if isinstance(_r, dict) else "") or ""
+                                )
+                            except Exception:
+                                _snippet = ""
+                            _combined = f"{last_message} {_snippet}".lower()
+                            _reason = last_code or (
+                                "prompt_too_long"
+                                if "prompt" in _combined and ("1200" in _combined or "1000" in _combined)
+                                else "pikzels_http_error"
+                            )
+                            if (
+                                str(last_status) == "402"
+                                or "insufficient_credits" in str(_reason).lower()
+                                or "insufficient_credits" in _combined
+                            ):
+                                pikzels_credits_exhausted = True
+                                _reason = "insufficient_credits"
+                                studio_render_report["pikzels_credits_exhausted"] = True
+                            pikzels_render_failures.append({
+                                "provider": "pikzels",
+                                "status": "failed",
+                                "reason": _reason,
+                                "fallback": "template",
+                                "platform": platform,
+                                "http_status": last_status,
+                                "message": (last_message or _snippet or "pikzels_http_error")[:500],
+                            })
                 elif step == "template":
                     attempted_methods.append("template")
                     from services.platform_colors import platform_color_for, resolve_platform_colors
@@ -1987,6 +2119,19 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             raw_frame_only = False
             studio_render_report["raw_frame_only"] = False
         elif strict_studio:
+            studio_render_report["fail_loud"] = True
+            studio_render_report["skip_reason"] = (
+                studio_render_report.get("skip_reason")
+                or _pikzels_failures_skip_reason(pikzels_render_failures)
+                or "strict_studio_no_styled_output"
+            )
+            _finalize_styled_thumbnail_artifacts(
+                ctx,
+                studio_render_report=studio_render_report,
+                render_method=render_method,
+                platform_map=platform_map,
+                pikzels_render_failures=pikzels_render_failures,
+            )
             raise ThumbnailError(
                 "Strict Pikzels mode enabled and Studio renderer did not produce a styled thumbnail"
             )
@@ -1999,7 +2144,8 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             studio_render_report["pikzels_requested_but_skipped"] = True
             if not studio_render_report.get("skip_reason"):
                 studio_render_report["skip_reason"] = (
-                    f"engine_requested_but_got_{render_method or 'none'}"
+                    _pikzels_failures_skip_reason(pikzels_render_failures)
+                    or f"engine_requested_but_got_{render_method or 'none'}"
                 )
 
         # Similarity: Studio winner vs primary YouTube cover (drift diagnostics).
@@ -2019,52 +2165,38 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             pass
 
         # Fail loud when engine was requested but Pikzels fell through to template.
+        strict_raise: Optional[str] = None
         if pikzels_render_failures and _engine_explicitly_requested(us):
             ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_FAILED_USED_TEMPLATE"
             ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels failed — used template"
             studio_render_report["fail_loud"] = True
             studio_render_report["queue_badge"] = "Pikzels failed — used template"
+            if not studio_render_report.get("skip_reason"):
+                studio_render_report["skip_reason"] = (
+                    _pikzels_failures_skip_reason(pikzels_render_failures)
+                    or "pikzels_http_error"
+                )
             if strict_studio:
-                raise ThumbnailError(
-                    "Strict Pikzels mode: engine was requested but Pikzels failed for one or more platforms"
+                strict_raise = (
+                    "Strict Pikzels mode: engine was requested but Pikzels failed "
+                    "for one or more platforms"
                 )
         elif studio_render_report.get("pikzels_requested_but_skipped") and _engine_explicitly_requested(us):
             ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_SKIPPED_UNEXPECTED"
             ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels skipped — check thumbnail settings"
             studio_render_report["fail_loud"] = True
 
-        ctx.output_artifacts["thumbnail_render_method"] = render_method
-        ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
-        ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
-        ctx.output_artifacts["pikzels_requested_but_skipped"] = (
-            "1" if studio_render_report.get("pikzels_requested_but_skipped") else "0"
+        # Persist diagnostics before any strict raise so Discord/queue see skip_reason
+        # (previously strict mode raised here and wiped studio_render_report from the job).
+        _finalize_styled_thumbnail_artifacts(
+            ctx,
+            studio_render_report=studio_render_report,
+            render_method=render_method,
+            platform_map=platform_map,
+            pikzels_render_failures=pikzels_render_failures,
         )
-        ctx.output_artifacts["platform_render_methods"] = json.dumps(
-            studio_render_report.get("platform_render_methods") or {}
-        )
-        if pikzels_render_failures:
-            ctx.output_artifacts["pikzels_render_failures"] = json.dumps(pikzels_render_failures)
-        try:
-            from services.diag_persist import schedule_persist_artifact_now
-
-            persist_keys = [
-                "studio_render_report",
-                "thumbnail_render_method",
-                "platform_thumbnail_map",
-                "pikzels_requested_but_skipped",
-                "platform_render_methods",
-            ]
-            if sticker_composite_enabled():
-                persist_keys.append("sticker_pack_json")
-            if pikzels_render_failures:
-                persist_keys.append("pikzels_render_failures")
-            if ctx.output_artifacts.get("thumbnail_error_code"):
-                persist_keys.extend(["thumbnail_error_code", "thumbnail_queue_badge"])
-            if ctx.output_artifacts.get("thumbnail_studio_similarity"):
-                persist_keys.append("thumbnail_studio_similarity")
-            schedule_persist_artifact_now(ctx, *persist_keys)
-        except Exception:
-            pass
+        if strict_raise:
+            raise ThumbnailError(strict_raise)
         logger.info(
             "[thumb-renderer] studio render report upload=%s eligible=%s steps=%s "
             "persona=%s methods=%s anchor=%r",

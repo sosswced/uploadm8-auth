@@ -40,6 +40,8 @@ services:
         sync: false
 
   # Background Worker (needs Docker for FFmpeg)
+  # OOM defense: pin concurrency=1 on Standard (2GB). Autoscaling instances does
+  # NOT help if each instance still runs CONCURRENCY≥2 — that is what OOMs us.
   - type: worker
     name: uploadm8-worker
     env: docker
@@ -63,3 +65,42 @@ services:
         value: uploadm8:jobs
       - key: PRIORITY_JOB_QUEUE
         value: uploadm8:priority
+      # ── Memory / concurrency (keep in sync with render-env-pipeline-additions.txt)
+      - key: RENDER_MEMORY_LIMIT_MB
+        value: "2048"
+      - key: MEMORY_ADMIT_PCT
+        value: "75"
+      - key: MEMORY_HARD_PCT
+        value: "88"
+      - key: MEMORY_WARN_PCT
+        value: "80"
+      - key: MEMORY_ADMIT_WAIT_SEC
+        value: "45"
+      - key: WORKER_LANE
+        value: full
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: WORKER_HEAVY_PIPELINE_SLOTS
+        value: "1"
+      - key: PUBLISH_CONCURRENCY
+        value: "1"
+      - key: USER_PROCESS_MAX_PARALLEL
+        value: "1"
+      - key: USER_PROCESS_MAX_PARALLEL_PRIORITY
+        value: "1"
+      - key: USER_SLOT_CLEAR_ON_START
+        value: "1"
+      - key: FFMPEG_THREADS
+        value: "1"
+      - key: TRANSCODE_X264_PRESET
+        value: faster
+      - key: WATERMARK_SINGLE_PASS
+        value: "true"
+      - key: TRANSCODE_PRESERVE_HD_TIER
+        value: "false"
+      - key: STALE_PROCESSING_MINUTES
+        value: "45"
+      - key: STUCK_READY_REDISPATCH_MINUTES
+        value: "60"
+      - key: STUCK_READY_FAIL_MINUTES
+        value: "90"

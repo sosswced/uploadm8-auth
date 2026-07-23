@@ -60,13 +60,15 @@ def _which_uv() -> Optional[str]:
     return shutil.which("uv")
 
 
-def _script_cmd(script_rel: str) -> List[str]:
-    """Prefer ``uv run`` for PEP 723 scripts (isolated deps e.g. datasets)."""
-    script = str(_REPO_ROOT / script_rel)
-    uv = _which_uv()
-    if uv:
-        return [uv, "run", script]
-    return [sys.executable, script]
+def _sklearn_stack_available() -> bool:
+    try:
+        import joblib  # noqa: F401
+        import pandas  # noqa: F401
+        import sklearn  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def _datasets_available() -> bool:
@@ -76,6 +78,57 @@ def _datasets_available() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _script_cmd(script_rel: str, *, needs_datasets: bool = False) -> List[str]:
+    """Resolve interpreter for ML scripts.
+
+    ``UM8_ML_USE_UV``:
+      * ``auto`` (default) — use ``sys.executable`` when sklearn is already
+        importable (Render API image). Only fall back to ``uv run`` when
+        ``needs_datasets`` and ``datasets`` is missing. This avoids
+        ``local training failed`` from ``uv run`` isolating away installed deps.
+      * ``1`` / ``true`` — always prefer ``uv run`` when uv is on PATH
+      * ``0`` / ``false`` — always ``sys.executable``
+    """
+    import os
+
+    script = str(_REPO_ROOT / script_rel)
+    mode = (os.environ.get("UM8_ML_USE_UV") or "auto").strip().lower()
+    uv = _which_uv()
+    if mode in ("1", "true", "yes", "on") and uv:
+        return [uv, "run", script]
+    if mode in ("0", "false", "no", "off"):
+        return [sys.executable, script]
+    # auto
+    if needs_datasets and not _datasets_available() and uv:
+        return [uv, "run", script]
+    if _sklearn_stack_available() or not uv:
+        return [sys.executable, script]
+    return [uv, "run", script]
+
+
+def _subprocess_detail(step: Optional[Dict[str, Any]], *, limit: int = 800) -> str:
+    if not isinstance(step, dict):
+        return ""
+    for key in ("stderr_tail", "stdout_tail", "error"):
+        raw = (step.get(key) or "").strip()
+        if raw:
+            return raw[-limit:]
+    return ""
+
+
+def _seed_on_train_fail_enabled(cfg: MLEngineConfig) -> bool:
+    """Default ON so train crashes recover via seed instead of paging Discord forever."""
+    import os
+
+    raw = (os.environ.get("UM8_ML_ENGINE_SEED_ON_TRAIN_FAIL") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # Explicit env unset → on (cfg.seed_bootstrap remains for the soft insufficient path).
+    return True
 
 
 async def _alert_ml_engine_failure(
@@ -94,18 +147,24 @@ async def _alert_ml_engine_failure(
         from services.ops_incidents import record_operational_incident
 
         err = str(result.get("error") or result.get("reason") or "unknown")[:800]
-        build = (result.get("steps") or {}).get("build_dataset") or {}
-        build_tail = (build.get("stderr_tail") or build.get("stdout_tail") or "").strip()[-600:]
+        steps = result.get("steps") or {}
+        build = steps.get("build_dataset") or {}
+        train = steps.get("train_local") or {}
+        build_tail = _subprocess_detail(build)
+        train_tail = _subprocess_detail(train) or str(result.get("train_detail") or "")[-600:]
         await record_operational_incident(
             pool,
             source="ml_engine",
             incident_type="ml_engine_cycle_failed",
             subject="ML engine cycle failed",
-            body=f"error={err}\nbuild_tail={build_tail}",
+            body=f"error={err}\ntrain_tail={train_tail}\nbuild_tail={build_tail}",
             details={
                 "cycle_status": cycle_status,
                 "error": err,
-                "steps": list((result.get("steps") or {}).keys()),
+                "steps": list(steps.keys()),
+                "train_detail": train_tail[:800],
+                "build_detail": build_tail[:800],
+                "script_cmd_mode": (__import__("os").environ.get("UM8_ML_USE_UV") or "auto"),
                 "finished_at": result.get("finished_at"),
             },
             dedupe_key="ml_engine:cycle_failed",
@@ -200,8 +259,9 @@ def _read_report(path: str) -> Dict[str, Any]:
 
 def _step_build_dataset(cfg: MLEngineConfig, lookback_days: Optional[int] = None) -> Dict[str, Any]:
     lb = int(lookback_days or cfg.dataset_lookback_days)
+    needs_datasets = bool(cfg.dataset_repo)
     cmd = [
-        *_script_cmd("scripts/build_promo_training_dataset.py"),
+        *_script_cmd("scripts/build_promo_training_dataset.py", needs_datasets=needs_datasets),
         "--lookback-days",
         str(lb),
         "--limit",
@@ -216,8 +276,10 @@ def _step_build_dataset(cfg: MLEngineConfig, lookback_days: Optional[int] = None
 
 def _step_train_local(cfg: MLEngineConfig) -> Dict[str, Any]:
     model_out = str(_REPO_ROOT / "data" / "ml" / "promo_uplift_model.joblib")
+    Path(model_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.local_report_path).parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        *_script_cmd("scripts/train_promo_uplift_baseline.py"),
+        *_script_cmd("scripts/train_promo_uplift_baseline.py", needs_datasets=False),
         "--input",
         cfg.local_dataset_path,
         "--report-out",
@@ -225,7 +287,11 @@ def _step_train_local(cfg: MLEngineConfig) -> Dict[str, Any]:
         "--model-out",
         model_out,
     ]
-    return _run_subprocess(cmd)
+    out = _run_subprocess(cmd)
+    # Attach interpreter choice for ops debugging (uv vs sys.executable).
+    out["cmd0"] = cmd[0]
+    out["cmd_preview"] = " ".join(cmd[:4])
+    return out
 
 
 def _step_push_eval(cfg: MLEngineConfig, report: Dict[str, Any]) -> Dict[str, Any]:
@@ -257,8 +323,9 @@ def _step_push_eval(cfg: MLEngineConfig, report: Dict[str, Any]) -> Dict[str, An
 
 def _step_build_content_dataset(cfg: MLEngineConfig, lookback_days: Optional[int] = None) -> Dict[str, Any]:
     lb = int(lookback_days or cfg.dataset_lookback_days)
+    needs_datasets = bool(cfg.content_dataset_repo)
     cmd = [
-        *_script_cmd("scripts/build_content_success_dataset.py"),
+        *_script_cmd("scripts/build_content_success_dataset.py", needs_datasets=needs_datasets),
         "--lookback-days",
         str(lb),
         "--limit",
@@ -273,8 +340,10 @@ def _step_build_content_dataset(cfg: MLEngineConfig, lookback_days: Optional[int
 
 def _step_train_content(cfg: MLEngineConfig) -> Dict[str, Any]:
     model_out = str(_REPO_ROOT / "data" / "ml" / "content_success_model.joblib")
+    Path(model_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.content_local_report_path).parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        *_script_cmd("scripts/train_content_success_model.py"),
+        *_script_cmd("scripts/train_content_success_model.py", needs_datasets=False),
         "--input",
         cfg.content_local_dataset_path,
         "--report-out",
@@ -282,7 +351,10 @@ def _step_train_content(cfg: MLEngineConfig) -> Dict[str, Any]:
         "--model-out",
         model_out,
     ]
-    return _run_subprocess(cmd)
+    out = _run_subprocess(cmd)
+    out["cmd0"] = cmd[0]
+    out["cmd_preview"] = " ".join(cmd[:4])
+    return out
 
 
 def _step_push_content_eval(cfg: MLEngineConfig, report: Dict[str, Any]) -> Dict[str, Any]:
@@ -473,17 +545,46 @@ async def _run_promo_loop(
             return
         last_train = await asyncio.to_thread(_step_train_local, c)
         if not last_train.get("ok"):
+            detail = _subprocess_detail(last_train)
+            logger.warning(
+                "ml engine promo train failed (rc=%s cmd=%s): %s",
+                last_train.get("returncode"),
+                last_train.get("cmd_preview"),
+                detail[-1200:],
+            )
+            # Recover: seed synthetic rows then retry once (closes crash-before-report gap).
+            if _seed_on_train_fail_enabled(c):
+                try:
+                    from services.ml_seed import seed_promo_parquet
+
+                    added = seed_promo_parquet(c.local_dataset_path, c.seed_rows)
+                    retry = await asyncio.to_thread(_step_train_local, c)
+                    last_train = retry
+                    last_train["seed_recovery_rows"] = added
+                    if retry.get("ok"):
+                        report = _read_report(c.local_report_path)
+                        used_lookback = lb
+                        result["seeded"] = True
+                        if report.get("status") not in _INSUFFICIENT:
+                            break
+                        # insufficient after seed — keep looping lookbacks / finalize below
+                        continue
+                except Exception as e:
+                    logger.warning("promo seed-on-train-fail recovery failed: %s", e)
             result["steps"]["build_dataset"] = last_build
             result["steps"]["train_local"] = last_train
             result["error"] = "local training failed"
+            result["train_detail"] = detail
             return
         report = _read_report(c.local_report_path)
         used_lookback = lb
         if report.get("status") not in _INSUFFICIENT:
             break
 
-    seeded = False
-    if report is not None and report.get("status") in _INSUFFICIENT and c.seed_bootstrap:
+    seeded = bool(result.get("seeded"))
+    if report is not None and report.get("status") in _INSUFFICIENT and (
+        c.seed_bootstrap or _seed_on_train_fail_enabled(c)
+    ):
         try:
             from services.ml_seed import seed_promo_parquet
 
@@ -501,6 +602,17 @@ async def _run_promo_loop(
     result["lookback_days_used"] = used_lookback
     if seeded:
         result["seeded"] = True
+    # Soft-fail: insufficient labels after recovery → blocked_on_data (no Discord spam).
+    if report is not None and report.get("status") in _INSUFFICIENT:
+        result["ok"] = True
+        result["status"] = "blocked_on_data"
+        result["error"] = None
+        result["message"] = report.get("message") or "insufficient training labels"
+        return
+    if last_train is not None and not last_train.get("ok"):
+        result["error"] = "local training failed"
+        result["train_detail"] = _subprocess_detail(last_train)
+        return
     await _finalize_publish(
         c, pool, result, report, seeded,
         task="promo_targeting_uplift_baseline",
@@ -534,17 +646,43 @@ async def _run_content_loop(
                 return content
             last_train = await asyncio.to_thread(_step_train_content, c)
             if not last_train.get("ok"):
+                detail = _subprocess_detail(last_train)
+                logger.warning(
+                    "ml engine content train failed (rc=%s): %s",
+                    last_train.get("returncode"),
+                    detail[-800:],
+                )
+                if _seed_on_train_fail_enabled(c):
+                    try:
+                        from services.ml_seed import seed_content_parquet
+
+                        added = seed_content_parquet(c.content_local_dataset_path, c.seed_rows)
+                        retry = await asyncio.to_thread(_step_train_content, c)
+                        last_train = retry
+                        last_train["seed_recovery_rows"] = added
+                        if retry.get("ok"):
+                            report = _read_report(c.content_local_report_path)
+                            used_lookback = lb
+                            content["seeded"] = True
+                            if report.get("status") not in _INSUFFICIENT:
+                                break
+                            continue
+                    except Exception as e:
+                        logger.warning("content seed-on-train-fail recovery failed: %s", e)
                 content["build_dataset"] = last_build
                 content["train_local"] = last_train
                 content["error"] = "content training failed"
+                content["train_detail"] = detail
                 return content
             report = _read_report(c.content_local_report_path)
             used_lookback = lb
             if report.get("status") not in _INSUFFICIENT:
                 break
 
-        seeded = False
-        if report is not None and report.get("status") in _INSUFFICIENT and c.seed_bootstrap:
+        seeded = bool(content.get("seeded"))
+        if report is not None and report.get("status") in _INSUFFICIENT and (
+            c.seed_bootstrap or _seed_on_train_fail_enabled(c)
+        ):
             try:
                 from services.ml_seed import seed_content_parquet
 

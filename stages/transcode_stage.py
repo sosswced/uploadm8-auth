@@ -746,10 +746,21 @@ async def transcode_video(
                         if now - last_progress_write >= PROGRESS_INTERVAL:
                             last_progress_write = now
                             try:
+                                # Map FFmpeg 0–99% into worker STAGE_PROGRESS
+                                # transcode→audio band (48..61). Do not import
+                                # worker here (circular). Best-effort only.
                                 from stages import db as _db
-                                await _db.update_upload_progress(
-                                    db_pool, upload_id, pct,
-                                    stage=f"transcoding:{platform}"
+
+                                band_lo, band_hi = 48, 61
+                                mapped = band_lo + int(
+                                    (max(0, min(99, pct)) / 99.0)
+                                    * (band_hi - band_lo)
+                                )
+                                await _db.update_stage_progress(
+                                    db_pool,
+                                    upload_id,
+                                    "transcode",
+                                    mapped,
                                 )
                             except Exception:
                                 pass

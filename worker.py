@@ -227,7 +227,7 @@ ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
 
 # ── Per-stage timeouts (seconds) — see stages/pipeline_stage_budgets.py ──
 STAGE_TIMEOUT_WATERMARK = int(stage_budgets.stage_timeout_watermark())
-STAGE_TIMEOUT_TRANSCODE = int(stage_budgets.stage_timeout_transcode()) or 1800
+STAGE_TIMEOUT_TRANSCODE = int(stage_budgets.stage_timeout_transcode()) or 3600
 STAGE_TIMEOUT_THUMBNAIL = int(stage_budgets.stage_timeout_thumbnail())
 STAGE_TIMEOUT_PUBLISH = int(stage_budgets.stage_timeout_publish())
 STAGE_TIMEOUT_AUDIO = int(stage_budgets.stage_timeout_audio())
@@ -661,15 +661,17 @@ STAGE_PROGRESS = {
     "download":   10,
     "telemetry":  18,
     "watermark":  28,
+    # Wide transcode→audio band so mid-encode heartbeats / FFmpeg % are visible
+    # (was 48→52 = 3pts; long multi-platform encodes looked frozen).
     "transcode":  48,
-    "audio":      52,
-    "vision":     55,
-    "twelvelabs": 57,
-    "video_intelligence": 58,
-    "dashcam_osd": 60,
-    "thumbnail":  65,
-    "caption":    75,
-    "upload":     87,
+    "audio":      62,
+    "vision":     65,
+    "twelvelabs": 67,
+    "video_intelligence": 68,
+    "dashcam_osd": 70,
+    "thumbnail":  74,
+    "caption":    80,
+    "upload":     88,
     "publish":    96,
     "notify":     99,
 }
@@ -846,11 +848,140 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         }
     except Exception as e:
         logger.warning(f"[{ctx.upload_id}] ffprobe failed: {e} — using standard transcode")
-        return await run_transcode_stage(ctx)
+        # Pass db_pool so fallback path still mid-encode bumps (best-effort).
+        return await run_transcode_stage(ctx, db_pool=db_pool)
 
     groups = _group_platforms_by_spec(platforms, info)
     reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
     ctx.platform_videos = {}
+
+    group_lists = list(groups.values())
+    total_groups = max(1, len(group_lists))
+    done_groups = 0
+    # Leave headroom under the next stage so mid-encode bumps never jump past
+    # audio-stage entry. Band is intentionally wide (see STAGE_PROGRESS).
+    base_pct = int(STAGE_PROGRESS.get("transcode", 48))
+    next_pct = int(STAGE_PROGRESS.get("audio", 62))
+    span = max(1, next_pct - base_pct - 1)
+    try:
+        encode_duration = float(getattr(info, "duration", 0) or 0)
+    except (TypeError, ValueError):
+        encode_duration = 0.0
+
+    async def _write_transcode_pct(pct: int, *, note: str) -> None:
+        pct = min(next_pct - 1, max(base_pct, int(pct)))
+        try:
+            await db_stage.update_stage_progress(
+                db_pool, ctx.upload_id, "transcode", pct
+            )
+            from services.worker_runtime_state import track_process_stage
+
+            await track_process_stage(str(ctx.upload_id), "transcode")
+            logger.info(
+                f"[{ctx.upload_id}] Transcode progress {pct}% ({note})"
+            )
+        except Exception as bump_e:
+            # Best-effort: a DB blip must never kill the encode.
+            logger.debug(
+                f"[{ctx.upload_id}] Transcode progress bump skipped: {bump_e}"
+            )
+
+    async def _bump_transcode_progress(finished_canonical: str) -> None:
+        """Advance % when a platform group finishes (keeps UI + updated_at alive)."""
+        nonlocal done_groups
+        done_groups += 1
+        pct = base_pct + max(1, int(span * done_groups / total_groups))
+        await _write_transcode_pct(
+            pct,
+            note=f"{done_groups}/{total_groups} groups, last={finished_canonical}",
+        )
+
+    async def _wait_ffmpeg_with_heartbeat(proc, canonical: str):
+        """Await FFmpeg with live % + heartbeat so stale/UI timeouts stay off.
+
+        Prefers stderr ``time=`` mapping into the current group's slice of the
+        transcode band; falls back to 45s micro-nudges. All DB writes are
+        best-effort — never raise into the encode path.
+        """
+        import re
+        import time as _time
+
+        floor = base_pct + max(0, int(span * done_groups / total_groups))
+        floor = min(next_pct - 1, max(base_pct, floor))
+        # One group's slice of the band (leave last point for completion bump).
+        group_span = max(1, int(span / total_groups))
+        ceil = min(next_pct - 1, floor + group_span)
+        time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+        last_write = 0.0
+        stderr_chunks: list[bytes] = []
+        saw_time = False
+
+        async def _hb() -> None:
+            tick = 0
+            while True:
+                await asyncio.sleep(45.0)
+                if saw_time:
+                    # Live FFmpeg % is already refreshing updated_at.
+                    continue
+                tick += 1
+                micro = min(ceil, floor + min(max(0, group_span - 1), tick))
+                await _write_transcode_pct(
+                    micro, note=f"ffmpeg heartbeat {canonical} t={tick * 45}s"
+                )
+
+        async def _stream_stderr() -> None:
+            nonlocal last_write, saw_time
+            if not proc.stderr:
+                return
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                stderr_chunks.append(line)
+                if encode_duration < 1:
+                    continue
+                try:
+                    text = line.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                m = time_re.search(text)
+                if not m:
+                    continue
+                try:
+                    h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                    encoded = h * 3600 + mn * 60 + s
+                    frac = min(1.0, max(0.0, encoded / encode_duration))
+                except (TypeError, ValueError):
+                    continue
+                now = _time.monotonic()
+                if now - last_write < 2.0:
+                    continue
+                last_write = now
+                saw_time = True
+                pct = floor + int(frac * max(1, ceil - floor))
+                await _write_transcode_pct(
+                    pct, note=f"ffmpeg {canonical} {frac:.0%} encode"
+                )
+
+        hb = asyncio.create_task(_hb())
+        stream = asyncio.create_task(_stream_stderr())
+        try:
+            await proc.wait()
+            # Drain any remaining stderr if stream finished early.
+            if proc.stdout:
+                try:
+                    await proc.stdout.read()
+                except Exception:
+                    pass
+            return b"", b"".join(stderr_chunks)
+        finally:
+            hb.cancel()
+            stream.cancel()
+            for t in (hb, stream):
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
     async def _transcode_one_group(group_platforms: List[str]) -> Dict[str, Path]:
         canonical = group_platforms[0]
@@ -882,7 +1013,7 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate()
+                _, stderr = await _wait_ffmpeg_with_heartbeat(proc, canonical)
 
                 if proc.returncode != 0 or not output_path.exists():
                     logger.error(
@@ -890,6 +1021,7 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                     )
                     for p in group_platforms:
                         out[p] = source_video
+                    await _bump_transcode_progress(canonical)
                     return out
 
                 sz_mb = output_path.stat().st_size / 1024 / 1024
@@ -915,9 +1047,9 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
             logger.info(f"[{ctx.upload_id}] Platforms {group_platforms} already compatible")
             for p in group_platforms:
                 out[p] = source_video
+        await _bump_transcode_progress(canonical)
         return out
 
-    group_lists = list(groups.values())
     if len(group_lists) > 1:
         group_results = await asyncio.gather(
             *[_transcode_one_group(gp) for gp in group_lists],
@@ -928,6 +1060,7 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 logger.error(f"[{ctx.upload_id}] Transcode group failed: {gr}")
                 for p in gp:
                     ctx.platform_videos[p] = source_video
+                await _bump_transcode_progress(gp[0] if gp else "?")
             else:
                 ctx.platform_videos.update(gr)
     else:
@@ -5623,6 +5756,16 @@ async def run_orphan_processing_recovery_loop() -> None:
                                 ledger.get("reason"),
                             )
                             continue
+                        # Fail-closed: accepted ledger exists but terminalize
+                        # failed — never fall through to re-queue/process
+                        # (would re-encode and risk a second publish).
+                        logger.error(
+                            "[%s] orphan recovery: full accepted ledger but "
+                            "reconcile failed (%s) — leaving processing",
+                            up,
+                            ledger.get("reason"),
+                        )
+                        continue
                     stage_now = str(fresh.get("processing_stage") or "").lower()
                     # Claim/slot latch or early stages: never jump to publish even if
                     # leftover processed_assets keys exist from a prior attempt.
@@ -5632,6 +5775,13 @@ async def run_orphan_processing_recovery_loop() -> None:
                         reclaim = classify_orphan_reclaim(
                             fresh, has_accepted_ledger=covers
                         )
+                    if reclaim == "ledger_complete":
+                        logger.warning(
+                            "[%s] orphan recovery: ledger_complete — skip "
+                            "re-enqueue (avoid double-post)",
+                            up,
+                        )
+                        continue
                     if reclaim == "publish":
                         # Fresh pending ledger slot(s) = Step A likely in-flight
                         # on a publisher whose heartbeat we can't see (e.g. it

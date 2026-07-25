@@ -231,25 +231,34 @@ async def verify_single_attempt(
 
     prev_verify = str(attempt.get("verify_status") or "").strip().lower()
     tiktok_post_url: Optional[str] = None
+    plat = str(platform or "").strip().lower()
 
-    # Load platform token for this user
-    platform_to_db_key = {
-        "tiktok": "tiktok",
-        "youtube": "google",
-        "instagram": "meta",
-        "facebook": "meta",
-    }
-    db_key = platform_to_db_key.get(platform, platform)
+    # Meta / YouTube already return durable post ids at accept time — confirm
+    # without a token round-trip (token-key mismatches used to leave these
+    # pending forever and flood "Verifying N publish attempts").
+    if plat in ("instagram", "facebook") and platform_post_id:
+        if prev_verify != "confirmed":
+            await db_stage.update_publish_attempt_verified(
+                db_pool, attempt_id, "confirmed"
+            )
+        return
 
+    # Load the exact account token when we have token_row_id; fall back to
+    # platform_tokens.platform (= tiktok|youtube|instagram|facebook). Older
+    # code wrongly queried "meta"/"google" and always missed the row.
+    token_row_id = str(attempt.get("token_row_id") or "").strip() or None
     token_data = None
     try:
-        token_data = await db_stage.load_platform_token(db_pool, user_id, db_key)
+        if token_row_id:
+            token_data = await db_stage.load_platform_token_by_id(db_pool, token_row_id)
+        if not token_data and user_id and plat:
+            token_data = await db_stage.load_platform_token(db_pool, user_id, plat)
     except Exception:
-        pass
+        token_data = None
 
     if not token_data:
         # Token missing/revoked — keep pending so reconnect can finish confirmation.
-        logger.debug("Verify %s/%s: no token — leave pending", platform, attempt_id)
+        logger.debug("Verify %s/%s: no token — leave pending", plat, attempt_id)
         if prev_verify != "pending":
             await db_stage.update_publish_attempt_verified(db_pool, attempt_id, "pending")
         return
@@ -264,14 +273,13 @@ async def verify_single_attempt(
     raw_status = "unknown"
     tiktok_video_id: Optional[str] = None
 
-    if platform == "tiktok" and publish_id:
+    if plat == "tiktok" and publish_id:
         raw_status, tiktok_video_id = await verify_tiktok(publish_id, token_data)
-    elif platform == "youtube" and platform_post_id:
+    elif plat == "youtube" and platform_post_id:
         raw_status = await verify_youtube(platform_post_id, token_data)
-    elif platform in ("instagram", "facebook") and platform_post_id:
-        # Publish already stored the media/post id — treat as confirmed live.
+    elif plat in ("instagram", "facebook") and platform_post_id:
         raw_status = "confirmed"
-    elif platform in ("instagram", "facebook"):
+    elif plat in ("instagram", "facebook"):
         raw_status = "pending"
     else:
         raw_status = "unknown"

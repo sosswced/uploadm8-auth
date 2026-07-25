@@ -258,11 +258,26 @@ class SingleBrowserSession:
 
     @staticmethod
     def _attach_human_guards(page: Page) -> None:
-        """Keep one tab: dismiss alert/confirm/prompt so the tour never blocks on popups."""
+        """Keep one tab: dismiss most dialogs so the tour never blocks on popups.
+
+        Accept the upload duplicate-source confirm so the presign
+        ``allowDuplicate`` retry can proceed under /TUP (Playwright would
+        otherwise dismiss and abort the journey as "Skipped").
+        """
 
         def _on_dialog(dialog) -> None:
+            msg = (getattr(dialog, "message", None) or "").lower()
+            kind = (getattr(dialog, "type", None) or "").lower()
+            accept_dupe = kind == "confirm" and (
+                "duplicate" in msg
+                or "post it again" in msg
+                or "allowduplicate" in msg
+            )
             try:
-                dialog.dismiss()
+                if accept_dupe:
+                    dialog.accept()
+                else:
+                    dialog.dismiss()
             except Exception:
                 try:
                     dialog.accept()

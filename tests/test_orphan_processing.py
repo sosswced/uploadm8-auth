@@ -136,6 +136,13 @@ def test_classify_orphan_reclaim_publish_vs_process():
     )
     assert classify_orphan_reclaim({"processed_assets": {}}) == "process"
     assert classify_orphan_reclaim(None) == "process"
+    assert (
+        classify_orphan_reclaim(
+            {"processed_assets": {"youtube": "processed/y.mp4"}},
+            has_accepted_ledger=True,
+        )
+        == "ledger_complete"
+    )
 
 
 def test_empty_fleet_past_grace_is_orphan():

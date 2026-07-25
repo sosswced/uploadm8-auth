@@ -14,7 +14,11 @@ pytestmark = [pytest.mark.e2e, pytest.mark.slow, pytest.mark.upload_ui]
 @pytest.mark.timeout(7200)
 def test_live_demo_journey(live_demo_page, base_url: str, test_video_path: Path | None, test_telemetry_map_path: Path | None):
     if test_video_path is None:
-        pytest.skip("Set E2E_TEST_VIDEO for live demo")
+        pytest.skip(
+            "No journey media: set E2E_MEDIA_LIBRARY (random .mp4+.map pair) "
+            "or E2E_TEST_VIDEO (+ optional E2E_TEST_TELEMETRY_MAP). "
+            "Under E2E_TUP=1 fixed-fixture fallback is disabled."
+        )
     video, telemetry = resolve_demo_paths(test_video_path, test_telemetry_map_path)
     result = run_live_demo_journey(
         live_demo_page,

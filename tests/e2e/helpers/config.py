@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 
-# Default overnight upload fixtures (override via E2E_TEST_VIDEO / E2E_TEST_TELEMETRY_MAP).
+# Legacy single-file fallbacks (prefer E2E_MEDIA_LIBRARY random pairs).
 DEFAULT_E2E_VIDEO = Path(r"C:\Users\Earl\Videos\20250224_0073_CAM_EVNT.MP4")
 DEFAULT_E2E_TELEMETRY_MAP = Path(r"C:\Users\Earl\Videos\20250224_0073_CAM_EVNT.map")
 
@@ -42,10 +42,37 @@ def _resolve_e2e_path(raw: str) -> Path | None:
     return p if p.is_file() else None
 
 
+def _library_pair() -> tuple[Path, Path] | None:
+    """Random matching .mp4+.map from E2E_MEDIA_LIBRARY (or default PNW folder)."""
+    # Skip library when ANY explicit path is set. If only one env is set,
+    # still calling the library for the other half can pair a fixed video
+    # with a random .map (or vice versa) and break TUP telemetry.
+    if (os.environ.get("E2E_TEST_VIDEO") or "").strip() or (
+        os.environ.get("E2E_TEST_TELEMETRY_MAP") or ""
+    ).strip():
+        return None
+    try:
+        from tests.e2e.helpers.media_library import pick_random_media_pair
+
+        return pick_random_media_pair()
+    except Exception:
+        return None
+
+
+def _tup_mode() -> bool:
+    return os.environ.get("E2E_TUP", "").lower() in ("1", "true", "yes", "on")
+
+
 def e2e_test_video() -> Path | None:
     resolved = _resolve_e2e_path(os.environ.get("E2E_TEST_VIDEO", ""))
     if resolved is not None:
         return resolved
+    pair = _library_pair()
+    if pair is not None:
+        return pair[0]
+    # /TUP must never silently re-post the same fixed fixture to live accounts.
+    if _tup_mode():
+        return None
     return DEFAULT_E2E_VIDEO if DEFAULT_E2E_VIDEO.is_file() else None
 
 
@@ -53,7 +80,21 @@ def e2e_test_telemetry_map() -> Path | None:
     resolved = _resolve_e2e_path(os.environ.get("E2E_TEST_TELEMETRY_MAP", ""))
     if resolved is not None:
         return resolved
+    pair = _library_pair()
+    if pair is not None:
+        return pair[1]
+    if _tup_mode():
+        return None
     return DEFAULT_E2E_TELEMETRY_MAP if DEFAULT_E2E_TELEMETRY_MAP.is_file() else None
+
+
+def e2e_youtube_copyright_trim() -> bool:
+    """Force-enable YouTube Shorts copyright trim for long-clip TUP tests."""
+    raw = os.environ.get("E2E_YOUTUBE_COPYRIGHT_TRIM")
+    if raw is None or raw.strip() == "":
+        # Default on for /TUP so >60s library clips exercise the cut path.
+        return os.environ.get("E2E_TUP", "").lower() in ("1", "true", "yes")
+    return raw.lower() not in ("0", "false", "no", "off")
 
 
 def e2e_headed() -> bool:

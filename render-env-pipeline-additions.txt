@@ -35,8 +35,12 @@ WATERMARK_SINGLE_PASS=true
 TWELVE_LABS_PARALLEL=false
 TRANSCODE_PRESERVE_HD_TIER=false
 
+# Multi-platform FFmpeg can exceed 30m wall clock — keep UI heartbeats alive
+# (worker mid-transcode bumps) and do not cut encode at the old 1800s default.
+STAGE_TIMEOUT_TRANSCODE_SECONDS=3600
+
 # Stale / ready_to_publish recovery — avoid 30m redispatch burn loops
-STALE_PROCESSING_MINUTES=45
+STALE_PROCESSING_MINUTES=30
 STUCK_READY_REDISPATCH_MINUTES=60
 STUCK_READY_FAIL_MINUTES=90
 
@@ -72,14 +76,25 @@ RENDER_MONITOR_OWNER_ID=tea_xxxxxxxx
 METRICS_API_KEY=change-me-long-random
 # RENDER_OPS_API_KEY=   # optional override; else METRICS_API_KEY
 RENDER_MONITOR_CACHE_TTL_SEC=30
-# Long encodes: don't treat stage as idle too early (default 90)
+# Long encodes: don't treat stage as idle too early *while a live worker owns it*
+# (default 90). Heartbeat-unowned zombies reclaim after ORPHAN_PROCESSING_GRACE_SEC.
 ACTIVE_PIPELINE_STALE_MINUTES=90
+# Mid-FFmpeg worker death: reclaim when no alive/stale heartbeat lists the upload.
+ORPHAN_PROCESSING_GRACE_SEC=90
+ORPHAN_PROCESSING_RECOVERY_INTERVAL_SEC=45
+# Promote stream reclaim defaults into Render dashboard if not already set:
+# STREAM_RECLAIM_INTERVAL_SEC=25
+# STREAM_RECLAIM_MIN_IDLE_MS=120000
+# STREAM_RECLAIM_COUNT=8
 # Fleet watchdog (default on) — Discord/email when fleet dies or RAM spikes
 WORKER_FLEET_WATCHDOG_ENABLED=1
 WORKER_FLEET_WATCHDOG_INTERVAL_SEC=60
 WATCHDOG_RENDER_API_ENABLED=1
 WATCHDOG_QUEUE_PENDING_ALERT=8
 WATCHDOG_ALERT_DEDUPE_SECONDS=600
+# Scale up/down Discord: edges (default) = only first worker up / last worker down.
+# all = every instance lifecycle; off = never Discord for scale events.
+WORKER_SCALE_DISCORD_MODE=edges
 # Worker Sentry (same DSN as API is fine — tagged component=worker)
 # SENTRY_DSN=https://…@….ingest.sentry.io/…
 # SENTRY_ENVIRONMENT=production
@@ -91,10 +106,22 @@ AI_TRACE_TIERS=pro,studio,agency,master_admin,friends_family
 AI_TRACE_PER_STAGE=true
 AI_TRACE_PIPELINE_SUMMARY=true
 
+# ACRCloud music ID (worker) — required for Music Detection + YouTube 60s copyright trim
+# ACRCLOUD_HOST=identify-us-west-2.acrcloud.com
+# ACRCLOUD_ACCESS_KEY=
+# ACRCLOUD_ACCESS_SECRET=
+# ACRCLOUD_MAX_SAMPLE_BYTES=4800000
+# ACRCLOUD_TIMEOUT_SECS=25
+
 # ML engine — runs on API web service; keep interval long to avoid RAM spikes
 UM8_ML_ENGINE_ENABLED=1
 UM8_ML_ENGINE_RUN_CONTENT_SUCCESS=1
 UM8_ML_ENGINE_INTERVAL_SECONDS=86400
+# Prefer API image Python for train (avoids uv isolating away sklearn).
+# auto|0|1 — leave unset for auto.
+UM8_ML_USE_UV=auto
+# On train crash, seed parquet + retry once (default on). Set 0 to disable.
+UM8_ML_ENGINE_SEED_ON_TRAIN_FAIL=1
 UM8_HF_DATASET_REPO=cedy243/uploadm8-promo-targeting-v1
 UM8_HF_MODEL_REPO=cedy243/uploadm8-promo-uplift-v1
 UM8_HF_CONTENT_DATASET_REPO=cedy243/uploadm8-content-success-v1
@@ -112,10 +139,26 @@ STUDIO_PREVIEW_PRESIGN_TTL_SEC=604800
 
 # Pikzels credit burn controls (upload pipeline)
 # Defaults in code: text-brief OFF, hydration /edit OFF; one image call per aspect
-# (YT 16:9 + shared 9:16 for IG/FB/TikTok). Set to 1 only when you intentionally
-# want the extra paid calls.
+# (YT 16:9 + shared 9:16 for IG/FB/TikTok). Cap=2 max billable /v2/thumbnail/image
+# calls per upload. After HTTP 402 the worker arms a process latch so auto-retry
+# and later uploads do NOT keep billing an empty balance.
 PIKZELS_TEXT_BRIEF_ON_UPLOAD=0
 THUMBNAIL_HYDRATION_PIKZELS_EDIT=0
+PIKZELS_MAX_IMAGE_CALLS_PER_JOB=2
+PIKZELS_CREDITS_EXHAUSTED_TTL_SEC=21600
+# After topping up Pikzels balance, set once then restart worker (or rely on TTL):
+# PIKZELS_CLEAR_CREDITS_LATCH=1
+
+
+# OpenAI image-edit thumbnail fallback (Pikzels → ai_edit → PIL template).
+# Off (default) keeps legacy Pikzels → template behavior. Set to 1 after
+# confirming OPENAI_API_KEY has image-edit quota; max 2 edit calls per upload.
+OPENAI_THUMBNAIL_EDIT_ENABLED=0
+# OPENAI_THUMBNAIL_EDIT_MODEL=gpt-image-1
+# OPENAI_THUMBNAIL_EDIT_TIMEOUT_SEC=90
+# Content-identity structured call (after speed consensus, before thumbnails).
+# CONTENT_IDENTITY_TIMEOUT_SEC=10
+# OPENAI_IDENTITY_MODEL=gpt-4o-mini
 
 
 # If you still hit OOM after WORKER_CONCURRENCY=1:

@@ -29,7 +29,10 @@ def stage_timeout_watermark() -> float:
 
 
 def stage_timeout_transcode() -> float:
-    return _sec("TRANSCODE", 1800)
+    # Multi-platform long clips (4 FFmpeg groups) routinely exceed 30m wall
+    # clock; 60m default avoids falling back to source mid-encode while the
+    # UI still shows "Building platform formats".
+    return _sec("TRANSCODE", 3600)
 
 
 def stage_timeout_thumbnail() -> float:

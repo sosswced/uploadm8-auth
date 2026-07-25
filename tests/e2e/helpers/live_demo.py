@@ -89,12 +89,42 @@ def resolve_demo_paths(
     video: Path | None = None,
     telemetry: Path | None = None,
 ) -> tuple[Path, Path | None]:
-    from tests.e2e.helpers.config import e2e_test_telemetry_map, e2e_test_video
+    import os
 
-    v = video or e2e_test_video() or (DEFAULT_VIDEO if DEFAULT_VIDEO.is_file() else None)
+    from tests.e2e.helpers.config import (
+        _resolve_e2e_path,
+        e2e_test_telemetry_map,
+        e2e_test_video,
+    )
+    from tests.e2e.helpers.media_library import describe_cached_pair, e2e_media_library
+
+    explicit = video or _resolve_e2e_path(os.environ.get("E2E_TEST_VIDEO", ""))
+    if explicit is not None:
+        v: Path | None = explicit
+        source = "explicit"
+    else:
+        v = e2e_test_video()
+        if describe_cached_pair().get("selected"):
+            source = "library"
+        else:
+            # No random pair came back. If a library IS configured, fail loudly:
+            # a fixed-fixture fallback re-posts the SAME clip to live platforms
+            # every run (duplicate posts on every connected account).
+            lib = e2e_media_library()
+            if lib is not None:
+                raise FileNotFoundError(
+                    f"E2E media library '{lib}' is configured but produced no "
+                    "matching .mp4+.map pair; refusing fixed-fixture fallback. "
+                    "Fix the library folder or set E2E_TEST_VIDEO explicitly."
+                )
+            source = "fixed-fallback"
+    if v is None and DEFAULT_VIDEO.is_file():
+        v = DEFAULT_VIDEO
+        source = "fixed-fallback"
     if v is None or not v.is_file():
         raise FileNotFoundError(
-            "Set E2E_TEST_VIDEO or pass --video (default: C:\\Users\\Earl\\Videos\\20250301_0058_CAM_EVNT.MP4)"
+            "Set E2E_MEDIA_LIBRARY (folder of matching .mp4+.map) or E2E_TEST_VIDEO. "
+            f"Library tried: {e2e_media_library()}"
         )
     t = telemetry
     if t is None:
@@ -103,6 +133,15 @@ def resolve_demo_paths(
         t = DEFAULT_MAP
     if t is not None and not t.is_file():
         t = None
+    pair_info = describe_cached_pair()
+    if source == "library" and pair_info.get("selected"):
+        print(
+            f"[live-demo] Media library pair: {pair_info.get('stem')} "
+            f"({pair_info.get('video')})",
+            flush=True,
+        )
+    else:
+        print(f"[live-demo] Video source={source}: {v}", flush=True)
     return v, t
 
 
@@ -733,6 +772,31 @@ def run_live_demo_journey(
 
     bootstrap_human_session(page, base_url)
     log.note(f"Logged in as {admin_email or 'master admin'} @ {base_url}")
+
+    try:
+        from tests.e2e.helpers.config import e2e_youtube_copyright_trim
+
+        if e2e_youtube_copyright_trim():
+            pref_client = api_client()
+            try:
+                r = pref_client.post(
+                    f"{base_url.rstrip('/')}/api/settings/preferences",
+                    json={"youtubeShortsCopyrightTrim": True},
+                )
+                if r.status_code < 400:
+                    log.note(
+                        "YouTube Shorts copyright trim ON "
+                        "(long library clips → ~60s YouTube cut path)"
+                    )
+                else:
+                    log.note(
+                        f"YouTube copyright trim pref not applied "
+                        f"(HTTP {r.status_code})"
+                    )
+            finally:
+                close_api_client(pref_client)
+    except Exception as pref_e:
+        log.note(f"YouTube copyright trim pref skipped: {pref_e}")
 
     stem, upload_ids = start_upload_on_page(page, base_url, video, telemetry, log)
     if worker_safe_mode():

@@ -65,6 +65,14 @@ services:
         value: uploadm8:jobs
       - key: PRIORITY_JOB_QUEUE
         value: uploadm8:priority
+      # ── ACRCloud music ID (required for YouTube Shorts copyright trim) ──
+      # All three must be set or ACR is skipped and the trim never triggers.
+      - key: ACRCLOUD_HOST
+        sync: false
+      - key: ACRCLOUD_ACCESS_KEY
+        sync: false
+      - key: ACRCLOUD_ACCESS_SECRET
+        sync: false
       # ── Memory / concurrency (keep in sync with render-env-pipeline-additions.txt)
       - key: RENDER_MEMORY_LIMIT_MB
         value: "2048"
@@ -99,7 +107,13 @@ services:
       - key: TRANSCODE_PRESERVE_HD_TIER
         value: "false"
       - key: STALE_PROCESSING_MINUTES
+        value: "30"
+      - key: ORPHAN_PROCESSING_GRACE_SEC
+        value: "90"
+      - key: ORPHAN_PROCESSING_RECOVERY_INTERVAL_SEC
         value: "45"
+      - key: ACTIVE_PIPELINE_STALE_MINUTES
+        value: "90"
       - key: STUCK_READY_REDISPATCH_MINUTES
         value: "60"
       - key: STUCK_READY_FAIL_MINUTES

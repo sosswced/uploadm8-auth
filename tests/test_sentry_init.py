@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from core.sentry_init import (
     _before_send,
     _before_send_transaction,
     _env_name,
     _is_localhost_url,
+    _should_drop_pytest_process,
 )
+
+
+@pytest.fixture(autouse=True)
+def _allow_before_send_assertions(monkeypatch):
+    """conftest sets SENTRY_DROP_PYTEST_EVENTS — clear for filter unit tests."""
+    monkeypatch.delenv("SENTRY_DROP_PYTEST_EVENTS", raising=False)
 
 
 def _event(message: str = "", exc_type: str = "", exc_value: str = "") -> dict:
@@ -85,6 +96,48 @@ def test_keep_remote_transactions():
 def test_localhost_url_helper():
     assert _is_localhost_url("http://127.0.0.1:8000/health")
     assert not _is_localhost_url("https://auth.uploadm8.com/api/me")
+
+
+def test_drop_pytest_events_when_flag_set(monkeypatch):
+    monkeypatch.setenv("SENTRY_DROP_PYTEST_EVENTS", "1")
+    assert _should_drop_pytest_process({}) is True
+    ev = _event(exc_type="RuntimeError", exc_value="hydrate exploded")
+    assert _before_send(ev, None) is None
+    monkeypatch.delenv("SENTRY_DROP_PYTEST_EVENTS", raising=False)
+    assert _should_drop_pytest_process({}) is False
+
+
+def test_drop_skipstage_pipeline_control_flow():
+    """UPLOADM8-8G / 8N — expected best-effort skips must not open issues."""
+    ev = _event(exc_type="SkipStage", exc_value="Video indexing failed")
+    assert _before_send(ev, None) is None
+    ev2 = _event(
+        exc_type="SkipStage",
+        exc_value="Video Intelligence disabled in upload preferences (aiServiceVideoAnalyzer)",
+    )
+    assert _before_send(ev2, None) is None
+
+
+def test_drop_openai_quota_and_m8_429_logs():
+    """UPLOADM8-8J / 8K — billing quota is ops, not a code regression."""
+    ev = {
+        "logentry": {
+            "message": 'M8 Engine HTTP 429: {"error":{"code":"insufficient_quota"}}'
+        }
+    }
+    assert _before_send(ev, None) is None
+    ev2 = {
+        "message": "OpenAI API error: 429 — exceeded your current quota",
+    }
+    assert _before_send(ev2, None) is None
+
+
+def test_drop_pikzels_persona_misconfig():
+    ev = _event(
+        exc_type="ThumbnailError",
+        exc_value="Linked Pikzels persona required but not resolved. Open Thumbnail Studio",
+    )
+    assert _before_send(ev, None) is None
 
 
 def test_env_name_prefers_development_for_local_e2e(monkeypatch):

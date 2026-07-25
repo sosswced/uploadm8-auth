@@ -263,8 +263,16 @@ _JUNK_HASHTAG_RE = re.compile(
     r"|mph[a-z]{2,}"                    # mphcwalker mashups
     r"|(?:lat|lon|gps)\d"
     r"|\d{2,3}\.\d{3,}"                 # coordinate fragments
+    # Overrun geo mashups: memorial / veterans / purpleheart trails smashed into one tag
+    r"|koreanwar|purpleheart|veteransmemo|memorialhighway|warveteran"
+    # Broadcast false-positive logos (Czech Radio) — not automotive brands
+    r"|^[a-z]{2,12}radio$"
     r")"
 )
+
+# Discoverable hashtags stay short. Anything longer is almost always a
+# concatenated road/OCR dump (e.g. pacifichighway1koreanwarveteransmemo).
+HASHTAG_BODY_MAX_LEN = 24
 
 # Always-on scene furniture for a profile — merged with GENERIC when profile is active.
 AMBIENT_REDUNDANT_SLUGS_BY_PROFILE: dict[str, frozenset[str]] = {
@@ -676,6 +684,9 @@ def is_junk_hashtag_body(raw: Any) -> bool:
         return True
     slug = vision_label_slug(text)
     if not slug:
+        return True
+    # Overrun mashups are never useful discovery tags.
+    if len(slug) > HASHTAG_BODY_MAX_LEN:
         return True
     try:
         from services.generic_hard_ban import is_hard_banned_slug

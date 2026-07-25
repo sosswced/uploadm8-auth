@@ -37,8 +37,12 @@ def test_mark_processing_started_only_claims_queued_or_staged():
     # Orphan processing (stage never set) must also be claimable.
     assert "status='processing'" in compact
     assert "processing_stage" in sql
-    # Single-winner: empty stage becomes 'claimed' so a second worker loses the race.
+    # Single-winner claim + aged claimed reclaim (worker died after claim).
     assert "claimed" in sql
+    assert "interval '1 second'" in sql
+    assert len(executed[0][1]) >= 3  # upload_id, started_at, grace_sec
+    # Seed progress so the UI is not stuck at 0% during claim/slot wait.
+    assert "processing_progress" in sql
 
 
 def test_mark_processing_started_returns_false_when_no_row_updated():

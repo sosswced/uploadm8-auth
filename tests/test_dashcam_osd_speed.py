@@ -109,6 +109,37 @@ def test_kph_converted_and_anchored():
     assert rec["speed_hud_anchored"] is True
 
 
+def test_bare_number_after_gps_is_never_speed():
+    """False readings: exits / lon digits / house numbers without mph|kmh."""
+    for line in (
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 46 C Walker",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115",
+        "36.136162° -115.178398° 65",
+        "I-15 Exit 46",
+        "SPEED 65",
+    ):
+        rec = parse_osd_line(line, t_s=0.0)
+        assert rec["speed_mph"] is None, line
+        assert rec["speed_unit"] is None, line
+
+
+def test_ocr_garbled_unit_still_reads_when_designation_present():
+    """Unit must follow the digits; tolerate OCR separators / M.P.H. spelling."""
+    cases = (
+        ("2025/03/05 04:50 12 PM 36.136162° -115.178398° 46°MPH C Walker", 46.0, "mph"),
+        ("2025/03/05 04:50 12 PM 36.136162° -115.178398° 46|MPH", 46.0, "mph"),
+        ("2025/03/05 04:50 12 PM 36.136162° -115.178398° 46 M.P.H.", 46.0, "mph"),
+        ("2025/03/05 04:50 12 PM 36.136162° -115.178398° 80 km/h", 49.7, "kph"),
+        ("2025/03/05 04:50 12 PM 36.136162° -115.178398° 46 mi/h", 46.0, "mph"),
+    )
+    for line, expect_mph, expect_unit in cases:
+        rec = parse_osd_line(line, t_s=0.0)
+        assert rec["speed_unit"] == expect_unit, line
+        assert rec["speed_mph"] is not None, line
+        assert abs(rec["speed_mph"] - expect_mph) < 0.2, (line, rec["speed_mph"])
+        assert rec["speed_hud_anchored"] is True, line
+
+
 def test_gps_path_does_not_carry_rejected_spike_speed():
     samples = [
         parse_osd_line(

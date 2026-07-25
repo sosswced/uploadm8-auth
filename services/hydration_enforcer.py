@@ -1266,6 +1266,89 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     return False
 
 
+# Short discoverable hashtag bodies only (see core.vision_labels.HASHTAG_BODY_MAX_LEN).
+_HASHTAG_MAX_LEN = 24
+# VI logo false positives (billboards / radio watermarks) need a high bar.
+_VI_LOGO_MIN_CONF = 0.90
+_FALSE_LOGO_RE = re.compile(
+    r"(?i)\b(?:radio|broadcast|fm\b|am\b|podcast|tv\b|network)\b|\bradio$"
+)
+# Memorial / honorary highway aliases are not searchable discovery tags.
+_ROAD_FLUFF_RE = re.compile(
+    r"(?i)\b(?:memorial|veterans?|purple\s*heart|honor(?:ary)?|scenic\s*byway|"
+    r"korean\s*war|world\s*war|trail)\b"
+)
+# Prefer compact route designators when present in a road segment.
+_ROUTE_TOKEN_RE = re.compile(
+    r"(?i)\b(?:(?:I|US|UH|SR|SH|Hwy|Highway|Route|FM|CR)[\s\-#]*\d{1,4}[A-Z]?)"
+    r"|(?:(?:Interstate|State\s+Route|County\s+Road)[\s\-#]*\d{1,4})"
+)
+
+
+def _road_hashtag_tokens(road: Any) -> List[str]:
+    """Split multi-name road strings into short discovery tokens.
+
+    Telemetry often returns semicolon-joined aliases like
+    ``Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail``.
+    Smashing that into one slug yields overrun junk; instead emit only compact
+    route/highway names (``pacifichighway1``, ``i5``) and drop memorial fluff.
+    """
+    raw = str(road or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in re.split(r"[;|/]+", raw) if p and p.strip()]
+    if not parts:
+        parts = [raw]
+    out: List[str] = []
+    seen: set = set()
+
+    def _emit(cand: str) -> None:
+        body = sanitize_hashtag_body(cand, max_len=_HASHTAG_MAX_LEN)
+        if not body or body in seen:
+            return
+        if len(body) > _HASHTAG_MAX_LEN or is_junk_hashtag_body(body):
+            return
+        seen.add(body)
+        out.append(body)
+
+    for part in parts:
+        is_fluff = bool(_ROAD_FLUFF_RE.search(part))
+        routes = _ROUTE_TOKEN_RE.findall(part)
+        if is_fluff:
+            # Memorial / honorary aliases: keep only compact route designators.
+            for r in routes:
+                _emit(r)
+            continue
+        whole = sanitize_hashtag_body(part, max_len=_HASHTAG_MAX_LEN)
+        if whole and len(whole) <= _HASHTAG_MAX_LEN and not is_junk_hashtag_body(whole):
+            _emit(part)
+        elif routes:
+            for r in routes:
+                _emit(r)
+        else:
+            _emit(part)
+    return out
+
+
+def _logo_ok_for_hashtag(desc: Any, *, confidence: Optional[float] = None) -> bool:
+    """Gate brand logos before they become hashtags."""
+    text = str(desc or "").strip()
+    if not text or len(text) < 2:
+        return False
+    if _FALSE_LOGO_RE.search(text):
+        return False
+    if confidence is not None:
+        try:
+            if float(confidence) < _VI_LOGO_MIN_CONF:
+                return False
+        except (TypeError, ValueError):
+            pass
+    body = sanitize_hashtag_body(text, max_len=_HASHTAG_MAX_LEN)
+    if not body or is_junk_hashtag_body(body):
+        return False
+    return True
+
+
 def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[str]:
     """Deterministic, evidence-driven hashtag bodies (no leading '#').
 
@@ -1285,7 +1368,7 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     seen: set = set()
 
     def _push(raw: Any) -> bool:
-        body = sanitize_hashtag_body(str(raw or ""), max_len=36)
+        body = sanitize_hashtag_body(str(raw or ""), max_len=_HASHTAG_MAX_LEN)
         if not body or body in seen:
             return False
         if is_junk_hashtag_body(body):
@@ -1312,9 +1395,17 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     # Brands early — high discovery value, beat trill fluff.
     for logo in pool.vision_logos[:3]:
-        _push(logo)
+        if _logo_ok_for_hashtag(logo):
+            _push(logo)
     for lg in pool.vi_logos[:4]:
-        if isinstance(lg, dict) and lg.get("description"):
+        if not isinstance(lg, dict) or not lg.get("description"):
+            continue
+        conf = lg.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_f = None
+        if _logo_ok_for_hashtag(lg.get("description"), confidence=conf_f):
             _push(str(lg["description"]))
 
     if pool.music_artist:
@@ -1322,16 +1413,23 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     if pool.music_title:
         _push(pool.music_title)
 
-    if pool.road:
-        _push(pool.road)
+    road_tokens = _road_hashtag_tokens(pool.road)
+    for tok in road_tokens:
+        _push(tok)
     for hwy in pool.vision_highways[:2]:
-        _push(hwy)
+        for tok in _road_hashtag_tokens(hwy):
+            _push(tok)
 
-    # Dig deeper: route + place composites (i5tumwater / tumwaterwa already covered).
+    # Route + place composites only when BOTH sides stay short (i5tumwater).
     place_seed = pool.gazetteer_place or pool.city
-    if pool.road and place_seed:
-        _push(f"{pool.road}{place_seed}")
-        _push(f"{place_seed}{pool.road}")
+    place_body = sanitize_hashtag_body(str(place_seed or ""), max_len=_HASHTAG_MAX_LEN)
+    for road_body in road_tokens:
+        if not place_body or len(road_body) > 10 or len(place_body) > 12:
+            continue
+        if len(road_body) + len(place_body) > _HASHTAG_MAX_LEN:
+            continue
+        _push(f"{road_body}{place_body}")
+        _push(f"{place_body}{road_body}")
 
     if pool.gazetteer_place:
         if pool.state_abbr:
@@ -1694,7 +1792,7 @@ def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
     out: List[str] = []
     learned_hits: List[str] = []
     for raw in tags or []:
-        body = sanitize_hashtag_body(str(raw).strip().lstrip("#"))
+        body = sanitize_hashtag_body(str(raw).strip().lstrip("#"), max_len=_HASHTAG_MAX_LEN)
         if not body:
             continue
         if body.lower() in banned:

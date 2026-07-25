@@ -19,5 +19,15 @@ def test_stage_label_for_empty():
 
 
 def test_stage_labels_has_core_pipeline_keys():
-    for key in ("transcode", "thumbnail", "caption", "publish"):
+    for key in (
+        "slot_wait",
+        "claimed",
+        "transcode",
+        "thumbnail",
+        "caption",
+        "publish",
+        "done",
+    ):
         assert key in STAGE_LABELS
+    assert "slot" in stage_label_for("slot_wait").lower()
+    assert stage_label_for("done") == "Complete"

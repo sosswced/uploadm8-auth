@@ -8,15 +8,19 @@ def test_studio_ok_includes_template_fallback():
         "studio",
         "template",
     ]
+    # When OpenAI edit is eligible, it sits between Pikzels and the PIL template.
     assert _thumbnail_styled_render_order(
         "studio_renderer", studio_ok=True, ai_edit_ok=True
-    ) == ["studio", "template"]
+    ) == ["studio", "ai_edit", "template"]
 
 
 def test_studio_ok_with_stickers_then_template():
     assert _thumbnail_styled_render_order(
         "auto", studio_ok=True, ai_edit_ok=False, sticker_ok=True
     ) == ["sticker", "studio", "template"]
+    assert _thumbnail_styled_render_order(
+        "auto", studio_ok=True, ai_edit_ok=True, sticker_ok=True
+    ) == ["sticker", "studio", "ai_edit", "template"]
 
 
 def test_no_studio_keeps_template_only_paths():

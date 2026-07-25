@@ -433,7 +433,8 @@ def test_vi_label_dump_never_enters_title_or_caption_anchor():
     assert "Video Intelligence" not in title_anchor
     assert "Captured at" not in title_anchor
     assert "labels:" not in title_anchor.lower()
-    assert "128 MPH" not in title_anchor
+    # Scene-understanding hook wins over compact speed·place when TL is present.
+    assert "Fast run" in title_anchor or "Tumwater" in title_anchor
 
     report = enforce_hydration(ctx)
     assert "Video Intelligence" not in (ctx.ai_title or "")
@@ -444,6 +445,68 @@ def test_vi_label_dump_never_enters_title_or_caption_anchor():
     assert "66mphcwalker" not in [t.lower() for t in (ctx.ai_hashtags or [])]
     assert "car" not in [t.lower() for t in (ctx.ai_hashtags or [])]
     assert report.get("title_anchor")
+
+
+def test_title_uses_timeline_when_twelvelabs_missing():
+    """Place-only titles must upgrade to speed·place·music when TL indexing fails."""
+    from services.hydration_enforcer import (
+        build_title_anchor_phrase,
+        collect_evidence,
+        enforce_hydration,
+    )
+
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=154.0,
+            avg_speed_mph=120.0,
+            location_city="Logandale",
+            location_state="California",
+            location_country="US",
+            location_road="Westside Freeway",
+            gazetteer_place_name="Logandale",
+            padus_unit_name=None,
+            near_padus=False,
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Fetty Wap",
+            "music_title": "The Truth",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={},  # Twelve Labs skipped / indexing failed
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title="Logandale, CA",
+        ai_caption="Captured at 154 MPH, near Logandale, CA, with Fetty Wap — The Truth on the speakers.",
+        ai_hashtags=["logandale", "fettywap"],
+        m8_platform_captions={},
+        m8_platform_titles={"youtube": "Logandale, CA", "tiktok": "Logandale, CA"},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="test-logandale-thin-title",
+    )
+    pool = collect_evidence(ctx)
+    title_anchor = build_title_anchor_phrase(pool, ctx)
+    assert "Captured at" not in title_anchor
+    assert "154 MPH" in title_anchor
+    assert "Logandale" in title_anchor
+    assert "Fetty Wap" in title_anchor
+
+    report = enforce_hydration(ctx)
+    assert report.get("rewrote_title")
+    assert "154 MPH" in (ctx.ai_title or "")
+    assert "Logandale" in (ctx.ai_title or "")
+    assert "Captured at" not in (ctx.ai_title or "")
+    assert "154 MPH" in (ctx.m8_platform_titles.get("youtube") or "")
+    # Caption keeps the rich prose form.
+    assert "Captured at 154 MPH" in (ctx.ai_caption or "")
 
 
 def test_hashtags_drop_ocr_mashups_and_generic_taxonomy():
@@ -539,6 +602,90 @@ def test_hashtags_drop_ocr_mashups_and_generic_taxonomy():
         assert j.lower() not in final
     assert "costco" in final or "matsoninc" in final
     assert "tumwaterwa" in final or "tumwater" in final
+
+
+def test_hashtags_split_long_roads_and_drop_false_logos():
+    """Salem-style overrun road mashups + Czech Radio / Bajaj false logos must die."""
+    from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
+    from services.hydration_enforcer import (
+        _road_hashtag_tokens,
+        _scrub_leaked_junk_hashtags,
+        build_evidence_hashtags,
+        collect_evidence,
+    )
+
+    overrun = "pacifichighway1koreanwarveteransmemo"
+    composite = "salempacifichighway1koreanwarveteran"
+    assert is_junk_hashtag_body(overrun)
+    assert is_junk_hashtag_body(composite)
+    assert is_junk_hashtag_body("czechradio")
+    assert len(overrun) > HASHTAG_BODY_MAX_LEN
+
+    road = (
+        "Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail"
+    )
+    tokens = _road_hashtag_tokens(road)
+    low_tok = {t.lower() for t in tokens}
+    assert "pacifichighway1" in low_tok
+    assert all(len(t) <= HASHTAG_BODY_MAX_LEN for t in tokens)
+    assert not any("korean" in t for t in low_tok)
+    assert not any("purpleheart" in t for t in low_tok)
+    assert not any("veteran" in t for t in low_tok)
+
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=118.0,
+            avg_speed_mph=112.0,
+            location_city="Salem",
+            location_state="Oregon",
+            location_country="US",
+            location_road=road,
+            gazetteer_place_name=None,
+            padus_unit_name=None,
+            near_padus=False,
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={"driver_name": "C Walker", "max_speed_mph": 72.0},
+        vision_context={"logo_names": [], "landmark_names": [], "ocr_text": ""},
+        audio_context={},
+        trill=SimpleNamespace(bucket="gloryBoy", score=99.0),
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={
+            "logos": [
+                {"description": "Czech Radio", "confidence": 0.8742},
+                {"description": "Bajaj Auto", "confidence": 0.8599},
+            ],
+            "on_screen_text": [],
+            "top_labels": ["night", "highway"],
+            "summary_text": "",
+        },
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title="118 MPH · Salem, Oregon",
+        ai_caption="Captured at 118 MPH, near Salem, OR.",
+        ai_hashtags=[overrun, composite, "czechradio", "bajajauto", "salem", "oregon"],
+        m8_platform_captions={},
+        m8_platform_titles={},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="salem-hashtag-quality",
+    )
+    pool = collect_evidence(ctx)
+    tags = [t.lower() for t in build_evidence_hashtags(pool, max_extra=16)]
+    assert "pacifichighway1" in tags
+    assert "salem" in tags or "salemor" in tags
+    assert "oregon" in tags
+    for bad in (overrun, composite, "czechradio", "bajajauto"):
+        assert bad not in tags
+    assert all(len(t) <= HASHTAG_BODY_MAX_LEN for t in tags)
+
+    scrubbed = {t.lower() for t in _scrub_leaked_junk_hashtags(ctx.ai_hashtags)}
+    for bad in (overrun, composite, "czechradio"):
+        assert bad not in scrubbed
+    assert "salem" in scrubbed
 
 
 def test_no_color_nature_or_vague_category_copy():

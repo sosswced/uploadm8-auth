@@ -53,6 +53,32 @@ def test_claimed_stage_is_active():
     )
 
 
+def test_aged_claimed_stage_is_reclaimable(monkeypatch):
+    """Claim latch must not block skip/reclaim for the full FFmpeg stale window."""
+    monkeypatch.setenv("CLAIMED_ACTIVE_STALE_SEC", "90")
+    old = datetime.now(timezone.utc) - timedelta(seconds=180)
+    assert (
+        upload_row_indicates_active_pipeline(
+            status="processing",
+            processing_stage="claimed",
+            updated_at=old,
+        )
+        is False
+    )
+
+
+def test_slot_wait_stage_is_not_active():
+    """Pre-acquire UI marker must not block reclaim / duplicate-job skip."""
+    assert (
+        upload_row_indicates_active_pipeline(
+            status="processing",
+            processing_stage="slot_wait",
+            updated_at=datetime.now(timezone.utc),
+        )
+        is False
+    )
+
+
 def test_long_transcode_still_active_under_default_stale_window(monkeypatch):
     monkeypatch.setenv("ACTIVE_PIPELINE_STALE_MINUTES", "90")
     mid = datetime.now(timezone.utc) - timedelta(minutes=45)

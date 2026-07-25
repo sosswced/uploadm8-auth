@@ -116,20 +116,13 @@ def _user_explicitly_disabled_auto_captions(us: Dict[str, Any]) -> bool:
 # Universal Content Category Engine
 # ============================================================
 
-# Category definitions:
-#   keywords      : filename/title/caption signal words (lowercase)
+# Category definitions (prompt vocabulary only — detection is identity-driven
+# via core.content_identity; there are intentionally NO keyword lists here):
 #   tone          : default tone guidance injected into the AI prompt
 #   hook_templates: example hooks to inspire the AI (it adapts, not copies)
 #   hashtag_seeds : starting hashtag vocabulary (no # prefix — AI expands from here)
 CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
     "automotive": {
-        "keywords": [
-            "car", "cars", "drive", "driving", "road", "highway", "speed",
-            "mph", "truck", "suv", "motorcycle", "bike", "moto", "drift",
-            "race", "track", "lap", "vehicle", "auto", "engine", "exhaust",
-            "trill", "dashcam", "cruise", "roadtrip", "joyride", "throttle",
-            "horsepower", "turbo", "supercar", "hypercar", "offroad", "jeep",
-        ],
         "tone": (
             "Grounded driving content: prefer HUD speeds, place names, driver labels, "
             "and named tracks over generic petrolhead filler. Match intensity to the "
@@ -146,13 +139,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "beauty": {
-        "keywords": [
-            "makeup", "beauty", "skincare", "foundation", "concealer", "blush",
-            "lipstick", "lipgloss", "eyeshadow", "mascara", "eyeliner", "brow",
-            "contour", "highlight", "glam", "grwm", "get ready", "routine",
-            "sephora", "ulta", "drugstore", "dupe", "glow", "bronzer",
-            "primer", "serum", "moisturizer", "toner", "cleanser", "spf",
-        ],
         "tone": (
             "Aspirational, empowering, and approachable. "
             "Tutorial vibes mixed with genuine confidence. Make it feel achievable."
@@ -168,13 +154,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "food": {
-        "keywords": [
-            "food", "recipe", "cook", "cooking", "bake", "baking", "eat",
-            "eating", "meal", "dinner", "lunch", "breakfast", "snack",
-            "restaurant", "foodie", "chef", "kitchen", "taste", "delicious",
-            "yummy", "tasty", "homemade", "ingredients", "dish", "dessert",
-            "cake", "pasta", "steak", "sushi", "pizza", "burger", "salad",
-        ],
         "tone": (
             "Warm, sensory, mouth-watering. "
             "Make viewers taste it through the screen. Recipes = instant saves."
@@ -190,13 +169,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "home_renovation": {
-        "keywords": [
-            "reno", "renovation", "diy", "home", "house", "room", "makeover",
-            "before after", "beforeafter", "transform", "decor", "interior",
-            "design", "build", "construction", "fix", "repair", "tile",
-            "paint", "floor", "wall", "cabinet", "remodel", "contractor",
-            "woodwork", "carpentry", "plumbing", "electrical", "demo",
-        ],
         "tone": (
             "Satisfying, process-driven. Before/after reveals. "
             "People love the transformation arc — tease the before, deliver the after."
@@ -212,12 +184,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "gardening": {
-        "keywords": [
-            "garden", "gardening", "plant", "plants", "grow", "growing",
-            "flower", "flowers", "vegetable", "herb", "seed", "soil",
-            "harvest", "compost", "greenhouse", "outdoor", "backyard",
-            "nature", "green thumb", "bloom", "prune", "mulch", "raised bed",
-        ],
         "tone": (
             "Calm, nurturing, educational. Community of plant people vibes. "
             "Patience and reward — the growth journey matters."
@@ -233,13 +199,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "fitness": {
-        "keywords": [
-            "workout", "gym", "fitness", "exercise", "train", "training",
-            "lift", "lifting", "weights", "cardio", "run", "running",
-            "yoga", "pilates", "hiit", "crossfit", "strength", "gains",
-            "physique", "body", "health", "sweat", "reps", "sets", "pr",
-            "personal record", "bulk", "cut", "shred", "lean",
-        ],
         "tone": (
             "Motivational, raw, no-nonsense. "
             "Sweat is the currency here. Show the work, not just the results."
@@ -255,12 +214,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "fashion": {
-        "keywords": [
-            "fashion", "outfit", "ootd", "style", "clothes", "clothing",
-            "wear", "wearing", "haul", "thrift", "thrifting", "fit check",
-            "fitcheck", "lookbook", "trend", "streetwear", "streetstyle",
-            "designer", "vintage", "aesthetic", "closet", "wardrobe",
-        ],
         "tone": (
             "Confident, expressive, aesthetic. "
             "OOTD energy — let the fit do the talking. Style is identity."
@@ -276,13 +229,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "gaming": {
-        "keywords": [
-            "game", "gaming", "gamer", "play", "playing", "gameplay",
-            "stream", "twitch", "fps", "rpg", "mmorpg", "controller",
-            "pc", "console", "xbox", "playstation", "nintendo", "fortnite",
-            "minecraft", "valorant", "cod", "lol", "roblox", "speedrun",
-            "clip", "montage", "ranked", "esports", "pro",
-        ],
         "tone": (
             "Energetic, community-fluent. Speak gamer. "
             "Reactions, hype, and skill showcasing — the clip does the work."
@@ -298,12 +244,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "travel": {
-        "keywords": [
-            "travel", "trip", "vacation", "holiday", "destination", "explore",
-            "adventure", "abroad", "country", "city", "beach", "mountain",
-            "hotel", "hostel", "airbnb", "flight", "backpack", "backpacking",
-            "solo travel", "tourist", "sightseeing", "wanderlust", "passport",
-        ],
         "tone": (
             "Wanderlust-inducing, vivid. "
             "Transport viewers there. FOMO is the goal — make them want to book a flight."
@@ -319,12 +259,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "pets": {
-        "keywords": [
-            "dog", "cat", "pet", "puppy", "kitten", "animal", "furry",
-            "paw", "tail", "bark", "meow", "bird", "fish", "hamster",
-            "bunny", "rabbit", "vet", "adoption", "rescue", "cute",
-            "doggo", "pupper", "floof", "doge",
-        ],
         "tone": (
             "Wholesome, playful, emotional. "
             "Pets are content gold — let the animal be the star. "
@@ -341,13 +275,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "education": {
-        "keywords": [
-            "learn", "learning", "teach", "tutorial", "how to", "howto",
-            "tips", "tricks", "hacks", "explain", "explanation", "guide",
-            "course", "study", "skill", "knowledge", "fact", "facts",
-            "science", "history", "psychology", "money", "finance", "invest",
-            "productivity", "life hack", "advice",
-        ],
         "tone": (
             "Clear, credible, punchy. "
             "Teach one thing per video. The hook IS the insight — lead with the value."
@@ -363,11 +290,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "comedy": {
-        "keywords": [
-            "funny", "comedy", "joke", "prank", "skit", "reaction", "meme",
-            "lol", "laugh", "hilarious", "humor", "parody", "roast",
-            "relatable", "pov", "nobody", "trend", "trending",
-        ],
         "tone": (
             "Irreverent, fast, punchy. "
             "Don't explain the joke. Timing is everything. Less is always more."
@@ -383,13 +305,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "tech": {
-        "keywords": [
-            "tech", "technology", "app", "software", "hardware", "phone",
-            "iphone", "android", "laptop", "computer", "pc", "review",
-            "unboxing", "setup", "desk setup", "battlestation", "ai",
-            "programming", "code", "coding", "developer", "startup",
-            "gadget", "gear", "product", "saas",
-        ],
         "tone": (
             "Smart, practical, no fluff. "
             "Nerds and early adopters are the audience — respect their intelligence."
@@ -405,12 +320,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "music": {
-        "keywords": [
-            "music", "song", "singing", "sing", "cover", "original", "produce",
-            "producing", "beat", "studio", "record", "recording", "guitar",
-            "piano", "drums", "bass", "vocal", "lyrics", "concert", "gig",
-            "mixtape", "album", "ep", "release",
-        ],
         "tone": (
             "Raw, authentic, emotional. "
             "Let the music carry it — words are the backstage pass."
@@ -426,12 +335,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "real_estate": {
-        "keywords": [
-            "real estate", "property", "house", "home", "apartment", "condo",
-            "listing", "for sale", "rent", "landlord", "tenant", "mortgage",
-            "investing", "investment", "flip", "flipping", "airbnb",
-            "cashflow", "rental", "equity", "roi",
-        ],
         "tone": (
             "Authoritative, aspirational. Show the lifestyle. "
             "Numbers sell — lead with the ROI, close with the dream."
@@ -447,13 +350,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "sports": {
-        "keywords": [
-            "sport", "sports", "athlete", "athletic", "soccer", "football",
-            "basketball", "baseball", "tennis", "golf", "swim", "swimming",
-            "hockey", "cricket", "rugby", "mma", "boxing", "fight", "match",
-            "game", "tournament", "league", "pro", "college", "training",
-            "score", "goal", "point", "win", "championship",
-        ],
         "tone": (
             "Competitive, electrifying. The scoreboard matters. "
             "Hype the achievement — make them feel the moment."
@@ -469,11 +365,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "asmr": {
-        "keywords": [
-            "asmr", "satisfying", "relaxing", "calm", "peaceful", "soothing",
-            "triggers", "tingles", "whisper", "tapping", "crunchy", "slime",
-            "soap", "cutting", "no talking", "oddly satisfying",
-        ],
         "tone": (
             "Quiet, intimate, sensory. "
             "Don't oversell it — let the content breathe. Less = more in ASMR."
@@ -489,12 +380,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "lifestyle": {
-        "keywords": [
-            "vlog", "day in my life", "daily", "morning routine", "night routine",
-            "productive", "productivity", "life update", "story time",
-            "minimalist", "aesthetic", "wellness", "mental health",
-            "self care", "journal", "gratitude", "haul", "unboxing",
-        ],
         "tone": (
             "Personal, warm, authentic. "
             "Viewers want to hang out with you — let them in. Real > polished."
@@ -510,7 +395,6 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "general": {
-        "keywords": [],  # catch-all — always matches last
         "tone": (
             "Engaging, authentic, and specific to what is actually visible in the video. "
             "Identify the content type from the frames and match your tone to it. "
@@ -526,21 +410,13 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Detection priority order (more specific first, general last)
-_CATEGORY_PRIORITY = [
-    "automotive", "beauty", "food", "home_renovation", "gardening",
-    "fitness", "fashion", "gaming", "travel", "pets", "education",
-    "comedy", "tech", "music", "real_estate", "sports", "asmr", "lifestyle",
-    "general",
-]
-
-
 # Legacy narrative-prompt directives — derived from core.caption_creative
 # (single source). Do not hardcode parallel style/tone/voice lists here.
 from core.caption_creative import (
     STYLE_DIRECTIVES as _CC_STYLE,
     TONE_DIRECTIVES as _CC_TONE,
     VOICE_DIRECTIVES as _CC_VOICE,
+    interaction_contract as _cc_interaction_contract,
 )
 
 TONE_DIRECTIVES: Dict[str, str] = {
@@ -554,46 +430,32 @@ STYLE_DIRECTIVES: Dict[str, str] = {
 }
 
 
-def _detect_category_from_text(text: str) -> Optional[str]:
-    """Scan a text string for category keyword signals. Returns first match or None."""
-    if not text:
-        return None
-    text_lower = text.lower()
-    for cat in _CATEGORY_PRIORITY:
-        if cat == "general":
-            continue
-        for kw in CONTENT_CATEGORIES[cat].get("keywords", []):
-            if kw in text_lower:
-                return cat
-    return None
-
-
 def _detect_content_category(ctx: JobContext) -> str:
+    """Identity-driven category resolution — no keyword lists.
+
+    Reads the ``content_identity_v1`` artifact (cross-provider fusion + LLM
+    resolution built in the worker; deterministic-only fallback when the
+    artifact is missing — user title/caption/filename hints are already part
+    of its evidence) and soft-maps its open-vocabulary tags onto the prompt
+    vocabulary keys in ``CONTENT_CATEGORIES``. Unmapped content stays
+    "general"; the AI prompt confirms from visual frames.
     """
-    3-layer content category detection.
+    from core.content_identity import get_content_identity, soft_bucket_for_identity
 
-    Layer 1: User hint — ctx.caption and ctx.title keyword scan.
-    Layer 2: Filename signal scan.
-    Layer 3: Falls back to 'general'; the AI prompt instructs GPT to
-             confirm from visual frames and adjust its output accordingly.
-
-    Returns a key from CONTENT_CATEGORIES.
-    """
-    # Layer 1: user-provided hints
-    for text in (ctx.caption, ctx.title):
-        cat = _detect_category_from_text(text or "")
-        if cat:
-            logger.debug(f"Content category from user hint: {cat}")
-            return cat
-
-    # Layer 2: filename
-    cat = _detect_category_from_text(ctx.filename or "")
-    if cat:
-        logger.debug(f"Content category from filename: {cat}")
-        return cat
-
-    logger.debug("Content category: general (GPT vision will identify from frames)")
-    return "general"
+    identity = get_content_identity(ctx)
+    bucket = soft_bucket_for_identity(
+        identity,
+        {
+            k: f"{v.get('tone') or ''} {' '.join(v.get('hashtag_seeds') or [])}"
+            for k, v in CONTENT_CATEGORIES.items()
+        },
+    )
+    logger.debug(
+        "Content category (identity-driven): %s subject=%r",
+        bucket,
+        str(identity.get("subject") or "")[:60],
+    )
+    return bucket
 
 
 def _build_category_context_block(category: str, location: Optional[str] = None) -> str:
@@ -1199,10 +1061,10 @@ VOICE PROFILE ({voice_key.upper()}): {voice_instruction}
 CAPTION STYLE ({caption_style.upper()} — {caption_length}): {style_instruction} Follow this structure strictly.
 {f"PLATFORM NOTE: {platform_note}" if platform_note else ""}
 
-HOW TONE + VOICE + CATEGORY FIT TOGETHER:
+HOW STYLE + TONE + VOICE + CATEGORY COMPOSE (this exact combination):
 - Category block above = subject vocabulary, hook patterns, and hashtag seeds for the detected vertical (or general).
-- Tone = energy, pacing, and emotional register.
-- Voice = who is speaking (persona and sentence habits).
+- Style = structure, hook mechanic, and length. Tone = energy, pacing, and emotional register. Voice = who is speaking (pronouns and sentence habits).
+{_cc_interaction_contract(caption_style, caption_tone, voice_key)}
 - All three must agree with what is actually visible or said. If category tone and user tone differ, keep user tone and voice for delivery but pull facts and niche words only from evidence—never force a vertical that the footage does not support.
 
 Generate the following for this video:
@@ -1297,7 +1159,15 @@ async def _call_openai(
             )
 
             if response.status_code != 200:
-                logger.error(f"OpenAI API error: {response.status_code} — {response.text[:300]}")
+                body = (response.text or "")[:300]
+                if response.status_code == 429 or "insufficient_quota" in body.lower():
+                    logger.warning(
+                        "OpenAI API error: %s — %s", response.status_code, body
+                    )
+                else:
+                    logger.error(
+                        "OpenAI API error: %s — %s", response.status_code, body
+                    )
                 return result
 
             data = response.json()

@@ -115,6 +115,11 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
+    allow_duplicate: bool = Field(
+        False,
+        alias="allowDuplicate",
+        description="Bypass the recent duplicate-source guard (re-post same file intentionally)",
+    )
     smart_schedule_days: int = Field(
         14,
         ge=1,

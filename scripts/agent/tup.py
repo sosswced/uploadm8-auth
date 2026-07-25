@@ -70,6 +70,12 @@ def _configure_tup_env(*, force_pikzels: bool, skip_pikzels: bool) -> None:
     os.environ.setdefault("E2E_WORKER_SAFE", "1")
     os.environ.setdefault("E2E_INCLUDE_SLOW_API", "0")
     os.environ.setdefault("RATE_LIMIT_LOOPBACK_BYPASS", "1")
+    # Long PNW library clips (>3min) — exercise YouTube Shorts copyright trim.
+    os.environ.setdefault(
+        "E2E_MEDIA_LIBRARY",
+        r"G:\My Drive\pnw 256\F\F\Normal",
+    )
+    os.environ.setdefault("E2E_YOUTUBE_COPYRIGHT_TRIM", "1")
     # Single-origin local API only — never point E2E at production BASE_URL or :8080 static.
     base = (os.environ.get("E2E_BASE_URL") or "").strip().rstrip("/")
     if not (

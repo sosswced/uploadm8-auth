@@ -34,7 +34,12 @@ from core.r2 import _normalize_r2_key, generate_presigned_download_url, get_s3_c
 from stages import db as db_stage
 from stages.context import JobContext
 from stages.entitlements import get_entitlements_from_user
-from stages.pikzels_api import refine_thumbnail_with_pikzels_edit, render_thumbnail_with_studio_renderer
+from stages.pikzels_api import (
+    pikzels_format_for_platform,
+    refine_thumbnail_with_pikzels_edit,
+    render_thumbnail_with_studio_renderer,
+    unique_pikzels_aspect_leaders,
+)
 from stages.thumbnail_stage import (
     _detect_category,
     _hydration_pikzels_edit_enabled,
@@ -290,10 +295,43 @@ async def regenerate_upload_thumbnail(
 
         if run_styled and platforms_to_render:
             persona_api, studio_opts = _studio_persona_for_request(settings)
+            # One Pikzels call per aspect — copy to each platform (same as upload pipeline).
+            pikzels_aspect_cache: Dict[str, Path] = {}
+            if studio_ok and "studio" in render_steps:
+                leaders = unique_pikzels_aspect_leaders(list(platforms_to_render))
+                for aspect_fmt, lead_plat in leaders.items():
+                    cache_path = tmp_path / f"thumb_pikzels_aspect_{aspect_fmt.replace(':', 'x')}.jpg"
+                    lead_ok = await render_thumbnail_with_studio_renderer(
+                        base_frame,
+                        brief,
+                        lead_plat,
+                        cache_path,
+                        upload_id=str(upload_id),
+                        category=category,
+                        persona=persona_api,
+                        options=studio_opts,
+                        job_context=ctx_for_brief,
+                    )
+                    if lead_ok and cache_path.exists():
+                        pikzels_aspect_cache[aspect_fmt] = cache_path
+                        hp_edit = _thumbnail_hydration_edit_prompt(brief or {})
+                        skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
+                        if hp_edit and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
+                            try:
+                                await refine_thumbnail_with_pikzels_edit(
+                                    cache_path,
+                                    hp_edit,
+                                    platform=lead_plat,
+                                    upload_id=str(upload_id),
+                                )
+                            except Exception as _pe:
+                                logger.debug("regenerate pikzels edit skipped: %s", _pe)
+
             for platform in platforms_to_render:
                 out_path = tmp_path / f"thumb_styled_{platform}.jpg"
                 step_ok = False
                 last_method = render_method
+                aspect_fmt = pikzels_format_for_platform(platform)
                 for step in render_steps:
                     if step == "sticker" and sticker_composite_enabled():
                         from services.platform_colors import platform_color_for, resolve_platform_colors
@@ -311,31 +349,19 @@ async def regenerate_upload_thumbnail(
                         if step_ok:
                             last_method = "sticker_composite"
                     elif step == "studio" and studio_ok:
-                        step_ok = await render_thumbnail_with_studio_renderer(
-                            base_frame,
-                            brief,
-                            platform,
-                            out_path,
-                            upload_id=str(upload_id),
-                            category=category,
-                            persona=persona_api,
-                            options=studio_opts,
-                            job_context=ctx_for_brief,
-                        )
-                        if step_ok:
-                            last_method = "pikzels"
-                            hp_edit = _thumbnail_hydration_edit_prompt(brief or {})
-                            skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
-                            if hp_edit and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
-                                try:
-                                    await refine_thumbnail_with_pikzels_edit(
-                                        out_path,
-                                        hp_edit,
-                                        platform=platform,
-                                        upload_id=str(upload_id),
-                                    )
-                                except Exception as _pe:
-                                    logger.debug("regenerate pikzels edit skipped: %s", _pe)
+                        cached = pikzels_aspect_cache.get(aspect_fmt)
+                        if cached and cached.exists():
+                            try:
+                                import shutil
+
+                                shutil.copyfile(cached, out_path)
+                                step_ok = out_path.exists()
+                            except OSError:
+                                step_ok = False
+                            if step_ok:
+                                last_method = "pikzels"
+                        else:
+                            step_ok = False
                     elif step == "template":
                         from services.platform_colors import platform_color_for, resolve_platform_colors
 

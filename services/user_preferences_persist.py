@@ -300,6 +300,10 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     trill_ai_enhance = _coerce_bool(p.get("trill_ai_enhance"), True)
     trill_openai_model = str(p.get("trill_openai_model", "gpt-4o-mini") or "gpt-4o-mini")[:50]
     use_audio_context = _coerce_bool(p.get("useAudioContext", p.get("use_audio_context")), True)
+    youtube_shorts_copyright_trim = _coerce_bool(
+        p.get("youtubeShortsCopyrightTrim", p.get("youtube_shorts_copyright_trim")),
+        False,
+    )
     audio_transcription = _coerce_bool(p.get("audioTranscription", p.get("audio_transcription")), True)
     ai_service_telemetry = _coerce_bool(p.get("aiServiceTelemetry", p.get("ai_service_telemetry")), True)
     ai_service_audio_signals = _coerce_bool(p.get("aiServiceAudioSignals", p.get("ai_service_audio_signals")), True)
@@ -406,23 +410,24 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 trill_ai_enhance = $21,
                 trill_openai_model = $22,
                 use_audio_context = $23,
-                audio_transcription = $24,
-                ai_service_telemetry = $25,
-                ai_service_audio_signals = $26,
-                ai_service_music_detection = $27,
-                ai_service_audio_summary = $28,
-                ai_service_emotion_signals = $29,
-                ai_service_caption_writer = $30,
-                ai_service_thumbnail_designer = $31,
-                ai_service_speech_to_text = $32,
-                ai_service_scene_understanding = $33,
-                ai_service_frame_inspector = $34,
-                ai_service_video_analyzer = $35,
-                trill_leaderboard_opt_in = $36,
-                trill_map_sharing_opt_in = $37,
-                trill_welcome_modal_seen_at = $38,
+                youtube_shorts_copyright_trim = $24,
+                audio_transcription = $25,
+                ai_service_telemetry = $26,
+                ai_service_audio_signals = $27,
+                ai_service_music_detection = $28,
+                ai_service_audio_summary = $29,
+                ai_service_emotion_signals = $30,
+                ai_service_caption_writer = $31,
+                ai_service_thumbnail_designer = $32,
+                ai_service_speech_to_text = $33,
+                ai_service_scene_understanding = $34,
+                ai_service_frame_inspector = $35,
+                ai_service_video_analyzer = $36,
+                trill_leaderboard_opt_in = $37,
+                trill_map_sharing_opt_in = $38,
+                trill_welcome_modal_seen_at = $39,
                 updated_at = NOW()
-            WHERE user_id = $39
+            WHERE user_id = $40
             """,
             auto_captions,
             auto_thumbnails,
@@ -452,6 +457,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             trill_ai_enhance,
             trill_openai_model,
             use_audio_context,
+            youtube_shorts_copyright_trim,
             audio_transcription,
             ai_service_telemetry,
             ai_service_audio_signals,
@@ -669,7 +675,17 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 for camel, snake in upload_ai_keys:
                     if camel in p or snake in p:
                         val = p.get(camel) if camel in p else p.get(snake)
-                        val = _coerce_bool(val, True)
+                        # Opt-in toggles default False; AI service toggles default True.
+                        _opt_in_false = camel in (
+                            "youtubeShortsCopyrightTrim",
+                            "tiktokBurnStyledCover",
+                            "aiServiceEmotionSignals",
+                            "aiServiceDashcamOSD",
+                            "aiServiceSpeechToText",
+                            "aiServiceSceneUnderstanding",
+                            "aiServiceVideoAnalyzer",
+                        )
+                        val = _coerce_bool(val, False if _opt_in_false else True)
                         users_prefs[camel] = users_prefs[snake] = val
 
                 normalize_preferences_dict(users_prefs)

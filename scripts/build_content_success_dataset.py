@@ -160,6 +160,19 @@ def _finalize_content_features(df: pd.DataFrame) -> pd.DataFrame:
     for col in active_cat("content"):
         if col not in df.columns:
             df[col] = None
+    # Phase 4 identity columns (experimental) — keep present for hero-fact priors.
+    for col in (
+        "identity_domain_tag",
+        "identity_hero_fact_class",
+        "identity_headline_class",
+        "identity_confidence",
+    ):
+        if col not in df.columns:
+            df[col] = None
+    if "identity_domain_confidence" not in df.columns:
+        df["identity_domain_confidence"] = float("nan")
+    if "identity_novel_content" not in df.columns:
+        df["identity_novel_content"] = float("nan")
 
     # Drop raw text we only needed for lengths.
     return df.drop(columns=[c for c in ("title", "caption") if c in df.columns])

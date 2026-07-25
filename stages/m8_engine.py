@@ -34,6 +34,8 @@ from core.caption_creative import (
     STYLE_DIRECTIVES as M8_STYLE_DIRECTIVES,
     TONE_DIRECTIVES as M8_TONE_DIRECTIVES,
     VOICE_DIRECTIVES as M8_VOICE_DIRECTIVES,
+    cell_micro_brief as _m8_cell_micro_brief,
+    compose_creative_directive as _m8_compose_creative_directive,
     evidence_matrix_cell_specs as _evidence_matrix_cell_specs,
     style_directive as _m8_style_directive,
     tone_directive as _m8_tone_directive,
@@ -222,6 +224,11 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
         )
         if peak >= 5:
             fact_bits.append(f"peak={int(round(peak))} MPH")
+            lines.append(
+                f"SPEED CONTRACT: the only publishable speed is {int(round(peak))} MPH. "
+                "Ignore any other MPH/KPH numbers in scene text, transcript, or OCR — "
+                "speed-limit signs are never the vehicle's speed."
+            )
         series = osd.get("speed_series") if isinstance(osd.get("speed_series"), list) else []
         sample_bits: List[str] = []
         for entry in series[:6]:
@@ -250,10 +257,20 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
             fact_bits.append(
                 f"HUD end={str(ls.get('date') or '')} {str(ls.get('time') or '')}".strip()
             )
-    for key in ("city", "state", "road", "display", "gazetteer_place"):
+    for key in (
+        "city",
+        "state",
+        "road",
+        "display",
+        "gazetteer_place",
+        "place_sign",
+        "start_display",
+    ):
         v = (geo or {}).get(key) if isinstance(geo, dict) else None
         if v:
             fact_bits.append(f"{key}={v}")
+            if key in ("place_sign", "start_display"):
+                continue
             break
     if isinstance(music, dict):
         artist = str(music.get("artist") or "").strip()
@@ -288,9 +305,32 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
                 if str(e.get("kind") or "").startswith("osd")
                 or "MPH" in str(e.get("text") or "").upper()
             ]
+            # Cap speed beats at 2 so speed never crowds out the other providers.
             if speedish:
                 picks.append(speedish[len(speedish) // 2])
                 picks.append(speedish[-1])
+            # Equal-weight guarantee: one beat from each non-speed provider group.
+            _diversity_kinds = (
+                "scene",
+                "welcome_sign",
+                "music",
+                "transcript",
+                "geo_place",
+                "landmark",
+                "object",
+                "on_screen_text",
+                "vi_label",
+                "yamnet",
+            )
+            picked_kinds = {str(e.get("kind") or "") for e in picks}
+            for want in _diversity_kinds:
+                if want in picked_kinds:
+                    continue
+                for ev in ordered:
+                    if str(ev.get("kind") or "") == want:
+                        picks.append(ev)
+                        picked_kinds.add(want)
+                        break
             if len(ordered) > 2:
                 picks.append(ordered[len(ordered) // 2])
             picks.append(ordered[-1])
@@ -303,7 +343,7 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
                 continue
             seen.add(txt)
             spine_lines.append(f"  t={_t(ev):.0f}s [{ev.get('kind') or 'beat'}] {txt[:160]}")
-            if len(spine_lines) >= 8:
+            if len(spine_lines) >= 12:
                 break
         if spine_lines:
             lines.append("TIMELINE SPINE (use these beats; do not invent sequence):\n" + "\n".join(spine_lines))
@@ -317,6 +357,19 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
         + "\n"
     )
 
+def _scrubbed_scene_text(ctx: JobContext, vu: Dict[str, Any]) -> str:
+    """TL/fusion scene prose with wrong-MPH claims removed before it reaches prompts."""
+    scene = str(vu.get("scene_description") or vu.get("description") or "")
+    if not scene:
+        return ""
+    try:
+        from core.speed_consensus import consensus_peak_mph, scrub_untrusted_speed_claims
+
+        return scrub_untrusted_speed_claims(scene, consensus_peak_mph(ctx)) or scene
+    except Exception:
+        return scene
+
+
 def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     """Single structured snapshot used by M8 prompts and ranking."""
     target_platforms = _effective_m8_platforms(ctx)
@@ -326,6 +379,13 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     tel = ctx.telemetry or ctx.telemetry_data
 
     geo: Dict[str, Any] = {}
+    _place_signs: List[str] = []
+    try:
+        from services.scene_fusion import collect_place_signs
+
+        _place_signs = collect_place_signs(ctx)
+    except Exception:
+        _place_signs = []
     if tel:
         n_pts = len(getattr(tel, "points", None) or [])
         geo = {
@@ -335,6 +395,8 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "city": getattr(tel, "location_city", None),
             "state": getattr(tel, "location_state", None),
             "country": getattr(tel, "location_country", None),
+            "place_sign": _place_signs[0] if _place_signs else None,
+            "place_signs": _place_signs[:4] or None,
             "mid_lat": getattr(tel, "mid_lat", None),
             "mid_lon": getattr(tel, "mid_lon", None),
             "start_lat": getattr(tel, "start_lat", None),
@@ -364,6 +426,11 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         pun = getattr(tel, "padus_unit_name", None)
         if pun:
             geo["protected_area_name"] = str(pun).strip()
+    elif _place_signs:
+        geo = {
+            "place_sign": _place_signs[0],
+            "place_signs": _place_signs[:4],
+        }
 
     tr = ctx.trill or ctx.trill_score
     trill_d: Dict[str, Any] = {}
@@ -477,6 +544,15 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         if hs_h:
             hydration_story_sg = hs_h[:1200]
 
+    # Canonical content identity (open-vocabulary consensus) — the evidence
+    # palette captions/hashtags fill their style/tone/voice slots from.
+    try:
+        from core.content_identity import get_content_identity, identity_scene_graph_view
+
+        content_identity_sg = identity_scene_graph_view(get_content_identity(ctx))
+    except Exception:
+        content_identity_sg = {}
+
     out_graph: Dict[str, Any] = {
         "engine_version": M8_ENGINE_VERSION,
         "m8_engine": {
@@ -489,6 +565,7 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         "upload_id": ctx.upload_id,
         "filename": ctx.filename,
         "category": category,
+        "content_identity": content_identity_sg,
         "platforms": target_platforms,
         "transcript": {
             "text": (ctx.ai_transcript or ac.get("transcript") or "")[:12000],
@@ -546,7 +623,7 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             ),
         },
         "video_understanding": {
-            "scene": (vu.get("scene_description") or vu.get("description") or "")[:8000],
+            "scene": _scrubbed_scene_text(ctx, vu)[:8000],
             "title_suggestion": (vu.get("title_suggestion") or "")[:200],
         },
         "geo": geo,
@@ -677,36 +754,34 @@ def _style_prompt(style: str, tone: str) -> str:
     )
 
 
-def _m8_creative_directive_block(style_ui: str, tone_ui: str, voice_ui: str) -> str:
-    """Compose the three UI-keyed directives into one elite, self-differentiating
-    creative brief. This is the primary driver of how copy reads, so that every
-    distinct combination of (style, tone, voice) produces visibly different output.
+def _m8_creative_directive_block(
+    style_ui: str,
+    tone_ui: str,
+    voice_ui: str,
+    *,
+    variant_seed: Optional[int] = None,
+) -> str:
+    """One composed creative brief per (style, tone, voice) combination.
+
+    Delegates to core.caption_creative.compose_creative_directive so the brief
+    is built combinatorially from facet ownership (STYLE=architecture,
+    TONE=heat, VOICE=speaker) plus per-combination interaction rules — every
+    registered combination yields a materially different contract, and the
+    optional seed rotates the lead evidence class for repeat uploads.
     """
-    style = _m8_style_directive(style_ui)
-    tone = _m8_tone_directive(tone_ui)
-    voice = _m8_voice_directive(voice_ui)
-    return f"""━━ CREATOR VOICE OPERATING SYSTEM (user-selected — this is the PRIMARY driver of how copy reads) ━━
-These three knobs are SEPARATE and compose together. They are delivery only — every fact, name, number, and
-piece of vocabulary still comes from the Scene Graph evidence, never invented.
+    return _m8_compose_creative_directive(
+        style_ui, tone_ui, voice_ui, variant_seed=variant_seed
+    )
 
-CAPTION STYLE → {style['label']}
-  {style['blueprint']}
 
-CAPTION TONE → {tone['label']}
-  {tone['register']}
-
-CAPTION VOICE / PERSONA → {voice['label']}
-  {voice['persona']}
-
-COMPOSITION RULES (non-negotiable):
-- STYLE controls the structure/architecture, TONE controls the emotional register, VOICE controls who is speaking
-  (diction + point of view). Apply all three at once; do not let one silently override another.
-- If this exact (style, tone, voice) were changed by even one knob, the resulting copy MUST read noticeably
-  different — different opening rhythm, sentence length, and word choice — not the same caption reskinned.
-- Do NOT fall back to a neutral house voice. The selected voice's diction and point of view must be audible
-  in every variant.
-- Stay evidence-grounded: the persona is HOW it is said; the Scene Graph is WHAT is said.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+def _m8_variant_seed(ctx: JobContext) -> Optional[int]:
+    """Stable per-upload seed so identical settings still open differently."""
+    raw = str(
+        getattr(ctx, "upload_id", "") or getattr(ctx, "job_id", "") or ""
+    ).strip()
+    if not raw:
+        return None
+    return sum(ord(c) for c in raw) % 997
 
 
 def _task_prompt(generate_title: bool, generate_caption: bool, generate_hashtags: bool) -> str:
@@ -1023,17 +1098,23 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
     matrix_close = ""
     if include_evidence_matrix:
         specs = _evidence_matrix_cell_specs(caption_style, caption_tone, caption_voice_ui)
-        order_h = "; ".join(f"{a}|{b}|{c}" for a, b, c in specs)
         n_cells = len(specs)
+        cell_lines = "\n".join(
+            f"  {i}. {a}|{b}|{c} — {_m8_cell_micro_brief(a, b, c)}"
+            for i, (a, b, c) in enumerate(specs, 1)
+        )
         matrix_section = f"""
 CAPTION EVIDENCE MATRIX (TikTok-style micro-captions, SAME frames + scene graph):
 - Add top-level JSON key caption_evidence_matrix with object {{ "cells": [ ... ] }} (replace the placeholder empty array with {n_cells} filled objects).
-- cells MUST have EXACTLY {n_cells} objects in THIS order (caption_style|caption_tone|caption_voice):
-  {order_h}
+- cells MUST have EXACTLY {n_cells} objects in THIS order (caption_style|caption_tone|caption_voice — each line
+  carries that cell's COMPOSED micro-brief; the cell's caption must obey it, not the main brief above):
+{cell_lines}
 - Each cell: caption_style, caption_tone, caption_voice (match row), tiktok_caption (45-320 chars),
   hashtags (0-6 strings without #) grounded in the same evidence as the main task.
 - Sweep EVERY registered style (tone+voice fixed to user), EVERY registered tone (style+voice fixed),
   and EVERY registered voice (style+tone fixed). Do not invent style/tone/voice keys outside the order list.
+- Adjacent cells differ by ONE knob — their captions must read audibly different (structure for style rows,
+  temperature for tone rows, pronouns/diction for voice rows), never the same caption reskinned.
 - REGURGITATE at least one concrete token from vision, OCR, geo, transcript, VI timeline, or telemetry per cell when present.
 - No duplicate captions; vary hook while staying truthful.
 """
@@ -1090,7 +1171,7 @@ CATEGORY: {category}
 USER ACCOUNT SETTINGS (UI): caption_style={caption_style} caption_tone={caption_tone} caption_voice={caption_voice_ui}
 EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a license to flatten the user's voice): style={base_style} tone={base_tone} persona={base_persona}
 {_user_brand_directive(ctx)}
-{_m8_creative_directive_block(caption_style, caption_tone, caption_voice_ui)}
+{_m8_creative_directive_block(caption_style, caption_tone, caption_voice_ui, variant_seed=_m8_variant_seed(ctx))}
 {_task_prompt(generate_title, generate_caption, generate_hashtags)}
 
 {fusion}
@@ -1343,6 +1424,11 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
             _push(city)
     if geo.get("protected_area_name"):
         _push(str(geo.get("protected_area_name")))
+    # Welcome to / Entering roadside signs — strongest place proof after GPS.
+    if geo.get("place_sign"):
+        _push(str(geo.get("place_sign")))
+    if geo.get("start_display"):
+        _push(str(geo.get("start_display")))
 
     # 2b. Place evidence (no .map): beaches, monuments, teams, plates
     pe = scene_graph.get("place_evidence") or {}
@@ -1367,12 +1453,16 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
     if trill.get("bucket"):
         _push(f"Trill {trill.get('bucket')}")
 
-    # 5. Vision landmarks + logos (specific named entities)
+    # 5. Vision landmarks + logos + web entities (specific named entities)
     vision = scene_graph.get("vision") or {}
     for lm in (vision.get("landmarks") or [])[:3]:
         _push(str(lm))
     for lg in (vision.get("logos") or [])[:3]:
         _push(str(lg))
+    for we in (vision.get("web_entities") or [])[:2]:
+        name = str(we or "").strip()
+        if name and not is_generic_vision_label(name):
+            _push(name)
 
     # 6. Video Intelligence object/person/text/logo tracks (added by phase 3)
     vi = scene_graph.get("video_intelligence") or {}
@@ -1998,11 +2088,23 @@ def _deterministic_evidence_title(
     vision = scene_graph.get("vision") or {}
 
     place_token = ""
-    for k in ("gazetteer_place", "protected_area_name", "city", "state", "road"):
+    for k in (
+        "gazetteer_place",
+        "place_sign",
+        "city",
+        "start_display",
+        "protected_area_name",
+        "state",
+        "road",
+    ):
         v = geo.get(k)
         if isinstance(v, str) and v.strip():
             place_token = v.strip()
             break
+    if not place_token:
+        signs = geo.get("place_signs") or []
+        if isinstance(signs, list) and signs:
+            place_token = str(signs[0]).strip()
 
     speed_token = ""
     try:
@@ -2049,6 +2151,9 @@ def _deterministic_evidence_title(
     if pref in ("geo", "speed", "trill", "visual", "music"):
         rest = [c for c in ("geo", "speed", "trill", "visual", "music") if c != pref]
         cluster_order = [pref] + rest
+    elif speed_token:
+        # Dashcam / telemetry: never lead with place-only when speed exists.
+        cluster_order = ["speed", "geo", "music", "trill", "visual"]
     else:
         cluster_order = ["geo", "speed", "trill", "visual", "music"]
 
@@ -2228,7 +2333,13 @@ async def _call_openai_m8_json(
         if resp is None:
             return {}, tokens
         if resp.status_code != 200:
-            logger.error(f"M8 Engine HTTP {resp.status_code}: {resp.text[:400]}")
+            body_snip = (resp.text or "")[:400]
+            # Quota/rate-limit is ops signal — warning avoids Sentry ERROR spam (UPLOADM8-8K).
+            # Caption stage still falls through to fusion / hydration anchors.
+            if resp.status_code == 429 or "insufficient_quota" in body_snip.lower():
+                logger.warning("M8 Engine HTTP %s (quota/rate-limit): %s", resp.status_code, body_snip)
+            else:
+                logger.error("M8 Engine HTTP %s: %s", resp.status_code, body_snip)
             return {}, tokens
 
         data = resp.json()

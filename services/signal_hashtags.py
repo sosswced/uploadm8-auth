@@ -208,6 +208,15 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     landmark_names = list(vc.get("landmark_names") or [])
     _take(landmark_names, 4)
 
+    # ── Welcome to / Entering roadside signs (Vision OCR + VI text) ─────
+    try:
+        from services.scene_fusion import collect_place_signs
+
+        for sign in collect_place_signs(ctx)[:2]:
+            _push(tags, seen, sign)
+    except Exception:
+        pass
+
     # ── ACR music identification ─────────────────────────────────────────
     # Keep this high priority: artist/track tags are exact catalogue signals and
     # can otherwise be crowded out by geo/vision-heavy dashcam clips.
@@ -238,6 +247,9 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
             _push(tags, seen, f"{city}{abbr}")
         _push(tags, seen, city)
         _push(tags, seen, state)
+        start_disp = getattr(tel, "location_start_display", None)
+        if start_disp:
+            _push(tags, seen, start_disp)
         pun = getattr(tel, "padus_unit_name", None)
         if pun:
             _push(tags, seen, pun)
@@ -296,17 +308,17 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
         _take(_TRILL_TAGS[bucket], 3)
 
     # ── Speed-bucket tags (works even with no Trill score) ───────────────
+    # Canonical consensus peak — never raw tel/OSD reads that can disagree.
     max_speed = 0.0
-    if tel is not None:
+    try:
+        from core.speed_consensus import consensus_peak_mph
+
+        max_speed = consensus_peak_mph(ctx)
+    except Exception:
+        max_speed = 0.0
+    if max_speed <= 0.0 and tel is not None:
         try:
             max_speed = float(getattr(tel, "max_speed_mph", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            max_speed = 0.0
-    if max_speed <= 0.0:
-        # Fall back to OSD-only signal if telemetry has no speed yet.
-        osd = (ctx.dashcam_osd_context or {}) if isinstance(ctx.dashcam_osd_context, dict) else {}
-        try:
-            max_speed = float(osd.get("max_speed_mph") or 0.0)
         except (TypeError, ValueError):
             max_speed = 0.0
     for thresh, sb_tags in _SPEED_BUCKETS:

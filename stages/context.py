@@ -715,9 +715,18 @@ class JobContext:
                 seen_tags.add(body)
                 clean_tags.append(f"#{body}")
 
+        identity_line = ""
+        try:
+            from core.content_identity import get_content_identity, identity_prompt_line
+
+            identity_line = identity_prompt_line(get_content_identity(self))
+        except Exception:
+            identity_line = ""
+
         out: Dict[str, str] = {
             "effective_title": self.get_effective_title() or self.filename or "Video",
             "effective_caption": self.get_effective_caption() or "",
+            "content_identity": identity_line,
             "category": category or getattr(self, "thumbnail_category", None) or "general",
             "location_name": self.location_name or "",
             "trill_bucket": trill.bucket if trill else "",
@@ -755,6 +764,7 @@ Return ONLY valid JSON. No markdown.
 CONTEXT
 - Effective title: {effective_title}
 - Caption hint: {effective_caption}
+- Content identity (verified consensus of what the footage IS — trust this over the category): {content_identity}
 - Category: {category}
 - Location: {location_name}
 - Trill bucket: {trill_bucket}
@@ -871,7 +881,20 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
 
     artifacts = coerce_jsonb_dict(upload_record.get("output_artifacts"), default={})
     if artifacts:
-        ctx.output_artifacts = {str(k): str(v) for k, v in artifacts.items() if v is not None}
+        # JSON-encode nested values: str(dict) yields Python repr (single quotes),
+        # which json.loads consumers (e.g. get_youtube_copyright_notice on resume)
+        # cannot parse — the prior trim notice would be silently dropped.
+        def _artifact_str(v: Any) -> str:
+            if isinstance(v, (dict, list)):
+                try:
+                    return json.dumps(v)
+                except (TypeError, ValueError):
+                    return str(v)
+            return str(v)
+
+        ctx.output_artifacts = {
+            str(k): _artifact_str(v) for k, v in artifacts.items() if v is not None
+        }
 
     def _artifact_json_dict(key: str) -> Dict[str, Any]:
         raw = artifacts.get(key)
@@ -1609,6 +1632,31 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             ts = 0.0
         events.append({"t_seconds": ts, "kind": str(kind)[:24], "text": text_clean[:240]})
 
+    # ── Scene understanding (Twelve Labs or fusion) — one anchor beat ────
+    vu = getattr(ctx, "video_understanding", None) or {}
+    if isinstance(vu, dict):
+        scene_txt = str(vu.get("scene_description") or vu.get("description") or "").strip()
+        if scene_txt:
+            first = re.split(r"(?<=[.!?])\s+", scene_txt, maxsplit=1)[0].strip()
+            if first:
+                _add(0.0, "scene", first)
+
+    # ── VI segment labels (whole-clip context, one beat each, cap 4) ─────
+    seg_labels = []
+    if isinstance(vic, dict):
+        seg_labels = list(vic.get("segment_labels") or [])
+    if not seg_labels and isinstance(vi, dict):
+        seg_labels = list(vi.get("segment_labels") or [])
+    seen_seg: set[str] = set()
+    for row in seg_labels[:8]:
+        desc = str(row.get("description") if isinstance(row, dict) else row or "").strip()
+        if not desc or desc.lower() in seen_seg:
+            continue
+        seen_seg.add(desc.lower())
+        _add(0.0, "vi_label", desc)
+        if len(seen_seg) >= 4:
+            break
+
     # ── Video Intelligence: shot changes (cap to 10 boundaries) ──────────
     shots = []
     if isinstance(vic, dict):
@@ -1783,12 +1831,24 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
         road = _first_nonempty(getattr(tel, "location_road", None))
         if road:
             _add(0.0, "geo_road", f"Road: {road}")
+        start_disp = _first_nonempty(getattr(tel, "location_start_display", None))
+        if start_disp and (not place or start_disp.lower() not in str(place).lower()):
+            _add(0.0, "geo_start", f"Run starts near {start_disp}")
         try:
             max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
         except (TypeError, ValueError):
             max_mph_tel = 0.0
         if max_mph_tel >= 5:
             _add(0.0, "telemetry_speed", f"Telemetry peak {int(round(max_mph_tel))} MPH")
+
+    # ── Welcome to / Entering roadside signs (Vision OCR + VI text) ──────
+    try:
+        from services.scene_fusion import collect_place_signs
+
+        for sign in collect_place_signs(ctx)[:3]:
+            _add(0.0, "welcome_sign", f"Welcome to {sign}")
+    except Exception:
+        pass
 
     # ── Audio: transcript segments (cap 10, ordered by time) ─────────────
     if isinstance(ac, dict):
@@ -1887,7 +1947,9 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
         body = scene
         if tsug:
             body = (body + "\nSuggested title angle: " + tsug).strip()
-        push("=== FULL VIDEO (scene understanding) ===", body, 0.30)
+        # Equal-weight providers: scene understanding gets the same share as
+        # Vision / audio / VI instead of dominating the digest.
+        push("=== FULL VIDEO (scene understanding) ===", body, 0.22)
 
     probe = _video_probe_lines(ctx)
     if probe:
@@ -1897,7 +1959,7 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
     if isinstance(vi, dict) and not vi.get("error"):
         vi_body = _video_intelligence_digest_body(vi)
         if vi_body:
-            push("=== VIDEO INTELLIGENCE (Google - full clip + timeline) ===", vi_body, 0.18)
+            push("=== VIDEO INTELLIGENCE (Google - full clip + timeline) ===", vi_body, 0.22)
 
     arts = getattr(ctx, "output_artifacts", None) or {}
     if isinstance(arts, dict):

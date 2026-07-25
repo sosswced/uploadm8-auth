@@ -98,6 +98,8 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "useAudioContext": True,
     "audio_transcription": True,
     "audioTranscription": True,
+    # youtube_shorts_copyright_trim is opt-in (DB default False). Do not inject False
+    # here — a missing key lets live Settings win on create_context overlay.
     # Trill / drive
     "trill_enabled": True,
     "trillEnabled": True,

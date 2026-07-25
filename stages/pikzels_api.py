@@ -180,6 +180,150 @@ def pikzels_format_for_platform(platform: str) -> str:
     return _PLATFORM_FORMAT.get(plat, "16:9")
 
 
+def pikzels_max_image_calls_per_job() -> int:
+    """Hard cap on billable ``/v2/thumbnail/image`` calls per upload job.
+
+    Default **2** = one 16:9 (YouTube) + one 9:16 shared by IG/FB/TikTok.
+    Set ``PIKZELS_MAX_IMAGE_CALLS_PER_JOB=0`` to disable the cap (not recommended).
+    """
+    try:
+        return max(0, int(os.environ.get("PIKZELS_MAX_IMAGE_CALLS_PER_JOB", "2") or "2"))
+    except (TypeError, ValueError):
+        return 2
+
+
+# Process-wide latch: after HTTP 402 / INSUFFICIENT_CREDITS, refuse further
+# billable image calls so auto-retry and the next N uploads do not keep
+# hammering an empty Pikzels balance (and ops Discord "tiktok,tiktok" spam).
+_credits_exhausted_until_mono: float = 0.0
+
+
+def pikzels_credits_exhausted_ttl_seconds() -> int:
+    try:
+        return max(60, int(os.environ.get("PIKZELS_CREDITS_EXHAUSTED_TTL_SEC", "21600") or "21600"))
+    except (TypeError, ValueError):
+        return 21600
+
+
+def clear_pikzels_credits_exhausted_latch() -> None:
+    """Reset the process latch (after topping up PIKZELS_API_KEY balance)."""
+    global _credits_exhausted_until_mono
+    _credits_exhausted_until_mono = 0.0
+
+
+def mark_pikzels_credits_exhausted(*, ttl_sec: Optional[int] = None) -> None:
+    """Arm the process latch after a 402 / insufficient-credits response."""
+    import time
+
+    global _credits_exhausted_until_mono
+    ttl = int(ttl_sec) if ttl_sec is not None else pikzels_credits_exhausted_ttl_seconds()
+    _credits_exhausted_until_mono = time.monotonic() + max(60, ttl)
+    logger.warning(
+        "[thumb-renderer] Pikzels credits exhausted latch armed for %ss — "
+        "further /v2/thumbnail/image calls blocked in this process",
+        max(60, ttl),
+    )
+
+
+def pikzels_credits_blocked() -> bool:
+    """True while the process latch is armed (empty API balance)."""
+    import time
+
+    if os.environ.get("PIKZELS_CLEAR_CREDITS_LATCH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        clear_pikzels_credits_exhausted_latch()
+        try:
+            del os.environ["PIKZELS_CLEAR_CREDITS_LATCH"]
+        except Exception:
+            pass
+        return False
+    return time.monotonic() < float(_credits_exhausted_until_mono or 0.0)
+
+
+def artifacts_show_pikzels_credits_exhausted(artifacts: Any) -> bool:
+    """True when prior pipeline artifacts already recorded a 402 / credits skip."""
+    if not isinstance(artifacts, dict):
+        return False
+    if str(artifacts.get("pikzels_credits_exhausted") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+    raw_report = artifacts.get("studio_render_report")
+    report: Any = raw_report
+    if isinstance(raw_report, str) and raw_report.strip():
+        try:
+            report = json.loads(raw_report)
+        except Exception:
+            report = None
+    if isinstance(report, dict):
+        if report.get("pikzels_credits_exhausted") is True:
+            return True
+        if str(report.get("skip_reason") or "").strip().lower() in (
+            "pikzels_insufficient_credits",
+            "insufficient_credits",
+        ):
+            return True
+    raw_pf = artifacts.get("pikzels_render_failures")
+    failures: Any = raw_pf
+    if isinstance(raw_pf, str) and raw_pf.strip():
+        try:
+            failures = json.loads(raw_pf)
+        except Exception:
+            failures = None
+    if isinstance(failures, list):
+        for f in failures:
+            if not isinstance(f, dict):
+                continue
+            reason = str(f.get("reason") or "").strip().lower()
+            status = str(f.get("http_status") or "").strip()
+            if reason in ("insufficient_credits", "pikzels_insufficient_credits") or status == "402":
+                return True
+    return False
+
+
+def unique_pikzels_aspect_leaders(
+    platforms: List[str],
+    *,
+    skip_platforms: Optional[set] = None,
+) -> Dict[str, str]:
+    """Map aspect format → first platform that needs a live Pikzels render.
+
+    Example: youtube/instagram/facebook/tiktok → ``{"16:9": "youtube", "9:16": "instagram"}``.
+    """
+    skip = {str(p).strip().lower() for p in (skip_platforms or set()) if str(p).strip()}
+    leaders: Dict[str, str] = {}
+    for raw in platforms or []:
+        plat = str(raw or "").strip().lower()
+        if not plat or plat in skip:
+            continue
+        fmt = pikzels_format_for_platform(plat)
+        if fmt not in leaders:
+            leaders[fmt] = plat
+    return leaders
+
+
+def _job_pikzels_image_call_count(job_context: Any) -> int:
+    try:
+        return max(0, int(getattr(job_context, "_pikzels_image_calls", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_job_pikzels_image_call_count(job_context: Any) -> int:
+    n = _job_pikzels_image_call_count(job_context) + 1
+    try:
+        setattr(job_context, "_pikzels_image_calls", n)
+    except Exception:
+        pass
+    return n
+
+
 def studio_renderer_enabled() -> bool:
     """True iff a Pikzels v2 API key is configured."""
     return bool(resolve_public_api_key())
@@ -693,6 +837,47 @@ async def render_thumbnail_with_studio_renderer(
         logger.debug("[thumb-renderer] PIKZELS_API_KEY not set — skipping Pikzels v2 render")
         return False
 
+    if pikzels_credits_blocked():
+        logger.warning(
+            "[thumb-renderer] Pikzels credits latch active — refusing billable call "
+            "upload=%s platform=%s (top up balance or set PIKZELS_CLEAR_CREDITS_LATCH=1)",
+            upload_id,
+            platform,
+        )
+        return False
+
+    # Hard fund guard: never bill more than N image renders per upload job.
+    # Callers must reuse one 9:16 JPEG across IG/FB/TikTok (aspect cache).
+    if job_context is not None:
+        cap = pikzels_max_image_calls_per_job()
+        if cap > 0:
+            used = _job_pikzels_image_call_count(job_context)
+            if used >= cap:
+                logger.warning(
+                    "[thumb-renderer] Pikzels image call cap reached (%s/%s) — "
+                    "refusing billable call upload=%s platform=%s "
+                    "(reuse aspect cache / one 9:16 for vertical platforms)",
+                    used,
+                    cap,
+                    upload_id,
+                    platform,
+                )
+                try:
+                    from services.thumbnail_trace import trace_append
+
+                    trace_append(
+                        job_context,
+                        "pikzels_image_call_capped",
+                        {
+                            "platform": str(platform or "").strip().lower(),
+                            "used": used,
+                            "cap": cap,
+                        },
+                    )
+                except Exception:
+                    pass
+                return False
+
     try:
         frame_bytes = _jpeg_bytes_for_pikzels_frame(base_frame_path)
     except (OSError, PermissionError, ValueError) as e:
@@ -957,6 +1142,18 @@ async def render_thumbnail_with_studio_renderer(
                 )
             return 0, {"error": {"code": "client_exception", "message": str(e)[:500]}}
 
+    # Count one billable image render per function invocation (retries share the slot).
+    if job_context is not None and pikzels_max_image_calls_per_job() > 0:
+        used_n = _bump_job_pikzels_image_call_count(job_context)
+        logger.info(
+            "[thumb-renderer] Pikzels image call #%s/%s upload=%s platform=%s format=%s",
+            used_n,
+            pikzels_max_image_calls_per_job(),
+            upload_id,
+            plat,
+            fmt,
+        )
+
     status, data = await _post_once()
 
     def _err_code(body: Any) -> str:
@@ -1030,6 +1227,15 @@ async def render_thumbnail_with_studio_renderer(
             "[thumb-renderer] Pikzels v2 image HTTP %s upload=%s platform=%s body=%s",
             status, upload_id, plat, str(data)[:240],
         )
+        if status == 402 or code in ("INSUFFICIENT_CREDITS", "PAYMENT_REQUIRED"):
+            mark_pikzels_credits_exhausted()
+            try:
+                if job_context is not None and isinstance(
+                    getattr(job_context, "output_artifacts", None), dict
+                ):
+                    job_context.output_artifacts["pikzels_credits_exhausted"] = "1"
+            except Exception:
+                pass
         if job_context is not None:
             low = (body_blob + " " + err_msg).lower()
             prompt_long = status == 400 and (
@@ -1109,6 +1315,12 @@ async def refine_thumbnail_with_pikzels_edit(
     """
     if not studio_renderer_enabled():
         return False
+    if pikzels_credits_blocked():
+        logger.warning(
+            "[thumb-renderer] hydration edit skipped — credits latch active upload=%s",
+            upload_id,
+        )
+        return False
     ep = str(edit_prompt or "").strip()
     if not ep:
         return False
@@ -1142,6 +1354,8 @@ async def refine_thumbnail_with_pikzels_edit(
             "[thumb-renderer] hydration edit HTTP %s upload=%s platform=%s body=%s",
             status, upload_id, plat, str(data)[:240],
         )
+        if status == 402:
+            mark_pikzels_credits_exhausted()
         return False
     image_bytes = await _pikzels_v2_response_to_bytes(data, timeout=timeout)
     if not image_bytes or len(image_bytes) < MIN_THUMB_SIZE:

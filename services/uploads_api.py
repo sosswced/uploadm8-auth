@@ -39,6 +39,70 @@ def _parse_platform_results_items(upload_row: dict) -> list:
     return []
 
 
+def dedupe_platform_result_entries(items: list) -> list:
+    """Collapse bloated platform_results to one chip per platform+account.
+
+    Re-publish storms / ledger reconcile can store many accepted attempts for the
+    same account; the queue then renders dozens of identical badges. Prefer the
+    entry with a live URL / video id, then success over failure.
+    """
+    if not items:
+        return []
+
+    def _score(e: dict) -> tuple:
+        ok = 1 if e.get("success") is True else 0
+        has_url = 1 if (e.get("platform_url") or e.get("url")) else 0
+        has_vid = 1 if (e.get("platform_video_id") or e.get("video_id") or e.get("publish_id")) else 0
+        has_acct = 1 if (
+            e.get("token_row_id")
+            or e.get("account_id")
+            or e.get("account_username")
+            or e.get("account_name")
+        ) else 0
+        return (ok, has_url, has_vid, has_acct)
+
+    def _key(e: dict) -> str:
+        plat = str(e.get("platform") or "").strip().lower()
+        tid = str(e.get("token_row_id") or "").strip().lower()
+        if tid:
+            return f"{plat}|tok:{tid}"
+        aid = str(e.get("account_id") or "").strip().lower()
+        if aid:
+            return f"{plat}|aid:{aid}"
+        uname = str(e.get("account_username") or e.get("username") or "").strip().lower().lstrip("@")
+        if uname:
+            return f"{plat}|user:{uname}"
+        aname = str(e.get("account_name") or "").strip().lower()
+        if aname:
+            return f"{plat}|name:{aname}"
+        # Anonymous rows: keep distinct live posts (video/publish id), else
+        # collapse by platform so identity-less storm rows don't flood chips.
+        vid = str(
+            e.get("platform_video_id") or e.get("video_id") or ""
+        ).strip().lower()
+        if vid:
+            return f"{plat}|vid:{vid}"
+        pub = str(e.get("publish_id") or "").strip().lower()
+        if pub:
+            return f"{plat}|pub:{pub}"
+        return plat or "_unknown"
+
+    best: dict = {}
+    order: list = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        k = _key(raw)
+        prev = best.get(k)
+        if prev is None:
+            best[k] = raw
+            order.append(k)
+            continue
+        if _score(raw) > _score(prev):
+            best[k] = raw
+    return [best[k] for k in order]
+
+
 def _platform_items_already_enriched(items: list) -> bool:
     if not items:
         return True
@@ -112,12 +176,12 @@ async def enrich_platform_results_batch(
     platform_set: set[str] = set()
 
     for i, upload_row in enumerate(upload_rows):
-        items = _parse_platform_results_items(upload_row)
+        items = dedupe_platform_result_entries(_parse_platform_results_items(upload_row))
         if not items:
             out[i] = []
             continue
         if _platform_items_already_enriched(items):
-            out[i] = items
+            out[i] = dedupe_platform_result_entries(items)
             continue
         pending_indices.append(i)
         for t in upload_row.get("target_accounts") or []:
@@ -175,15 +239,21 @@ async def enrich_platform_results_batch(
 
     for i in pending_indices:
         upload_row = upload_rows[i]
-        items = _parse_platform_results_items(upload_row)
+        items = dedupe_platform_result_entries(_parse_platform_results_items(upload_row))
         target_ids = [str(t) for t in (upload_row.get("target_accounts") or []) if t]
         token_map = {tid: global_by_id[tid] for tid in target_ids if tid in global_by_id}
-        out[i] = _merge_platform_entries(items, token_map, global_platform_fallback)
+        out[i] = dedupe_platform_result_entries(
+            _merge_platform_entries(items, token_map, global_platform_fallback)
+        )
 
     for i in range(n):
         row = out[i]
         if isinstance(row, list):
-            out[i] = _resolve_platform_result_avatars(row, presign=presign_avatars)
+            # Dedupe again after enrich: fallback account fill can make many
+            # ledger rows look like the same chip.
+            out[i] = _resolve_platform_result_avatars(
+                dedupe_platform_result_entries(row), presign=presign_avatars
+            )
 
     return out
 

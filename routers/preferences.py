@@ -573,6 +573,8 @@ async def get_user_preferences(
                 "trillMapSharingOptIn": bool(d.get("trill_map_sharing_opt_in", False)),
                 "styledThumbnails": d.get("styled_thumbnails", True),
                 "useAudioContext": bool(d.get("use_audio_context", True)),
+                "youtubeShortsCopyrightTrim": bool(d.get("youtube_shorts_copyright_trim", False)),
+                "youtube_shorts_copyright_trim": bool(d.get("youtube_shorts_copyright_trim", False)),
                 "audioTranscription": bool(d.get("audio_transcription", True)),
                 "authSecurityAlerts": bool(d.get("auth_security_alerts", True)),
                 "digestEmails": bool(d.get("digest_emails", True)),

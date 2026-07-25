@@ -126,6 +126,7 @@ async def record_pikzels_render_failures_incident(
         from services.ops_incidents import record_operational_incident
 
         rows = []
+        seen_keys: set[str] = set()
         for f in failures:
             if not isinstance(f, dict):
                 continue
@@ -134,6 +135,10 @@ async def record_pikzels_render_failures_incident(
             status_label = (
                 str(status_code) if status_code not in (None, "", "unknown") else "unknown"
             )
+            dedupe_key = f"{plat}:{status_label}"
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
             msg = str(f.get("message") or "")[:1000]
             rows.append(
                 {

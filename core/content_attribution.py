@@ -207,6 +207,54 @@ def build_content_attribution_snapshot(
     niche = ""
     if isinstance(strat, dict):
         niche = str(strat.get("audience_niche") or strat.get("niche") or "").strip()
+    # Content-identity packaging signals (Phase 4 ML logging).
+    identity: Dict[str, Any] = {}
+    raw_ident = output_artifacts.get("content_identity_v1")
+    if isinstance(raw_ident, dict):
+        identity = raw_ident
+    elif isinstance(raw_ident, str) and raw_ident.strip():
+        try:
+            parsed_i = json.loads(raw_ident)
+            if isinstance(parsed_i, dict):
+                identity = parsed_i
+        except Exception:
+            identity = {}
+    top_tag = ""
+    top_tag_conf = None
+    tags = identity.get("domain_tags") or []
+    if isinstance(tags, list) and tags:
+        best = max(
+            (t for t in tags if isinstance(t, dict)),
+            key=lambda t: float(t.get("confidence") or 0),
+            default=None,
+        )
+        if best:
+            top_tag = str(best.get("tag") or "").strip().lower()[:48]
+            try:
+                top_tag_conf = float(best.get("confidence") or 0)
+            except (TypeError, ValueError):
+                top_tag_conf = None
+    hero_class = ""
+    for f in identity.get("hero_facts") or []:
+        if isinstance(f, dict) and f.get("class"):
+            hero_class = str(f.get("class") or "").strip().lower()[:32]
+            break
+    headline_class = hero_class
+    # Prefer the class that matches the selected headline text when present.
+    selected_headline = str(
+        output_artifacts.get("thumbnail_selected_headline")
+        or (report.get("selected_headline") if isinstance(report, dict) else "")
+        or ""
+    ).strip().lower()
+    if selected_headline:
+        for f in identity.get("hero_facts") or []:
+            if not isinstance(f, dict):
+                continue
+            ft = str(f.get("text") or "").strip().lower()
+            if ft and (ft in selected_headline or selected_headline in ft):
+                headline_class = str(f.get("class") or headline_class).strip().lower()[:32]
+                break
+
     snap.update(
         {
             # Absent prefs → off/unknown (False), not an implicit opt-in.
@@ -221,6 +269,13 @@ def build_content_attribution_snapshot(
             "studio_variant_ctr_score": ctr_f,
             "studio_pikzels_main_score": pikz_f,
             "studio_persona_kind": str(report.get("persona_kind") or "")[:64],
+            "identity_domain_tag": top_tag,
+            "identity_domain_confidence": top_tag_conf,
+            "identity_hero_fact_class": hero_class,
+            "identity_headline_class": headline_class,
+            "identity_confidence": str(identity.get("confidence") or "")[:16],
+            "identity_novel_content": bool(identity.get("novel_content")) if identity else None,
+            "identity_subject": str(identity.get("subject") or "")[:140],
         }
     )
     return snap

@@ -130,6 +130,23 @@ CONTENT_FEATURES: List[Feature] = [
     Feature("thumbnail_engine_mode", "thumbnail_render_method", "categorical", "cat"),
     Feature("thumbnail_layout_pattern", "studio default strategy", "categorical", "cat"),
 
+    # Content-identity packaging (Phase 4) — logged at publish for hero-fact priors.
+    Feature("identity_domain_tag", "content_identity_v1.domain_tags[0]", "categorical", "cat",
+            status="experimental",
+            notes="Open-vocab soft domain; used later for per-cluster hero-fact priors."),
+    Feature("identity_domain_confidence", "content_identity_v1.domain_tags[0].confidence", "float", "num",
+            status="experimental"),
+    Feature("identity_hero_fact_class", "content_identity_v1.hero_facts[0].class", "categorical", "cat",
+            status="experimental",
+            notes="Which hero-fact class led the identity ranking for this upload."),
+    Feature("identity_headline_class", "content_identity_v1 matched to selected headline", "categorical", "cat",
+            status="experimental",
+            notes="Hero-fact class that matched the published thumbnail headline."),
+    Feature("identity_confidence", "content_identity_v1.confidence", "categorical", "cat",
+            status="experimental"),
+    Feature("identity_novel_content", "content_identity_v1.novel_content", "int", "num",
+            status="experimental"),
+
     # Missing-attribution indicator (replaces fake-default categoricals).
     Feature("has_attribution", "output_artifacts presence", "int", "num"),
 

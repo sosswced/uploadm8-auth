@@ -2079,6 +2079,89 @@ async def run_migrations(db_pool):
                     ON uploads (user_id, created_at DESC)
                     WHERE status IN ('completed', 'succeeded', 'partial');
             """),
+            # YouTube Shorts copyright trim — durable column (was JSONB-only in users.preferences).
+            (1098, """
+                ALTER TABLE user_preferences
+                    ADD COLUMN IF NOT EXISTS youtube_shorts_copyright_trim BOOLEAN DEFAULT FALSE;
+                UPDATE user_preferences up
+                SET youtube_shorts_copyright_trim = TRUE
+                FROM users u
+                WHERE up.user_id = u.id
+                  AND COALESCE(up.youtube_shorts_copyright_trim, FALSE) = FALSE
+                  AND (
+                    LOWER(COALESCE(u.preferences->>'youtubeShortsCopyrightTrim', '')) IN ('true', '1', 'yes', 'on')
+                    OR LOWER(COALESCE(u.preferences->>'youtube_shorts_copyright_trim', '')) IN ('true', '1', 'yes', 'on')
+                  );
+            """),
+            # Publish ledger: token-scoped attempts + unique open slot (anti double-post).
+            (1099, """
+                CREATE TABLE IF NOT EXISTS publish_attempts (
+                    id UUID PRIMARY KEY,
+                    upload_id UUID NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    platform VARCHAR(50) NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    token_row_id UUID,
+                    platform_post_id TEXT,
+                    platform_url TEXT,
+                    publish_id TEXT,
+                    http_status INT,
+                    response_payload JSONB,
+                    error_code VARCHAR(120),
+                    error_message TEXT,
+                    verify_status VARCHAR(32),
+                    verified_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                ALTER TABLE publish_attempts
+                    ADD COLUMN IF NOT EXISTS token_row_id UUID;
+                ALTER TABLE publish_attempts
+                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+                CREATE INDEX IF NOT EXISTS idx_publish_attempts_upload
+                    ON publish_attempts (upload_id, created_at ASC);
+                CREATE INDEX IF NOT EXISTS idx_publish_attempts_verify
+                    ON publish_attempts (status, verify_status, created_at ASC)
+                    WHERE status = 'accepted';
+                -- Collapse storm duplicates before unique open-slot index.
+                WITH ranked AS (
+                    SELECT id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY
+                                   upload_id,
+                                   lower(platform),
+                                   COALESCE(
+                                       token_row_id,
+                                       '00000000-0000-0000-0000-000000000000'::uuid
+                                   )
+                               ORDER BY
+                                   CASE status
+                                       WHEN 'accepted' THEN 0
+                                       WHEN 'pending' THEN 1
+                                       ELSE 2
+                                   END,
+                                   created_at ASC NULLS LAST
+                           ) AS rn
+                      FROM publish_attempts
+                     WHERE status IN ('pending', 'accepted')
+                )
+                UPDATE publish_attempts pa
+                   SET status = 'failed',
+                       error_code = 'DUPLICATE_OPEN_SLOT',
+                       error_message = 'Collapsed duplicate open ledger slot before unique index',
+                       updated_at = NOW()
+                  FROM ranked r
+                 WHERE pa.id = r.id
+                   AND r.rn > 1;
+                -- One open (pending|accepted) row per upload+platform+token slot.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_publish_attempts_open_slot
+                    ON publish_attempts (
+                        upload_id,
+                        lower(platform),
+                        COALESCE(token_row_id, '00000000-0000-0000-0000-000000000000'::uuid)
+                    )
+                    WHERE status IN ('pending', 'accepted');
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

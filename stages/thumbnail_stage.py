@@ -63,6 +63,10 @@ from .pikzels_api import (
     refine_thumbnail_with_pikzels_edit,
     render_thumbnail_with_studio_renderer,
     studio_renderer_enabled,
+    artifacts_show_pikzels_credits_exhausted,
+    mark_pikzels_credits_exhausted,
+    pikzels_credits_blocked,
+    unique_pikzels_aspect_leaders,
 )
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
@@ -77,17 +81,12 @@ STRICT_STUDIO_ENV        = os.environ.get("UPLOADM8_THUMBNAIL_STRICT_STUDIO", ""
 # ============================================================
 # Content Category Engine
 # ============================================================
-# Defined independently here so thumbnail_stage has zero circular imports.
-# Mirrors the same detection system in caption_stage.py.
+# Layout buckets only — frame-selection prose per content shape. Detection is
+# identity-driven (core.content_identity soft-maps open-vocabulary tags onto
+# these keys); there are intentionally NO keyword lists here.
 
 _THUMB_CATEGORIES: Dict[str, Dict] = {
     "automotive": {
-        "keywords": [
-            "car", "drive", "driving", "road", "highway", "speed", "mph",
-            "truck", "suv", "motorcycle", "moto", "drift", "race", "track",
-            "vehicle", "auto", "engine", "trill", "dashcam", "cruise",
-            "roadtrip", "throttle", "turbo", "supercar", "offroad", "joyride",
-        ],
         "selection_criteria": (
             "Select the frame that BEST conveys speed and excitement: "
             "peak dynamic moment on a road, vehicle clearly in motion, "
@@ -96,11 +95,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "beauty": {
-        "keywords": [
-            "makeup", "beauty", "skincare", "foundation", "concealer", "blush",
-            "lipstick", "eyeshadow", "mascara", "eyeliner", "contour", "glam",
-            "grwm", "glow", "bronzer", "primer", "serum", "toner",
-        ],
         "selection_criteria": (
             "Select the frame with the BEST LIGHTING on the subject's face: "
             "eyes wide open and expressive, makeup clearly and fully applied, "
@@ -110,12 +104,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "food": {
-        "keywords": [
-            "food", "recipe", "cook", "cooking", "bake", "baking", "eat",
-            "meal", "dinner", "lunch", "breakfast", "snack", "restaurant",
-            "foodie", "chef", "kitchen", "dish", "dessert", "cake", "pasta",
-            "steak", "pizza", "burger", "sushi",
-        ],
         "selection_criteria": (
             "Select the frame that makes the food look most APPETIZING: "
             "finished dish filling the frame, vivid colors, steam or glossy texture visible, "
@@ -125,11 +113,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "home_renovation": {
-        "keywords": [
-            "reno", "renovation", "diy", "makeover", "before after", "transform",
-            "decor", "interior", "design", "build", "tile", "paint", "floor",
-            "wall", "cabinet", "remodel", "woodwork", "carpentry",
-        ],
         "selection_criteria": (
             "Select the frame showing the most DRAMATIC TRANSFORMATION: "
             "the finished, clean, complete room or space at its best angle. "
@@ -138,11 +121,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "gardening": {
-        "keywords": [
-            "garden", "gardening", "plant", "plants", "grow", "flower",
-            "flowers", "vegetable", "herb", "seed", "soil", "harvest",
-            "greenhouse", "bloom", "prune", "mulch",
-        ],
         "selection_criteria": (
             "Select the frame with the most LUSH or VIBRANT plant life: "
             "in-bloom flowers, ripe harvest, full green growth filling the frame. "
@@ -151,11 +129,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "fitness": {
-        "keywords": [
-            "workout", "gym", "fitness", "exercise", "train", "lift", "lifting",
-            "weights", "cardio", "run", "yoga", "pilates", "hiit", "crossfit",
-            "strength", "gains", "physique", "sweat", "reps",
-        ],
         "selection_criteria": (
             "Select the frame showing PEAK EFFORT: maximum exertion clearly visible, "
             "form correct and muscles engaged, sweat present, intense expression. "
@@ -164,10 +137,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "fashion": {
-        "keywords": [
-            "fashion", "outfit", "ootd", "style", "clothes", "haul", "thrift",
-            "fitcheck", "lookbook", "trend", "streetwear", "vintage", "aesthetic",
-        ],
         "selection_criteria": (
             "Select the frame where the FULL OUTFIT is most visible: "
             "head-to-toe or torso-down clearly framed, best pose, "
@@ -177,11 +146,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "gaming": {
-        "keywords": [
-            "game", "gaming", "gamer", "gameplay", "stream", "fps", "rpg",
-            "controller", "xbox", "playstation", "nintendo", "fortnite",
-            "minecraft", "valorant", "cod", "lol", "roblox", "speedrun", "esports",
-        ],
         "selection_criteria": (
             "Select the frame with the highest VISUAL DRAMA: "
             "peak action, critical game moment, impressive score or stat on screen, "
@@ -191,11 +155,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "travel": {
-        "keywords": [
-            "travel", "trip", "vacation", "destination", "explore", "adventure",
-            "abroad", "beach", "mountain", "hotel", "backpack", "sightseeing",
-            "landmark", "scenic", "wanderlust", "passport",
-        ],
         "selection_criteria": (
             "Select the frame with the most STUNNING SCENERY or ICONIC LOCATION: "
             "widest angle capturing the full landscape, most recognizable landmark, "
@@ -205,11 +164,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "pets": {
-        "keywords": [
-            "dog", "cat", "pet", "puppy", "kitten", "animal", "paw", "bark",
-            "meow", "bird", "hamster", "bunny", "rabbit", "furry", "doggo",
-            "furryfriend",
-        ],
         "selection_criteria": (
             "Select the frame where the pet's EYES AND FACE are most clearly visible: "
             "cute or funny expression, mid-action (jump, play, zoomies), or an emotional moment. "
@@ -218,11 +172,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "education": {
-        "keywords": [
-            "learn", "learning", "teach", "tutorial", "how to", "tips", "tricks",
-            "hacks", "guide", "course", "study", "skill", "knowledge", "fact",
-            "science", "history", "psychology", "finance", "productivity",
-        ],
         "selection_criteria": (
             "Select the frame where the presenter is MOST ENGAGED and CLEARLY VISIBLE: "
             "expressive face showing the key insight, key graphic or diagram readable behind them, "
@@ -232,10 +181,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "comedy": {
-        "keywords": [
-            "funny", "comedy", "joke", "prank", "skit", "reaction", "meme",
-            "laugh", "hilarious", "parody", "relatable", "pov",
-        ],
         "selection_criteria": (
             "Select the frame with the PEAK REACTION or highest-energy expression: "
             "biggest laugh, most exaggerated face, or the comedic climax moment. "
@@ -244,10 +189,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "tech": {
-        "keywords": [
-            "tech", "technology", "app", "software", "phone", "laptop", "computer",
-            "review", "unboxing", "setup", "desk setup", "ai", "gadget", "gear",
-        ],
         "selection_criteria": (
             "Select the frame that best SHOWCASES THE PRODUCT or KEY VISUAL: "
             "product in sharp focus and well-lit, screen content clearly visible, "
@@ -257,11 +198,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "music": {
-        "keywords": [
-            "music", "song", "singing", "sing", "cover", "original", "produce",
-            "beat", "studio", "record", "guitar", "piano", "drums", "vocal",
-            "concert", "gig", "performance",
-        ],
         "selection_criteria": (
             "Select the frame at PEAK MUSICAL INTENSITY: "
             "emotional climax, instrument mid-play at its most dynamic, "
@@ -272,11 +208,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "real_estate": {
-        "keywords": [
-            "real estate", "property", "house", "home", "apartment", "listing",
-            "for sale", "rent", "mortgage", "investing", "flip", "flipping",
-            "rental", "cashflow",
-        ],
         "selection_criteria": (
             "Select the frame showing the property's BEST FEATURE or MONEY SHOT: "
             "most impressive room (kitchen, pool, master suite, view), "
@@ -286,11 +217,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "sports": {
-        "keywords": [
-            "sport", "sports", "athlete", "soccer", "football", "basketball",
-            "baseball", "tennis", "golf", "swim", "hockey", "mma", "boxing",
-            "tournament", "league", "training", "score", "goal",
-        ],
         "selection_criteria": (
             "Select the frame at the PEAK ATHLETIC MOMENT: "
             "ball in air, mid-strike, maximum effort face, celebration, "
@@ -300,11 +226,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "asmr": {
-        "keywords": [
-            "asmr", "satisfying", "relaxing", "calm", "soothing", "triggers",
-            "tingles", "whisper", "tapping", "crunchy", "slime", "soap",
-            "oddly satisfying",
-        ],
         "selection_criteria": (
             "Select the frame that looks most VISUALLY SATISFYING or TEXTURAL: "
             "peak satisfying moment (soap cut, slime stretch, tapping close-up), "
@@ -314,11 +235,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "lifestyle": {
-        "keywords": [
-            "vlog", "day in my life", "daily", "morning routine", "night routine",
-            "productive", "productivity", "life update", "minimalist", "aesthetic",
-            "wellness", "self care", "journal",
-        ],
         "selection_criteria": (
             "Select the frame that best captures the VIDEO'S VIBE AND AESTHETIC: "
             "presenter looking their best and most genuine, "
@@ -328,7 +244,6 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
         ),
     },
     "general": {
-        "keywords": [],   # catch-all — always matches last
         "selection_criteria": (
             "First identify what this video is actually about by examining all the frames carefully. "
             "Then select the frame with the highest VISUAL IMPACT and CLICK-WORTHINESS: "
@@ -340,91 +255,31 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
     },
 }
 
-_CATEGORY_PRIORITY = [
-    "automotive", "beauty", "food", "home_renovation", "gardening",
-    "fitness", "fashion", "gaming", "travel", "pets", "education",
-    "comedy", "tech", "music", "real_estate", "sports", "asmr", "lifestyle",
-    "general",
-]
-
-
 def _detect_category(ctx: JobContext) -> str:
+    """Identity-driven category resolution — no keyword lists.
+
+    Reads the ``content_identity_v1`` artifact (cross-provider fusion + LLM
+    resolution built in the worker; deterministic-only fallback when the
+    artifact is missing) and soft-maps its open-vocabulary tags/subject onto
+    the layout bucket keys in ``_THUMB_CATEGORIES``. The bucket is a
+    layout/analytics hint only — prompts consume the identity descriptor
+    itself. Content that maps nowhere stays "general" (the prompt asks the
+    model to identify from frames).
     """
-    Multi-signal content category detection.
-    Layer 1: user-provided caption/title hints
-    Layer 2: filename keyword scan
-    Layer 3: vision/audio/video-understanding/telemetry signals
-    Layer 4: fall back to 'general' (GPT identifies from frames in the prompt)
-    """
-    def _scan(text: str) -> Optional[str]:
-        if not text:
-            return None
-        t = text.lower()
-        for cat in _CATEGORY_PRIORITY:
-            if cat == "general":
-                continue
-            for kw in _THUMB_CATEGORIES[cat].get("keywords", []):
-                if kw in t:
-                    return cat
-        return None
+    from core.content_identity import get_content_identity, soft_bucket_for_identity
 
-    for text in (ctx.caption, ctx.title):
-        result = _scan(text or "")
-        if result:
-            logger.debug(f"Thumbnail category from user hint: {result}")
-            return result
-
-    result = _scan(ctx.filename or "")
-    if result:
-        logger.debug(f"Thumbnail category from filename: {result}")
-        return result
-
-    evidence: List[str] = []
-    vu = ctx.video_understanding or {}
-    if isinstance(vu, dict):
-        for key in ("scene_description", "description", "title_suggestion", "summary"):
-            value = vu.get(key)
-            if isinstance(value, str) and value.strip():
-                evidence.append(value)
-
-    vi = ctx.video_intelligence_context or {}
-    if isinstance(vi, dict):
-        for key in ("labels", "label_names", "shot_labels", "objects", "ocr_text"):
-            value = vi.get(key)
-            if isinstance(value, list):
-                evidence.extend(str(x.get("description") if isinstance(x, dict) else x) for x in value[:24])
-            elif isinstance(value, str):
-                evidence.append(value)
-
-    vc = ctx.vision_context or {}
-    if isinstance(vc, dict):
-        for key in ("label_names", "landmark_names", "logo_names", "ocr_text"):
-            value = vc.get(key)
-            if isinstance(value, list):
-                evidence.extend(str(x) for x in value[:24])
-            elif isinstance(value, str):
-                evidence.append(value)
-
-    ac = ctx.audio_context or {}
-    if isinstance(ac, dict):
-        for key in ("suggested_keywords", "yamnet_events", "top_sound_class", "sound_profile", "music_title", "music_artist", "music_genre", "fusion_narrative"):
-            value = ac.get(key)
-            if isinstance(value, list):
-                evidence.extend(str(x) for x in value[:24])
-            elif isinstance(value, str):
-                evidence.append(value)
-
-    tel = ctx.telemetry_data or ctx.telemetry
-    if tel and ((getattr(tel, "max_speed_mph", 0) or 0) > 0 or getattr(tel, "location_road", None)):
-        evidence.append("dashcam road drive speed automotive route")
-
-    result = _scan(" ".join(x for x in evidence if x))
-    if result:
-        logger.debug(f"Thumbnail category from fused context: {result}")
-        return result
-
-    logger.debug("Thumbnail category: general (GPT will identify from frames)")
-    return "general"
+    identity = get_content_identity(ctx)
+    bucket = soft_bucket_for_identity(
+        identity,
+        {k: str(v.get("selection_criteria") or "") for k, v in _THUMB_CATEGORIES.items()},
+    )
+    logger.debug(
+        "Thumbnail category (identity-driven): %s subject=%r tags=%s",
+        bucket,
+        str(identity.get("subject") or "")[:60],
+        [t.get("tag") for t in (identity.get("domain_tags") or []) if isinstance(t, dict)],
+    )
+    return bucket
 
 
 # ============================================================
@@ -478,28 +333,67 @@ def _dashcam_pov_content(ctx: JobContext, category: str) -> bool:
     return False
 
 
-def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
-    """Build a truthful fallback headline from known context, never generic hype."""
-    cat = (category or "general").strip().lower()
-    tel = ctx.telemetry_data or ctx.telemetry
-    if tel:
-        mph = getattr(tel, "max_speed_mph", 0) or 0
-        if cat in {"automotive", "travel", "sports"} and mph and float(mph) >= 10:
-            return f"{float(mph):.0f} MPH RUN"
-        road = (getattr(tel, "location_road", None) or "").strip()
-        if cat in {"automotive", "travel"} and road:
-            cleaned = clean_thumbnail_headline(f"{road} drive", max_words=4)
-            if cleaned:
-                return cleaned
+def _hero_fact_headlines(ctx: JobContext, category: str) -> List[str]:
+    """Ranked headline candidates from the content-identity hero facts.
 
-    osd = ctx.dashcam_osd_context or {}
-    if isinstance(osd, dict):
-        mph = osd.get("max_speed_mph") or osd.get("peak_speed_mph")
-        try:
-            if cat in {"automotive", "travel", "sports"} and mph and float(mph) >= 10:
-                return f"{float(mph):.0f} MPH RUN"
-        except (TypeError, ValueError):
-            pass
+    Speed is a PEER candidate, never automatic: it only qualifies when the
+    speed consensus is high-confidence AND the content is actually a drive.
+    All other fact classes (landmark, dish, harvest, on-screen text, music,
+    entity) compete equally — this is what makes gardening/food/travel
+    uploads stop getting "MPH RUN" covers.
+    """
+    from core.content_identity import get_content_identity, top_domain_tag
+    from core.hero_fact_priors import rank_hero_facts
+    from core.speed_consensus import get_speed_consensus
+
+    identity = get_content_identity(ctx)
+    consensus = get_speed_consensus(ctx)
+    peak_mph = float(consensus.get("peak_mph") or 0)
+    speed_conf = str(consensus.get("confidence") or "none")
+    cat = (category or "general").strip().lower()
+    domain_tag = top_domain_tag(identity)
+    if cat in {"automotive", "sports"}:
+        driving_domain = True
+    elif cat in {"", "general", "travel"}:
+        # Undetermined/travel content: trust the identity domain tags.
+        driving_domain = domain_tag in ("automotive", "driving", "motorsport")
+    else:
+        # An explicit non-driving category (gardening, food, …) blocks speed
+        # even when a GPS logger recorded motion — no MPH on a garden cover.
+        driving_domain = False
+
+    # Phase 5: learned (or bootstrap) class priors re-order hero facts per cluster.
+    ranked_facts = rank_hero_facts(
+        list(identity.get("hero_facts") or []),
+        domain_tag=domain_tag or cat,
+    )
+
+    out: List[str] = []
+    for fact in ranked_facts:
+        if not isinstance(fact, dict):
+            continue
+        if fact.get("class") == "speed":
+            if peak_mph >= 10 and speed_conf == "high" and driving_domain:
+                candidate = f"{peak_mph:.0f} MPH RUN"
+            else:
+                continue
+        else:
+            candidate = clean_thumbnail_headline(str(fact.get("text") or ""), max_words=5)
+        if candidate and not is_generic_thumbnail_headline(candidate) and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
+    """Truthful headline from ranked hero facts, never generic hype.
+
+    Identity hero facts lead; legacy evidence probes (vision, OCR, music,
+    title) back them up; CATEGORY_HEADLINE_FALLBACKS is the demoted last
+    resort for uploads with no usable evidence at all.
+    """
+    hero = _hero_fact_headlines(ctx, category)
+    if hero:
+        return hero[0]
 
     vc = ctx.vision_context or {}
     if isinstance(vc, dict):
@@ -571,7 +465,10 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
             cleaned = clean_thumbnail_headline(candidate, max_words=5)
             if cleaned and not is_generic_thumbnail_headline(cleaned) and cleaned not in options:
                 options.append(cleaned)
-    for candidate in (selected, fallback, CATEGORY_HEADLINE_FALLBACKS.get(category, "VIDEO HIGHLIGHT")):
+    # Identity hero facts join the rotation so platforms can lead with
+    # different verified facts (landmark vs speed vs dish vs on-screen text).
+    hero_candidates = _hero_fact_headlines(ctx, category)
+    for candidate in (selected, *hero_candidates, fallback, CATEGORY_HEADLINE_FALLBACKS.get(category, "VIDEO HIGHLIGHT")):
         cleaned = clean_thumbnail_headline(candidate, max_words=5)
         if cleaned and cleaned not in options:
             options.append(cleaned)
@@ -859,8 +756,13 @@ def _thumbnail_styled_render_order(
     sticker_first: List[str] = ["sticker"] if sticker_ok else []
 
     if studio_ok:
-        # Studio first; PIL template always last so API 400s still produce a cover.
-        return sticker_first + ["studio", "template"]
+        # Studio first; OpenAI edit rescues Pikzels failures when enabled;
+        # PIL template always last so API 400s still produce a cover.
+        order: List[str] = list(sticker_first) + ["studio"]
+        if ai_edit_ok:
+            order.append("ai_edit")
+        order.append("template")
+        return order
     if p == "template":
         return sticker_first + ["template"]
     if p == "ai_edit":
@@ -1140,13 +1042,20 @@ def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict
 
 
 def effective_thumbnail_category(us: Dict[str, Any], detected_category: str) -> str:
-    """Prefer saved Studio default audience/niche over auto-detected category."""
+    """Prefer saved Studio default audience/niche over auto-detected category.
+
+    "general" in the Studio dropdown means Auto — identity-driven detection
+    wins. Any specific niche is a hard user override of the layout bucket
+    (never of the identity descriptor itself, which prompts always receive).
+    """
     strategy = _thumbnail_default_strategy(us)
     niche = str(strategy.get("audience_niche") or "").strip()
     if niche:
         from services.thumbnail_niches import normalize_niche
 
-        return normalize_niche(niche, default=detected_category or "general")
+        normalized = normalize_niche(niche, default=detected_category or "general")
+        if normalized != "general":
+            return normalized
     return (detected_category or "general").strip().lower() or "general"
 
 
@@ -1275,6 +1184,7 @@ def _finalize_styled_thumbnail_artifacts(
     render_method: Optional[str],
     platform_map: Dict[str, Any],
     pikzels_render_failures: List[Dict[str, Any]],
+    openai_render_failures: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Write styled-block diagnostics onto ctx and flush to DB before any raise."""
     ctx.output_artifacts["thumbnail_render_method"] = render_method or "none"
@@ -1288,6 +1198,8 @@ def _finalize_styled_thumbnail_artifacts(
     )
     if pikzels_render_failures:
         ctx.output_artifacts["pikzels_render_failures"] = json.dumps(pikzels_render_failures)
+    if openai_render_failures:
+        ctx.output_artifacts["openai_render_failures"] = json.dumps(openai_render_failures)
     try:
         from services.diag_persist import schedule_persist_artifact_now
 
@@ -1302,6 +1214,8 @@ def _finalize_styled_thumbnail_artifacts(
             persist_keys.append("sticker_pack_json")
         if pikzels_render_failures:
             persist_keys.append("pikzels_render_failures")
+        if openai_render_failures:
+            persist_keys.append("openai_render_failures")
         if ctx.output_artifacts.get("thumbnail_error_code"):
             persist_keys.extend(["thumbnail_error_code", "thumbnail_queue_badge"])
         if ctx.output_artifacts.get("thumbnail_studio_similarity"):
@@ -1452,8 +1366,13 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         ctx.entitlements,
         require_auto_thumbnails=False,
     )
-    # Product policy: no OpenAI image-edit for thumbnails — Pikzels or PIL template only.
-    ai_edit_ok = False
+    # OpenAI image-edit fallback (policy reversed per Dynamic Content Identity
+    # plan): footage-anchored images.edit runs between Pikzels and the PIL
+    # template when the kill-switch env + tier entitlement allow it. Off means
+    # byte-identical legacy behavior.
+    from services.openai_thumbnail_edit import openai_thumbnail_edit_eligible
+
+    ai_edit_ok = openai_thumbnail_edit_eligible(us, ctx.entitlements)
 
     # Sample several frames; pick sharpest (no GPT vision).
     extraction_count = min(6, max(3, max_thumbnails))
@@ -1478,7 +1397,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         f"max_thumbnails={max_thumbnails}, extraction_count={extraction_count}, "
         f"category={category}, "
         f"pikzels_studio_pipeline={'on' if pikzels_studio_pipeline_on else 'off'}, "
-        f"openai_image_edit_for_thumbnails=False"
+        f"openai_image_edit_for_thumbnails={'on' if ai_edit_ok else 'off'}"
     )
     raw_offset = us.get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
     try:
@@ -1832,7 +1751,9 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             studio_render_report["skip_reason"] = "persona_not_linked"
             studio_render_report["pikzels_requested_but_skipped"] = True
             if _strict_studio_mode_enabled(us) or _persona_explicitly_required(us):
-                raise ThumbnailError(
+                # Skip styled Pikzels — keep frame-extract / non-persona path alive
+                # instead of failing the stage (Sentry UPLOADM8-8P).
+                raise SkipStage(
                     "Linked Pikzels persona required but not resolved. "
                     "Open Thumbnail Studio → Personas and Link to Pikzels, or turn off Apply persona."
                 )
@@ -1930,8 +1851,125 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         pikzels_render_failures: List[Dict[str, Any]] = []
         # One successful Pikzels JPEG per aspect (16:9 / 9:16) — reuse across platforms.
         pikzels_aspect_cache: Dict[str, Path] = {}
-        pikzels_credits_exhausted = False
+        # Auto-retry / reclaim must not re-bill Pikzels after a prior 402 on this
+        # upload or while the process-wide credits latch is armed.
+        prior_credits_out = bool(
+            pikzels_credits_blocked()
+            or artifacts_show_pikzels_credits_exhausted(
+                ctx.output_artifacts if isinstance(ctx.output_artifacts, dict) else {}
+            )
+        )
+        pikzels_credits_exhausted = prior_credits_out
+        if prior_credits_out:
+            studio_render_report["pikzels_credits_exhausted"] = True
+            studio_render_report["skip_reason"] = (
+                studio_render_report.get("skip_reason") or "pikzels_insufficient_credits"
+            )
+            studio_render_report["pikzels_requested_but_skipped"] = True
+            ctx.output_artifacts["pikzels_credits_exhausted"] = "1"
+            if "studio" in render_steps:
+                render_steps = [s for s in render_steps if s != "studio"]
+                studio_render_report["render_steps"] = list(render_steps)
+                logger.warning(
+                    "[%s] Skipping Pikzels studio — credits exhausted (prior job or latch)",
+                    ctx.upload_id,
+                )
         skip_studio_set = {str(p).strip().lower() for p in (skip_studio_platforms or [])}
+        # OpenAI image-edit fallback state: one raw edit per aspect, hard call cap.
+        # ``None`` marks a failed aspect so it is never retried within this job.
+        openai_render_failures: List[Dict[str, Any]] = []
+        openai_edit_aspect_cache: Dict[str, Optional[Path]] = {}
+        openai_edit_calls = 0
+
+        # Pre-render unique aspects once (youtube→16:9, one vertical→9:16) so IG/FB/TikTok
+        # never each open a billable Pikzels call.
+        if studio_ok and "studio" in render_steps and not pikzels_credits_exhausted:
+            leaders = unique_pikzels_aspect_leaders(
+                list(platforms_to_render),
+                skip_platforms=skip_studio_set,
+            )
+            studio_render_report["pikzels_aspect_leaders"] = dict(leaders)
+            for aspect_fmt, lead_plat in leaders.items():
+                if pikzels_credits_exhausted:
+                    break
+                cache_name = (
+                    f"thumb_pikzels_aspect_{aspect_fmt.replace(':', 'x')}_{ctx.upload_id}.jpg"
+                )
+                cache_path = Path(ctx.temp_dir) / cache_name
+                trace_append(
+                    ctx,
+                    "thumbnail_pikzels_aspect_leader",
+                    {"platform": lead_plat, "format": aspect_fmt},
+                )
+                lead_ok = await render_thumbnail_with_studio_renderer(
+                    best_path,
+                    brief,
+                    lead_plat,
+                    cache_path,
+                    upload_id=str(ctx.upload_id),
+                    category=category,
+                    persona=persona_api,
+                    options=studio_opts,
+                    job_context=ctx,
+                )
+                if lead_ok and cache_path.exists() and cache_path.stat().st_size >= MIN_THUMB_SIZE:
+                    pikzels_aspect_cache[aspect_fmt] = cache_path
+                    hp = _thumbnail_hydration_edit_prompt(brief or {})
+                    skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
+                    if hp and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
+                        he_ok = await refine_thumbnail_with_pikzels_edit(
+                            cache_path,
+                            hp,
+                            platform=lead_plat,
+                            upload_id=str(ctx.upload_id),
+                        )
+                        studio_render_report["hydration_pikzels_edit"][lead_plat] = bool(he_ok)
+                else:
+                    # Inspect last failure for credits so we stop further leaders.
+                    last_status: Any = "unknown"
+                    last_message = ""
+                    try:
+                        raw_trace = (
+                            ctx.output_artifacts.get("provider_error_trace")
+                            if isinstance(ctx.output_artifacts, dict)
+                            else None
+                        )
+                        if isinstance(raw_trace, str) and raw_trace.strip():
+                            import json as _json
+
+                            _arr = _json.loads(raw_trace)
+                            if isinstance(_arr, list) and _arr:
+                                _r = _arr[-1] if isinstance(_arr[-1], dict) else {}
+                                last_status = _r.get("http_status") or _r.get("status") or last_status
+                                last_message = str(_r.get("message") or "")[:500]
+                    except Exception:
+                        pass
+                    _reason = "http_error"
+                    try:
+                        if int(last_status) == 402:
+                            pikzels_credits_exhausted = True
+                            _reason = "insufficient_credits"
+                            studio_render_report["pikzels_credits_exhausted"] = True
+                            ctx.output_artifacts["pikzels_credits_exhausted"] = "1"
+                            mark_pikzels_credits_exhausted()
+                    except (TypeError, ValueError):
+                        pass
+                    pikzels_render_failures.append({
+                        "provider": "pikzels",
+                        "status": "failed",
+                        "reason": _reason,
+                        "fallback": "ai_edit" if ai_edit_ok else "template",
+                        "platform": lead_plat,
+                        "http_status": last_status,
+                        "message": (last_message or "pikzels_aspect_leader_failed")[:500],
+                    })
+                    logger.warning(
+                        "[thumb-renderer] Pikzels aspect leader failed format=%s platform=%s upload=%s",
+                        aspect_fmt,
+                        lead_plat,
+                        ctx.upload_id,
+                    )
+
         for platform in platforms_to_render:
             plat_l = str(platform or "").strip().lower()
             aspect_fmt = pikzels_format_for_platform(plat_l)
@@ -1951,7 +1989,6 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             out_path = ctx.temp_dir / out_name
             ok = False
             attempted_methods: List[str] = []
-            studio_attempted = False
             for step in render_steps:
                 if step == "sticker" and sticker_composite_enabled():
                     attempted_methods.append("sticker_composite")
@@ -1988,105 +2025,120 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                             studio_render_report.setdefault("aspect_reuse", {})[plat_l] = aspect_fmt
                     elif pikzels_credits_exhausted:
                         attempted_methods.append("studio_renderer_skipped_no_credits")
-                        pikzels_render_failures.append({
-                            "provider": "pikzels",
-                            "status": "failed",
-                            "reason": "insufficient_credits",
-                            "fallback": "template",
-                            "platform": platform,
-                            "http_status": 402,
-                            "message": "Skipped — Pikzels API credits exhausted earlier in this job",
-                        })
-                    else:
-                        attempted_methods.append("studio_renderer")
-                        studio_attempted = True
-                        trace_append(
-                            ctx,
-                            "thumbnail_pikzels_attempt",
-                            {"platform": platform, "format": aspect_fmt},
+                        # Do not append a second failure row for the same platform
+                        # (ops subject was "tiktok,tiktok" from leader fail + skip).
+                        already = any(
+                            isinstance(f, dict)
+                            and str(f.get("platform") or "").strip().lower() == plat_l
+                            and str(f.get("http_status") or "") == "402"
+                            for f in pikzels_render_failures
                         )
-                        ok = await render_thumbnail_with_studio_renderer(
-                            best_path,
-                            brief,
-                            platform,
-                            out_path,
-                            upload_id=str(ctx.upload_id),
-                            category=category,
-                            persona=persona_api,
-                            options=studio_opts,
-                            job_context=ctx,
-                        )
-                        if ok:
-                            render_method = "studio_renderer"
-                            pikzels_aspect_cache[aspect_fmt] = out_path
-                            hp = _thumbnail_hydration_edit_prompt(brief or {})
-                            skip_hydration_edit = bool((brief or {}).get("_uploadm8_dashcam_pov"))
-                            if hp and _hydration_pikzels_edit_enabled() and not skip_hydration_edit:
-                                he_ok = await refine_thumbnail_with_pikzels_edit(
-                                    out_path,
-                                    hp,
-                                    platform=platform,
-                                    upload_id=str(ctx.upload_id),
-                                )
-                                studio_render_report["hydration_pikzels_edit"][platform] = bool(
-                                    he_ok
-                                )
-                        else:
-                            logger.warning(
-                                "[thumb-renderer] Pikzels studio render failed for %s upload=%s — "
-                                "falling back to next render step (was: %s)",
-                                platform, ctx.upload_id, render_steps,
-                            )
-                            # Capture the last pikzels HTTP status from the provider-error trace so
-                            # the worker can emit a focused admin ops_incident. The trace lives in
-                            # ctx.output_artifacts["provider_error_trace"] as a JSON list.
-                            last_status: Any = "unknown"
-                            last_message = ""
-                            last_code = ""
-                            _r: Any = None
-                            try:
-                                raw_trace = ctx.output_artifacts.get("provider_error_trace") if isinstance(ctx.output_artifacts, dict) else None
-                                if isinstance(raw_trace, str) and raw_trace.strip():
-                                    _rows = json.loads(raw_trace)
-                                    if isinstance(_rows, list):
-                                        for _cand in reversed(_rows):
-                                            if isinstance(_cand, dict) and str(_cand.get("provider") or "").lower() == "pikzels":
-                                                _r = _cand
-                                                last_status = _cand.get("http_status", "unknown") or "unknown"
-                                                last_message = str(_cand.get("message") or "")[:240]
-                                                last_code = str(_cand.get("provider_code") or "").strip()
-                                                break
-                            except Exception:
-                                pass
-                            _snippet = ""
-                            try:
-                                _snippet = str(
-                                    (_r.get("response_body_snippet") if isinstance(_r, dict) else "") or ""
-                                )
-                            except Exception:
-                                _snippet = ""
-                            _combined = f"{last_message} {_snippet}".lower()
-                            _reason = last_code or (
-                                "prompt_too_long"
-                                if "prompt" in _combined and ("1200" in _combined or "1000" in _combined)
-                                else "pikzels_http_error"
-                            )
-                            if (
-                                str(last_status) == "402"
-                                or "insufficient_credits" in str(_reason).lower()
-                                or "insufficient_credits" in _combined
-                            ):
-                                pikzels_credits_exhausted = True
-                                _reason = "insufficient_credits"
-                                studio_render_report["pikzels_credits_exhausted"] = True
+                        if not already:
                             pikzels_render_failures.append({
                                 "provider": "pikzels",
                                 "status": "failed",
-                                "reason": _reason,
+                                "reason": "insufficient_credits",
+                                "fallback": "ai_edit" if ai_edit_ok else "template",
+                                "platform": platform,
+                                "http_status": 402,
+                                "message": "Skipped — Pikzels API credits exhausted earlier in this job",
+                            })
+                    else:
+                        # Cap / failed leaders: do not open another billable call per platform.
+                        attempted_methods.append("studio_renderer_skipped_no_aspect_cache")
+                        logger.warning(
+                            "[thumb-renderer] no aspect cache for %s (%s) upload=%s — "
+                            "skipping live Pikzels (%s fallback)",
+                            platform,
+                            aspect_fmt,
+                            ctx.upload_id,
+                            "ai_edit" if ai_edit_ok else "template",
+                        )
+                elif step == "ai_edit" and ai_edit_ok:
+                    from core.content_identity import get_content_identity
+                    from services.openai_thumbnail_edit import (
+                        MAX_EDIT_CALLS_PER_UPLOAD,
+                        build_openai_edit_prompt,
+                        finalize_platform_cover,
+                        generate_openai_edited_cover,
+                    )
+
+                    cached_raw = openai_edit_aspect_cache.get(aspect_fmt)
+                    if cached_raw is None and aspect_fmt in openai_edit_aspect_cache:
+                        # Prior live call for this aspect already failed — skip retry.
+                        attempted_methods.append("ai_edit_skipped_prior_fail")
+                        openai_render_failures.append({
+                            "provider": "openai",
+                            "status": "failed",
+                            "reason": "prior_aspect_fail",
+                            "fallback": "template",
+                            "platform": platform,
+                            "message": "Skipped — OpenAI edit already failed for this aspect",
+                        })
+                    elif isinstance(cached_raw, Path) and cached_raw.exists():
+                        attempted_methods.append("ai_edit_aspect_reuse")
+                        ok = finalize_platform_cover(cached_raw, platform, out_path)
+                        if ok:
+                            render_method = "ai_edit"
+                            studio_render_report.setdefault("openai_aspect_reuse", {})[plat_l] = aspect_fmt
+                    elif openai_edit_calls >= MAX_EDIT_CALLS_PER_UPLOAD:
+                        attempted_methods.append("ai_edit_skipped_call_cap")
+                        openai_render_failures.append({
+                            "provider": "openai",
+                            "status": "failed",
+                            "reason": "call_cap",
+                            "fallback": "template",
+                            "platform": platform,
+                            "message": f"Skipped — OpenAI edit call cap ({MAX_EDIT_CALLS_PER_UPLOAD}) reached",
+                        })
+                    else:
+                        attempted_methods.append("ai_edit")
+                        raw_name = (
+                            f"thumb_openai_aspect_{aspect_fmt.replace(':', 'x')}_{ctx.upload_id}.png"
+                        )
+                        raw_path = Path(ctx.temp_dir) / raw_name
+                        prompt = build_openai_edit_prompt(
+                            brief or {},
+                            get_content_identity(ctx),
+                            platform=platform,
+                        )
+                        openai_edit_calls += 1
+                        studio_render_report["openai_edit_calls"] = openai_edit_calls
+                        live_ok = await generate_openai_edited_cover(
+                            best_path,
+                            prompt,
+                            aspect_fmt,
+                            raw_path,
+                            upload_id=str(ctx.upload_id),
+                        )
+                        if live_ok and raw_path.exists():
+                            openai_edit_aspect_cache[aspect_fmt] = raw_path
+                            ok = finalize_platform_cover(raw_path, platform, out_path)
+                            if ok:
+                                render_method = "ai_edit"
+                                trace_append(
+                                    ctx,
+                                    "thumbnail_openai_edit",
+                                    {"platform": platform, "format": aspect_fmt},
+                                )
+                            else:
+                                openai_render_failures.append({
+                                    "provider": "openai",
+                                    "status": "failed",
+                                    "reason": "finalize_failed",
+                                    "fallback": "template",
+                                    "platform": platform,
+                                    "message": "OpenAI edit succeeded but platform finalize failed",
+                                })
+                        else:
+                            openai_edit_aspect_cache[aspect_fmt] = None
+                            openai_render_failures.append({
+                                "provider": "openai",
+                                "status": "failed",
+                                "reason": "http_or_empty",
                                 "fallback": "template",
                                 "platform": platform,
-                                "http_status": last_status,
-                                "message": (last_message or _snippet or "pikzels_http_error")[:500],
+                                "message": "OpenAI images.edit failed or returned empty image",
                             })
                 elif step == "template":
                     attempted_methods.append("template")
@@ -2131,6 +2183,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 render_method=render_method,
                 platform_map=platform_map,
                 pikzels_render_failures=pikzels_render_failures,
+                openai_render_failures=openai_render_failures,
             )
             raise ThumbnailError(
                 "Strict Pikzels mode enabled and Studio renderer did not produce a styled thumbnail"
@@ -2139,7 +2192,12 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         if (
             _engine_explicitly_requested(us)
             and render_method
-            not in ("studio_renderer", "studio_winner_cover_direct", "studio_winner_pin")
+            not in (
+                "studio_renderer",
+                "studio_winner_cover_direct",
+                "studio_winner_pin",
+                "ai_edit",
+            )
         ):
             studio_render_report["pikzels_requested_but_skipped"] = True
             if not studio_render_report.get("skip_reason"):
@@ -2164,22 +2222,43 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         except Exception:
             pass
 
-        # Fail loud when engine was requested but Pikzels fell through to template.
+        # Fail loud when engine was requested but Pikzels fell through.
+        # ai_edit counts as a styled success (policy reversal) — soft badge only.
+        # Credits exhaustion must NOT hard-raise: that requeues auto-retry and
+        # burns another billable attempt against an empty Pikzels balance.
         strict_raise: Optional[str] = None
+        credits_soft = bool(
+            pikzels_credits_exhausted
+            or studio_render_report.get("pikzels_credits_exhausted")
+            or _pikzels_failures_skip_reason(pikzels_render_failures)
+            == "pikzels_insufficient_credits"
+        )
         if pikzels_render_failures and _engine_explicitly_requested(us):
-            ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_FAILED_USED_TEMPLATE"
-            ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels failed — used template"
-            studio_render_report["fail_loud"] = True
-            studio_render_report["queue_badge"] = "Pikzels failed — used template"
+            if render_method == "ai_edit":
+                ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_FAILED_USED_AI_EDIT"
+                ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels failed — used AI edit"
+                studio_render_report["queue_badge"] = "Pikzels failed — used AI edit"
+                studio_render_report["fail_loud"] = False
+            else:
+                ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_FAILED_USED_TEMPLATE"
+                ctx.output_artifacts["thumbnail_queue_badge"] = (
+                    "Pikzels out of credits — used template"
+                    if credits_soft
+                    else "Pikzels failed — used template"
+                )
+                studio_render_report["fail_loud"] = not credits_soft
+                studio_render_report["queue_badge"] = ctx.output_artifacts[
+                    "thumbnail_queue_badge"
+                ]
+                if strict_studio and not credits_soft:
+                    strict_raise = (
+                        "Strict Pikzels mode: engine was requested but Pikzels failed "
+                        "for one or more platforms"
+                    )
             if not studio_render_report.get("skip_reason"):
                 studio_render_report["skip_reason"] = (
                     _pikzels_failures_skip_reason(pikzels_render_failures)
                     or "pikzels_http_error"
-                )
-            if strict_studio:
-                strict_raise = (
-                    "Strict Pikzels mode: engine was requested but Pikzels failed "
-                    "for one or more platforms"
                 )
         elif studio_render_report.get("pikzels_requested_but_skipped") and _engine_explicitly_requested(us):
             ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_SKIPPED_UNEXPECTED"
@@ -2194,6 +2273,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             render_method=render_method,
             platform_map=platform_map,
             pikzels_render_failures=pikzels_render_failures,
+            openai_render_failures=openai_render_failures,
         )
         if strict_raise:
             raise ThumbnailError(strict_raise)

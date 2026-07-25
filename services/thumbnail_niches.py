@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # (value, label) — single source for API + UI population
 THUMBNAIL_NICHE_OPTIONS: Tuple[Tuple[str, str], ...] = (
-    ("general", "General"),
+    ("general", "Auto (detected)"),
     ("gaming", "Gaming"),
     ("finance", "Finance"),
     ("education", "Education"),

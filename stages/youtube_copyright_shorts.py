@@ -87,16 +87,78 @@ def youtube_copyright_shorts_trim_applied(ctx: JobContext) -> bool:
     return bool(n and n.get("trim_applied"))
 
 
-async def _retrim_youtube_deliverable(ctx: JobContext, db_pool) -> bool:
+def _resolve_youtube_source_path(ctx: JobContext) -> Optional[Path]:
+    """
+    Locate a local YouTube (or fallback) MP4 for copyright trim.
+
+    Deduped transcode groups may omit a distinct youtube path briefly, or resume
+    may restore only ``processed_video_path`` / ``local_video_path``. Prefer the
+    youtube map entry, then ``get_video_for_platform``, then processed/local.
+    """
+    candidates: list[Path] = []
     pv = getattr(ctx, "platform_videos", None) or {}
-    yp = pv.get("youtube")
-    if not yp or not Path(yp).exists():
-        logger.warning("[%s] YouTube copyright trim: no youtube platform video path", ctx.upload_id)
+    if isinstance(pv, dict):
+        for key, val in pv.items():
+            if val is None:
+                continue
+            if str(key).strip().lower() == "youtube":
+                candidates.append(Path(val))
+        # Also accept common aliases if normalization ever left them.
+        for alias in ("youtube_shorts", "yt", "you_tube"):
+            if alias in pv and pv[alias] is not None:
+                candidates.append(Path(pv[alias]))
+    try:
+        via = ctx.get_video_for_platform("youtube")
+        if via is not None:
+            candidates.append(Path(via))
+    except Exception:
+        pass
+    for attr in ("processed_video_path", "local_video_path"):
+        lp = getattr(ctx, attr, None)
+        if lp is not None:
+            candidates.append(Path(lp))
+
+    seen: set[str] = set()
+    for cand in candidates:
+        try:
+            key = str(cand.resolve()) if cand.exists() else str(cand)
+        except OSError:
+            key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if cand.exists() and cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+async def _retrim_youtube_deliverable(ctx: JobContext, db_pool) -> bool:
+    yp = _resolve_youtube_source_path(ctx)
+    if not yp:
+        logger.warning(
+            "[%s] YouTube copyright trim: no local youtube/source video path "
+            "(platform_videos=%s processed=%s local=%s)",
+            ctx.upload_id,
+            list((getattr(ctx, "platform_videos", None) or {}).keys()),
+            bool(getattr(ctx, "processed_video_path", None)),
+            bool(getattr(ctx, "local_video_path", None)),
+        )
         return False
+    # Ensure the map points at the resolved source before rewrite (resume/fallback).
+    pv = getattr(ctx, "platform_videos", None)
+    if not isinstance(pv, dict):
+        ctx.platform_videos = {}
+        pv = ctx.platform_videos
+    pv["youtube"] = yp
+
     info = await get_video_info(Path(yp))
     if info.duration <= COPYRIGHT_SHORTS_MAX_SEC:
         return False
     if not ctx.temp_dir:
+        logger.warning("[%s] YouTube copyright trim: missing temp_dir", ctx.upload_id)
         return False
     out = Path(ctx.temp_dir) / "transcoded_youtube_copyright_shorts_trim.mp4"
     reframe = resolve_reframe_action(info, getattr(ctx, "reframe_mode", "auto") or "auto", "youtube")
@@ -110,6 +172,9 @@ async def _retrim_youtube_deliverable(ctx: JobContext, db_pool) -> bool:
         upload_id=str(ctx.upload_id) if ctx.upload_id else None,
         force_duration_trim_sec=COPYRIGHT_SHORTS_MAX_SEC,
     )
+    if not out.exists():
+        logger.warning("[%s] YouTube copyright trim: output missing after transcode", ctx.upload_id)
+        return False
     ctx.platform_videos["youtube"] = out
     new_info = await get_video_info(out)
     logger.info(
@@ -121,11 +186,42 @@ async def _retrim_youtube_deliverable(ctx: JobContext, db_pool) -> bool:
     return True
 
 
+async def _backfill_missing_duration(ctx: JobContext) -> None:
+    """Checkpoint resume can leave ``ctx.video_info`` empty — probe the local file.
+
+    The risk gate reads ``video_info.duration``; a missing duration silently
+    disables both the rights notice and the trim, so recover it from the
+    resolved YouTube/source deliverable when absent.
+    """
+    if _source_duration_sec(ctx) > 0:
+        return
+    yp = _resolve_youtube_source_path(ctx)
+    if not yp:
+        return
+    try:
+        info = await get_video_info(yp)
+    except Exception as e:
+        logger.warning("[%s] duration backfill probe failed: %s", ctx.upload_id, e)
+        return
+    if not info or not getattr(info, "duration", None):
+        return
+    vi = dict(getattr(ctx, "video_info", None) or {})
+    vi["duration"] = float(info.duration)
+    ctx.video_info = vi
+    logger.info(
+        "[%s] video_info.duration backfilled from %s: %.2fs",
+        ctx.upload_id,
+        yp.name,
+        float(info.duration),
+    )
+
+
 async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -> None:
     """
     Persist a user-visible notice on the upload row; optionally replace the YouTube
     deliverable with a ≤60s head when the user enabled ``youtubeShortsCopyrightTrim``.
     """
+    await _backfill_missing_duration(ctx)
     if not youtube_copyright_shorts_acr_risk(ctx):
         return
 
@@ -152,7 +248,7 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
         notice["message"] = (
             "UploadM8 detected recognized music (ACR) that may be copyright-protected. "
             f"YouTube often blocks Shorts **{int(COPYRIGHT_SHORTS_MAX_SEC)} seconds or longer** when that audio is claimed. "
-            "Because you enabled **Trim YouTube to 60s**, we are using only the first minute for your "
+            "Because you enabled **Trim YouTube to 60s**, we will use only the first minute for your "
             "**YouTube** upload so Shorts + this track can stay within that policy. Other platforms are unchanged."
         )
     else:
@@ -166,12 +262,23 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
 
     def _mark_trim_applied(out_dur: Optional[float] = None) -> None:
         notice["trim_applied"] = True
+        notice.pop("trim_error", None)
         if out_dur is not None:
             notice["youtube_output_duration_sec"] = out_dur
         notice["message"] = (
             "UploadM8 detected recognized music (ACR) and **trimmed the YouTube file to the first ~60 seconds** "
             "because you enabled **Trim YouTube to 60s** — this keeps Shorts-style delivery safer when a catalogue "
             "match is present. TikTok / Instagram / Facebook files were not shortened."
+        )
+
+    def _mark_trim_failed(reason: str) -> None:
+        notice["trim_applied"] = False
+        notice["trim_error"] = reason[:300]
+        notice["message"] = (
+            "UploadM8 detected recognized music (ACR) and your **Trim YouTube to 60s** setting is on, "
+            "but the YouTube file could not be shortened automatically "
+            f"({reason[:160]}). We are publishing the full-length YouTube copy as a standard watch-page video "
+            "(no #shorts). Other platforms are unchanged."
         )
 
     ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
@@ -216,13 +323,48 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
                     await merge_output_artifacts_patch(
                         db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice}
                     )
-                elif prior_trim_applied:
+                else:
+                    if prior_trim_applied:
+                        logger.warning(
+                            "[%s] YouTube copyright trim: prior trim_applied but deliverable not ≤%ss "
+                            "(duration=%s) — leaving trim_applied false",
+                            ctx.upload_id,
+                            int(COPYRIGHT_SHORTS_MAX_SEC),
+                            out_dur,
+                        )
+                    reason = (
+                        f"source still {out_dur:.1f}s and trim did not run"
+                        if out_dur is not None
+                        else "no local YouTube deliverable to trim"
+                    )
+                    _mark_trim_failed(reason)
+                    ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
+                    try:
+                        await merge_output_artifacts_patch(
+                            db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice}
+                        )
+                    except Exception as merge_e:
+                        logger.warning(
+                            "[%s] youtube_copyright_shorts trim-fail notice merge failed: %s",
+                            ctx.upload_id,
+                            merge_e,
+                        )
                     logger.warning(
-                        "[%s] YouTube copyright trim: prior trim_applied but deliverable not ≤%ss "
-                        "(duration=%s) — leaving trim_applied false",
+                        "[%s] YouTube copyright trim pref on but trim_applied=false reason=%s",
                         ctx.upload_id,
-                        int(COPYRIGHT_SHORTS_MAX_SEC),
-                        out_dur,
+                        reason,
                     )
         except Exception as e:
-            logger.warning("[%s] YouTube copyright trim failed (continuing with full-length YouTube file): %s", ctx.upload_id, e)
+            logger.warning(
+                "[%s] YouTube copyright trim failed (continuing with full-length YouTube file): %s",
+                ctx.upload_id,
+                e,
+            )
+            _mark_trim_failed(str(e) or type(e).__name__)
+            ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
+            try:
+                await merge_output_artifacts_patch(
+                    db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice}
+                )
+            except Exception:
+                pass

@@ -364,6 +364,10 @@ async def save_post_transcode_checkpoint(pool, ctx: JobContext) -> None:
         "transcode_r2": transcode_r2,
         "telemetry": telemetry_to_dict(ctx.telemetry_data or ctx.telemetry),
         "trill": trill_to_dict(ctx.trill_score or ctx.trill),
+        # video_info must survive resume: audio-stage gates and the YouTube
+        # copyright trim risk gate read ctx.video_info.duration; without it the
+        # trim silently never fires on post_transcode/post_audio resume.
+        "video_info": dict(ctx.video_info) if getattr(ctx, "video_info", None) else None,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
     await merge_output_artifacts_patch(pool, upload_id, {RESUME_KEY: resume})
@@ -664,6 +668,13 @@ async def try_resume_from_checkpoint(
     ctx.temp_dir = temp_dir
 
     restore_telemetry_from_dict(ctx, cp.get("telemetry"), cp.get("trill"))
+
+    _vi = cp.get("video_info") or {}
+    if isinstance(_vi, dict) and _vi:
+        try:
+            ctx.video_info = dict(_vi)
+        except Exception:
+            pass
 
     ctx.platform_videos.clear()
     by_r2: Dict[str, Path] = {}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any, Optional
 
@@ -44,6 +45,76 @@ def telemetry_r2_key_for_upload(user_id: str, upload_id: str, has_telemetry: boo
     if not has_telemetry:
         return None
     return f"uploads/{user_id}/{upload_id}/telemetry.map"
+
+
+def duplicate_upload_window_hours() -> float:
+    raw = (os.environ.get("DUPLICATE_UPLOAD_WINDOW_HOURS") or "").strip()
+    if not raw:
+        return 6.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 6.0
+
+
+def duplicate_upload_guard_enabled() -> bool:
+    raw = (os.environ.get("DUPLICATE_UPLOAD_GUARD") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+async def reject_recent_duplicate_source(conn, bill_id: str, data: Any) -> None:
+    """
+    Block re-submitting the same source file while a prior copy is still in
+    flight or recently posted — one accidental resubmit otherwise multiplies
+    the same video across every connected platform. ``allowDuplicate`` in the
+    presign body bypasses (intentional re-post).
+    """
+    if not duplicate_upload_guard_enabled():
+        return
+    if bool(getattr(data, "allow_duplicate", False)):
+        return
+    hours = duplicate_upload_window_hours()
+    if hours <= 0:
+        return
+    dup = await conn.fetchrow(
+        """
+        SELECT id::text AS id, status, created_at
+          FROM uploads
+         WHERE user_id = $1
+           AND filename = $2
+           AND file_size = $3
+           AND (
+                 status IN ('pending','staged','queued','processing','ready_to_publish')
+                 OR (
+                     status IN ('succeeded','partial','completed')
+                     AND COALESCE(completed_at, updated_at, created_at)
+                         > NOW() - ($4::float8 * INTERVAL '1 hour')
+                 )
+               )
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        bill_id,
+        data.filename,
+        data.file_size,
+        hours,
+    )
+    if not dup:
+        return
+    raise HTTPException(
+        409,
+        detail={
+            "code": "duplicate_upload",
+            "message": (
+                f"'{data.filename}' was already uploaded (status: {dup['status']}). "
+                "Posting it again would duplicate the same video on your connected "
+                "platforms. To post it again on purpose, retry with allowDuplicate."
+            ),
+            "existing_upload_id": dup["id"],
+            "existing_status": dup["status"],
+            "window_hours": hours,
+        },
+    )
 
 
 async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
@@ -146,6 +217,8 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
                 "ledger_url": "/settings.html#token-balances",
             },
         )
+
+    await reject_recent_duplicate_source(conn, bill_id, data)
 
     upload_id = str(uuid.uuid4())
     schedule_seed = (

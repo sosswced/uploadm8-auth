@@ -374,7 +374,56 @@ def _step_train_content(cfg: MLEngineConfig) -> Dict[str, Any]:
     out = _run_subprocess(cmd)
     out["cmd0"] = cmd[0]
     out["cmd_preview"] = " ".join(cmd[:4])
+    # Phase 5: rebuild per-cluster hero-fact class priors from the same dataset.
+    # Fail-soft — priors are optional ranking boosts, never a train gate.
+    try:
+        priors_out = _step_rebuild_hero_fact_priors(cfg)
+        out["hero_fact_priors"] = priors_out
+    except Exception as e:
+        out["hero_fact_priors"] = {"ok": False, "error": str(e)[:200]}
     return out
+
+
+def _step_rebuild_hero_fact_priors(cfg: MLEngineConfig) -> Dict[str, Any]:
+    """Aggregate content-success rows → data/ml/hero_fact_priors_v1.json."""
+    from core.hero_fact_priors import DEFAULT_PRIORS_PATH, rebuild_hero_fact_priors
+
+    path = Path(cfg.content_local_dataset_path)
+    if not path.exists():
+        return {"ok": False, "skipped": "dataset missing", "path": str(path)}
+    try:
+        import pandas as pd
+
+        df = pd.read_parquet(path)
+    except Exception as e:
+        return {"ok": False, "error": f"parquet read failed: {e}"[:200]}
+
+    needed = {"identity_domain_tag", "identity_headline_class", "identity_hero_fact_class"}
+    if not needed.intersection(set(df.columns)):
+        return {
+            "ok": True,
+            "skipped": "identity columns not yet in dataset (accumulate Phase 4 logs)",
+            "columns": list(df.columns)[:40],
+        }
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        rows.append({
+            "identity_domain_tag": r.get("identity_domain_tag"),
+            "identity_headline_class": r.get("identity_headline_class"),
+            "identity_hero_fact_class": r.get("identity_hero_fact_class"),
+            "is_hot": r.get("is_hot"),
+            "hotness_score": r.get("hotness_score"),
+            "views_per_day": r.get("views_per_day"),
+        })
+    payload = rebuild_hero_fact_priors(rows, out_path=DEFAULT_PRIORS_PATH)
+    return {
+        "ok": True,
+        "source": payload.get("source"),
+        "clusters": list((payload.get("clusters") or {}).keys()),
+        "path": str(DEFAULT_PRIORS_PATH),
+        "rows": len(rows),
+    }
 
 
 def _step_push_content_eval(cfg: MLEngineConfig, report: Dict[str, Any]) -> Dict[str, Any]:

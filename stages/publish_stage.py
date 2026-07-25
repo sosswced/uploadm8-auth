@@ -2336,14 +2336,56 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         ]
 
     from services.deferred_publish_schedule import publish_target_already_done
+    from services.upload.publish_ledger_reconcile import hydrate_ctx_from_accepted_ledger
 
     pending_targets = [
         (p, tid)
         for p, tid in publish_targets
         if not publish_target_already_done(ctx, p, tid)
     ]
+    # Critical: empty platform_results after crash still has accepted ledger rows.
+    # Skip those platforms so recovery / reclaim cannot double-post.
+    # Fail-closed: ledger load errors or hydrate failures abort fan-out when
+    # attempts may exist (LedgerLoadError) or when rows were already loaded.
+    if pending_targets and db_pool is not None:
+        from services.upload.publish_ledger_reconcile import (
+            LedgerLoadError,
+            load_publish_attempts_for_upload,
+        )
+
+        _ledger_rows: list = []
+        try:
+            _ledger_rows = await load_publish_attempts_for_upload(
+                db_pool, str(ctx.upload_id)
+            )
+            pending_targets = await hydrate_ctx_from_accepted_ledger(
+                ctx, db_pool, pending_targets
+            )
+        except LedgerLoadError as ledger_load_err:
+            logger.error(
+                "[%s] ledger load failed — aborting fan-out: %s",
+                ctx.upload_id,
+                ledger_load_err,
+            )
+            raise
+        except Exception as ledger_skip_err:
+            if _ledger_rows:
+                logger.error(
+                    "[%s] ledger hydrate failed with existing attempts — aborting fan-out: %s",
+                    ctx.upload_id,
+                    ledger_skip_err,
+                )
+                raise
+            logger.warning(
+                "[%s] ledger idempotent skip failed (continuing, no attempts): %s",
+                ctx.upload_id,
+                ledger_skip_err,
+            )
     if not pending_targets:
-        logger.info(f"[{ctx.upload_id}] Deferred publish: no pending targets in this batch")
+        logger.info(
+            f"[{ctx.upload_id}] Deferred publish: no pending targets in this batch "
+            f"(platform_results and/or accepted ledger)"
+        )
         return ctx
 
     logger.info(f"Publishing to {len(pending_targets)} target(s)")
@@ -2376,18 +2418,105 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                     f"using fallback: {video_file.name}"
                 )
 
+        # -- Heartbeat: long multi-platform fan-outs must not look stale --
+        # Stale recovery flags processing rows whose updated_at is older than
+        # STALE_PROCESSING_MINUTES; a 4-platform publish can exceed that and get
+        # re-dispatched mid-flight (duplicate posts). Refresh before each target.
+        try:
+            async with db_pool.acquire() as _hb_conn:
+                await _hb_conn.execute(
+                    "UPDATE uploads SET updated_at = NOW() WHERE id = $1::uuid AND status = 'processing'",
+                    str(ctx.upload_id),
+                )
+        except Exception as _hb_e:
+            logger.debug(f"[{ctx.upload_id}] publish heartbeat skipped: {_hb_e}")
+
         # -- Create ledger row (before API call) --
         attempt_id = None
+        skip_api = False
         try:
-            attempt_id = await db_stage.insert_publish_attempt(
+            attempt_id, skip_api = await db_stage.insert_publish_attempt(
                 db_pool,
                 upload_id=str(ctx.upload_id),
                 user_id=str(ctx.user_id),
                 platform=str(platform),
+                token_row_id=token_id,
             )
         except Exception as e:
-            logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
+            # Fail-closed: without a ledger claim we cannot rule out an open
+            # slot from another worker — skip this platform instead of risking
+            # a duplicate post. Recovery re-enters via the ledger later.
+            logger.warning(
+                f"{account_label}: Could not create publish_attempt row (fail-closed, skip): {e}"
+            )
             attempt_id = None
+            skip_api = True
+
+        if skip_api:
+            logger.info(
+                "[%s] %s: open ledger slot exists — skipping platform API (attempt=%s)",
+                ctx.upload_id,
+                account_label,
+                attempt_id,
+            )
+            # Assume the open slot is a fresh pending owned by another publisher;
+            # cleared below when it turns out to be accepted (result hydrated).
+            _inflight_skip = True
+            # Keep ctx.platform_results complete for finalize when the open slot
+            # is already accepted (race after hydrate or concurrent claim).
+            if attempt_id and db_pool is not None:
+                try:
+                    from services.upload.publish_ledger_reconcile import (
+                        attempt_row_to_platform_result,
+                        load_publish_attempts_for_upload,
+                    )
+
+                    _rows = await load_publish_attempts_for_upload(
+                        db_pool, str(ctx.upload_id)
+                    )
+                    _hit = next(
+                        (
+                            r
+                            for r in _rows
+                            if str(r.get("id") or "") == str(attempt_id)
+                            and str(r.get("status") or "").lower() == "accepted"
+                        ),
+                        None,
+                    )
+                    if _hit:
+                        _inflight_skip = False
+                        pr = attempt_row_to_platform_result(_hit)
+                        if token_id:
+                            pr["token_row_id"] = str(token_id)
+                        ctx.platform_results.append(
+                            PlatformResult(
+                                platform=str(pr.get("platform") or platform),
+                                success=True,
+                                platform_video_id=pr.get("platform_video_id"),
+                                platform_url=pr.get("platform_url"),
+                                publish_id=pr.get("publish_id"),
+                                token_row_id=pr.get("token_row_id") or token_id,
+                                attempt_id=pr.get("attempt_id") or attempt_id,
+                                http_status=pr.get("http_status"),
+                                verify_status=str(pr.get("verify_status") or "pending"),
+                            )
+                        )
+                except Exception as _skip_ctx_e:
+                    logger.warning(
+                        "[%s] %s: skip_api ctx hydrate failed: %s",
+                        ctx.upload_id,
+                        account_label,
+                        _skip_ctx_e,
+                    )
+            if _inflight_skip:
+                # Another publisher owns this slot (fresh pending / claim lost).
+                # The finalizer must not terminalize as failed on our empty batch.
+                setattr(
+                    ctx,
+                    "publish_inflight_skips",
+                    int(getattr(ctx, "publish_inflight_skips", 0) or 0) + 1,
+                )
+            continue
 
         # -- Load platform token (use target_accounts token when specified) --
         token_data = None

@@ -165,10 +165,18 @@ def pipeline_row_looks_active(
     status: Any,
     processing_stage: Any,
 ) -> bool:
-    """Stage-entered processing (independent of age / heartbeat)."""
+    """Stage-entered processing (independent of age / heartbeat).
+
+    ``slot_wait`` is pre-acquire UI only — not an owned pipeline stage.
+    """
     if str(status or "").strip().lower() != "processing":
         return False
-    return bool(str(processing_stage or "").strip())
+    stage = str(processing_stage or "").strip()
+    if not stage:
+        return False
+    if stage.lower() == "slot_wait":
+        return False
+    return True
 
 
 async def fetch_fleet_workers(db_pool) -> List[dict]:
@@ -186,7 +194,8 @@ async def fetch_fleet_workers(db_pool) -> List[dict]:
 async def reset_orphan_processing_to_queued(db_pool, upload_id: str) -> bool:
     """Flip unowned ``processing`` → ``queued`` so ``mark_processing_started`` can claim.
 
-    Keeps ``pipeline_resume`` / checkpoint artifacts intact.
+    Keeps ``pipeline_resume`` / checkpoint artifacts intact. Clears latch-only
+    stages (``claimed`` / ``slot_wait``) so skip/claim logic cannot re-deadlock.
     """
     if not db_pool or not upload_id:
         return False
@@ -196,6 +205,18 @@ async def reset_orphan_processing_to_queued(db_pool, upload_id: str) -> bool:
             UPDATE uploads
                SET status = 'queued',
                    processing_started_at = NULL,
+                   processing_stage = CASE
+                       WHEN LOWER(BTRIM(COALESCE(processing_stage, '')))
+                            IN ('claimed', 'slot_wait')
+                       THEN NULL
+                       ELSE processing_stage
+                   END,
+                   processing_progress = CASE
+                       WHEN LOWER(BTRIM(COALESCE(processing_stage, '')))
+                            IN ('claimed', 'slot_wait')
+                       THEN NULL
+                       ELSE processing_progress
+                   END,
                    error_code = NULL,
                    error_detail = NULL,
                    updated_at = NOW()
@@ -274,8 +295,19 @@ async def list_orphan_processing_upload_ids(
     return out
 
 
-def classify_orphan_reclaim(upload_row: Optional[dict]) -> str:
-    """Return ``publish`` | ``process`` for an orphan processing row."""
+def classify_orphan_reclaim(
+    upload_row: Optional[dict],
+    *,
+    has_accepted_ledger: bool = False,
+) -> str:
+    """Return ``ledger_complete`` | ``publish`` | ``process`` for an orphan row.
+
+    ``ledger_complete`` — Step A ``publish_attempts`` already accepted; reclaim
+    must terminalize from the ledger and **must not** re-enqueue publish
+    (double-post risk).
+    """
+    if has_accepted_ledger:
+        return "ledger_complete"
     if not upload_row:
         return "process"
     if has_publishable_processed_assets(upload_row.get("processed_assets")):

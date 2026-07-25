@@ -532,6 +532,8 @@ async def fetch_user_uploads_list(
         ]
     elif shell:
         # Dashboard/queue first paint: card fields without AI/pipeline blobs or avatar enrich.
+        # Include output_artifacts so youtubeCopyrightShorts (and slim UI artifacts) survive
+        # shell/bootstrap polls — omitting it nulls the notice and blinks the queue banner.
         wanted = [
             "id",
             "filename",
@@ -563,6 +565,7 @@ async def fetch_user_uploads_list(
             "target_accounts",
             "trill_score",
             "created_by_user_id",
+            "output_artifacts",
         ]
     else:
         wanted = [
@@ -802,6 +805,12 @@ def build_upload_detail_payload(d: dict) -> dict:
     caption = ai_caption if ai_caption and is_placeholder_upload_caption(raw_caption) else (raw_caption or ai_caption)
     hashtags = _normalize_hashtags_list(d.get("hashtags"))
     platform_results = _normalize_platform_results_detail(d.get("platform_results"))
+    try:
+        from services.uploads_api import dedupe_platform_result_entries
+
+        platform_results = dedupe_platform_result_entries(platform_results)
+    except Exception:
+        pass
 
     thumb_key = d.get("thumbnail_r2_key")
     sk = str(thumb_key).strip() if thumb_key else ""
@@ -1058,6 +1067,12 @@ async def poll_upload_thumbnails_payload(
         if not uid:
             continue
         platform_results = _normalize_platform_results_detail(d.get("platform_results"))
+        try:
+            from services.uploads_api import dedupe_platform_result_entries
+
+            platform_results = dedupe_platform_result_entries(platform_results)
+        except Exception:
+            pass
         upload_id_str = str(d.get("id") or "")
         thumb = card_thumbnail_url(
             upload_id_str,

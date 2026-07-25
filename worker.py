@@ -104,7 +104,12 @@ from typing import Optional, Dict, List, Tuple, Callable, Awaitable, Any
 import asyncpg
 import redis.asyncio as redis
 
-from core.helpers import coerce_jsonb_dict, coerce_jsonb_list, merge_platform_hashtag_overlay
+from core.helpers import (
+    _init_asyncpg_codecs,
+    coerce_jsonb_dict,
+    coerce_jsonb_list,
+    merge_platform_hashtag_overlay,
+)
 from stages.errors import StageError, SkipStage, CancelRequested
 from stages.context import (
     JobContext,
@@ -650,6 +655,8 @@ async def check_cancelled(ctx: JobContext) -> bool:
 
 
 STAGE_PROGRESS = {
+    "slot_wait":  2,
+    "claimed":    3,
     "init":       5,
     "download":   10,
     "telemetry":  18,
@@ -1438,6 +1445,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             # ============================================================
             # STAGE 5: Transcode (deduplicated)
             # ============================================================
+            # Write stage BEFORE long FFmpeg so UI does not sit on claimed/watermark
+            # for the entire encode (resume from post_telemetry hits this path cold).
+            await maybe_cancel(ctx, "transcode")
             try:
                 ctx = await asyncio.wait_for(_run_deduplicated_transcode(ctx), timeout=STAGE_TIMEOUT_TRANSCODE)
             except asyncio.TimeoutError:
@@ -1454,7 +1464,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 source = ctx.processed_video_path or ctx.local_video_path
                 for p in (ctx.platforms or []):
                     ctx.platform_videos[p] = source
-            await maybe_cancel(ctx, "transcode")
         else:
             try:
                 await db_stage.save_trill_metadata(db_pool, ctx)
@@ -1847,6 +1856,24 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.debug(f"[{upload_id}] OSD Trill metadata persist skipped: {e}")
         await maybe_cancel(ctx, "dashcam_osd")
 
+        # ── Speed consensus (canonical publishable peak) ─────────────────────
+        # One artifact every downstream consumer (M8 prompt, hydration
+        # enforcer, hashtags, overlays) reads instead of raw tel/OSD fields.
+        try:
+            from core.speed_consensus import SPEED_CONSENSUS_ARTIFACT, build_speed_consensus
+
+            _speed_consensus = build_speed_consensus(ctx)
+            if isinstance(ctx.output_artifacts, dict):
+                ctx.output_artifacts[SPEED_CONSENSUS_ARTIFACT] = _speed_consensus
+            await _persist_diag_artifacts_now(SPEED_CONSENSUS_ARTIFACT)
+            logger.info(
+                f"[{upload_id}] speed consensus: peak={_speed_consensus.get('peak_mph')} MPH "
+                f"source={_speed_consensus.get('source')} confidence={_speed_consensus.get('confidence')} "
+                f"outliers={_speed_consensus.get('outliers')}"
+            )
+        except Exception as _spc_e:
+            logger.debug(f"[{upload_id}] speed consensus build skipped: {_spc_e}")
+
         # ── Scene-story + timeline fusion ───────────────────────────────────
         # Build the ordered VI+Vision+OSD+telemetry+audio timeline AFTER the
         # dashcam OSD stage so OSD backfill is incorporated. Persist into
@@ -1861,7 +1888,36 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 if not isinstance(ev, dict):
                     continue
                 kind = str(ev.get("kind") or "").lower()
-                if kind in ("shot", "segment", "scene", "vi_label", "vision", "osd", "speech", "music"):
+                if kind in (
+                    "shot",
+                    "segment",
+                    "scene",
+                    "vi_label",
+                    "vision",
+                    "vision_frame",
+                    "vision_label",
+                    "vision_ocr",
+                    "object",
+                    "logo",
+                    "osd",
+                    "osd_start",
+                    "osd_end",
+                    "osd_speed",
+                    "osd_speed_beat",
+                    "osd_gps",
+                    "telemetry_speed",
+                    "geo_place",
+                    "geo_road",
+                    "geo_start",
+                    "welcome_sign",
+                    "speech",
+                    "transcript",
+                    "music",
+                    "yamnet",
+                    "ambient_sound",
+                    "on_screen_text",
+                    "landmark",
+                ):
                     _shot_list.append({
                         "t_seconds": ev.get("t_seconds"),
                         "kind": kind,
@@ -1880,6 +1936,94 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             )
         except Exception as _scts_e:
             logger.debug(f"[{upload_id}] scene_story/timeline build skipped: {_scts_e}")
+
+        # 24/7 scene understanding floor: when Twelve Labs skipped/failed, fuse
+        # VI + Vision OCR + OSD + ACR + Whisper into video_understanding.
+        try:
+            from services.scene_fusion import apply_scene_fusion
+
+            _fusion = apply_scene_fusion(ctx)
+            if _fusion and not _fusion.get("skipped"):
+                _ai_trace(ctx, upload_id, "scene_fusion", {
+                    "status": "ok",
+                    "source": "fusion",
+                    "scene_chars": len(str((_fusion.get("scene_description") or ""))),
+                    "place_signs": list(_fusion.get("place_signs") or []),
+                    "providers": _fusion.get("providers") or {},
+                })
+                await _persist_diag_artifacts_now("scene_fusion")
+            else:
+                _ai_trace(ctx, upload_id, "scene_fusion", {
+                    "status": "skipped",
+                    "reason": (_fusion or {}).get("reason"),
+                    "source": (_fusion or {}).get("source"),
+                })
+        except Exception as _fuse_e:
+            logger.debug(f"[{upload_id}] scene_fusion skipped: {_fuse_e}")
+
+        # ── Content identity consensus (what IS this footage?) ──────────────
+        # One artifact (content_identity_v1) thumbnails, captions, and hashtags
+        # all read instead of keyword-scanning raw contexts. Deterministic
+        # cross-provider fusion always succeeds; the LLM resolution layer is
+        # strictly fail-soft (timeout / quota / parse errors keep the
+        # deterministic identity).
+        try:
+            from core.content_identity import (
+                CONTENT_IDENTITY_ARTIFACT,
+                build_content_identity,
+                build_identity_evidence,
+                merge_llm_identity,
+            )
+            from core.speed_consensus import get_speed_consensus
+
+            _id_evidence = build_identity_evidence(ctx)
+            _identity = build_content_identity(ctx, evidence=_id_evidence)
+            try:
+                from services.content_identity_llm import (
+                    IDENTITY_TIMEOUT_SEC,
+                    resolve_content_identity,
+                )
+
+                _id_llm = await asyncio.wait_for(
+                    resolve_content_identity(
+                        _id_evidence,
+                        get_speed_consensus(ctx),
+                        upload_id=str(upload_id),
+                    ),
+                    timeout=IDENTITY_TIMEOUT_SEC + 5.0,
+                )
+                if _id_llm:
+                    _identity = merge_llm_identity(
+                        _identity,
+                        _id_llm,
+                        evidence=_id_evidence,
+                        speed_consensus=get_speed_consensus(ctx),
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(f"[{upload_id}] content identity LLM timed out — deterministic identity kept")
+            except Exception as _cid_llm_e:
+                logger.warning(f"[{upload_id}] content identity LLM skipped (non-fatal): {_cid_llm_e}")
+            if isinstance(ctx.output_artifacts, dict):
+                ctx.output_artifacts[CONTENT_IDENTITY_ARTIFACT] = _identity
+            await _persist_diag_artifacts_now(CONTENT_IDENTITY_ARTIFACT)
+            _ai_trace(ctx, upload_id, "content_identity", {
+                "status": "ok",
+                "resolver": _identity.get("resolver"),
+                "subject": str(_identity.get("subject") or "")[:140],
+                "domain_tags": _identity.get("domain_tags") or [],
+                "hero_fact_count": len(_identity.get("hero_facts") or []),
+                "confidence": _identity.get("confidence"),
+                "novel_content": bool(_identity.get("novel_content")),
+            })
+            logger.info(
+                f"[{upload_id}] content identity: subject={str(_identity.get('subject') or '')[:80]!r} "
+                f"tags={[t.get('tag') for t in (_identity.get('domain_tags') or []) if isinstance(t, dict)]} "
+                f"facts={len(_identity.get('hero_facts') or [])} "
+                f"confidence={_identity.get('confidence')} resolver={_identity.get('resolver')}"
+            )
+        except Exception as _cid_e:
+            logger.warning(f"[{upload_id}] content identity build skipped (non-fatal): {_cid_e}")
+            _ai_trace(ctx, upload_id, "content_identity", {"status": "skipped", "reason": str(_cid_e)[:200]})
 
         # Canonical hydration snapshot (thumb + caption + `output_artifacts`).
         try:
@@ -2716,6 +2860,14 @@ async def run_publish_and_notify(
             pass
         return False
 
+    # Immediate + deferred share this path — heartbeat so poll leaves ~87% upload.
+    try:
+        await maybe_cancel(ctx, "publish")
+    except CancelRequested:
+        raise
+    except Exception as _pub_hb:
+        logger.debug("[%s] publish progress heartbeat skipped: %s", upload_id, _pub_hb)
+
     try:
         ctx = await asyncio.wait_for(
             run_publish_stage(ctx, db_pool), timeout=STAGE_TIMEOUT_PUBLISH
@@ -2761,11 +2913,23 @@ async def run_publish_and_notify(
         )
         return True
 
-    try:
-        await run_notify_stage(ctx, db_pool)
-    except Exception as e:
-        logger.warning(f"[{upload_id}] Notify error: {e}")
+    # Stand down instead of terminalizing when every target was skipped because
+    # another publisher holds fresh pending ledger slots: our batch produced no
+    # results, but the publish is in flight elsewhere. Marking failed here would
+    # contradict the owning worker (and stale recovery arbitrates via ledger).
+    _inflight_skips = int(getattr(ctx, "publish_inflight_skips", 0) or 0)
+    if _inflight_skips and not ctx.platform_results and not getattr(ctx, "error_code", None):
+        logger.warning(
+            "[%s] publish stand-down: %s target(s) owned by another publisher "
+            "(fresh pending ledger slots) and no local results — leaving status "
+            "for the owning worker / stale recovery",
+            upload_id,
+            _inflight_skips,
+        )
+        return True
 
+    # Decide terminal state + write DB status BEFORE Discord/preview notify.
+    # run_notify_stage can hang on R2 preview copy; status must not stay processing.
     ctx.finished_at = _now_utc()
     if ctx.is_partial_success():
         ctx.state = "partial"
@@ -2824,7 +2988,72 @@ async def run_publish_and_notify(
     except Exception:
         pass
 
-    await db_stage.mark_processing_completed(db_pool, ctx)
+    try:
+        _complete_mode = await db_stage.mark_processing_completed(db_pool, ctx)
+        if _complete_mode == "degraded":
+            logger.warning(
+                "[%s] mark_processing_completed used degraded (status-first) path",
+                upload_id,
+            )
+    except Exception as complete_err:
+        # Platforms may already have accepted the publish — never abort before
+        # wallet capture / terminal notify / funnel (returning early left silent
+        # stuck processing + skipped billing).
+        logger.exception(
+            "[%s] mark_processing_completed failed after publish: %s",
+            upload_id,
+            complete_err,
+        )
+        try:
+            await db_stage.mark_processing_completed(db_pool, ctx)
+        except Exception as retry_err:
+            if ctx.is_success() or ctx.is_partial_success():
+                logger.error(
+                    "[%s] CRITICAL: publish OK but completion DB write failed twice: %s "
+                    "— attempting ledger reconcile then wallet/notify finalize",
+                    upload_id,
+                    retry_err,
+                )
+                try:
+                    from services.upload.publish_ledger_reconcile import (
+                        reconcile_stuck_processing_from_ledger,
+                    )
+
+                    _rec = await reconcile_stuck_processing_from_ledger(
+                        db_pool,
+                        str(upload_id),
+                        user_id=str(user_id),
+                        force=True,
+                    )
+                    logger.warning(
+                        "[%s] post-complete ledger reconcile: ok=%s reason=%s state=%s",
+                        upload_id,
+                        _rec.get("ok"),
+                        _rec.get("reason"),
+                        _rec.get("state"),
+                    )
+                except Exception as _rec_e:
+                    logger.error(
+                        "[%s] ledger reconcile after complete failure: %s",
+                        upload_id,
+                        _rec_e,
+                    )
+                try:
+                    await notify_admin_error(
+                        "publish_ok_db_incomplete",
+                        {
+                            "upload_id": upload_id,
+                            "user_id": str(user_id),
+                            "error": str(retry_err),
+                            "state": str(getattr(ctx, "state", "") or ""),
+                            "ok_platforms": list(ctx.get_success_platforms() or []),
+                        },
+                        db_pool,
+                    )
+                except Exception:
+                    pass
+            else:
+                raise
 
     # ── Post-publish Trill persistence check ────────────────────────────
     # Trill metadata may be saved during telemetry and dashcam OSD stages
@@ -2916,6 +3145,19 @@ async def run_publish_and_notify(
     except Exception as wallet_err:
         # Never let wallet accounting crash the job finalization
         logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
+
+    # Discord / preview notify AFTER status + wallet — never gate completion.
+    try:
+        await maybe_cancel(ctx, "notify")
+    except CancelRequested:
+        # Already terminalized above — still attempt notify, ignore cancel for notify.
+        pass
+    except Exception as _nt_hb:
+        logger.debug("[%s] notify progress heartbeat skipped: %s", upload_id, _nt_hb)
+    try:
+        await run_notify_stage(ctx, db_pool)
+    except Exception as e:
+        logger.warning(f"[{upload_id}] Notify error: {e}")
 
     # ── Unified upload comms (user when enabled, admin always for partial/failed) ─
     scene_story = ""
@@ -3053,6 +3295,13 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 
         hydrate_platform_results_into_ctx(ctx, upload_record.get("platform_results"))
         ctx.deferred_publish_platform_filter = set(due_platforms)
+        # Heartbeat so poll UI leaves 0% during R2 download + TikTok chunk upload.
+        try:
+            await maybe_cancel(ctx, "publish")
+        except CancelRequested:
+            raise
+        except Exception:
+            pass
         logger.info(
             f"[{upload_id}] Deferred publish batch platforms={sorted(due_platforms)}"
         )
@@ -3200,6 +3449,162 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 
     except Exception as e:
         logger.exception(f"[{upload_id}] Deferred publish failed: {e}")
+        # If platforms already accepted (ctx and/or publish_attempts ledger),
+        # reconcile to succeeded/partial — never mark_processing_failed / user
+        # failure email (false-failure class: jsonb bind "expected str, got list").
+        ledger_recovered = False
+        try:
+            from services.upload.publish_ledger_reconcile import (
+                recover_deferred_publish_false_failure,
+            )
+
+            _ledger_rec = await recover_deferred_publish_false_failure(
+                db_pool,
+                str(upload_id),
+                user_id=str(user_id) if user_id else None,
+                ctx=ctx,
+            )
+            ledger_recovered = bool(_ledger_rec.get("recovered"))
+            if ledger_recovered and ctx is not None and _ledger_rec.get("state"):
+                ctx.state = str(_ledger_rec["state"])
+            if _ledger_rec.get("hydrated"):
+                logger.warning(
+                    "[%s] Deferred publish hydrated platform_results from ledger "
+                    "after post-publish error",
+                    upload_id,
+                )
+        except Exception as _ledger_e:
+            logger.error(
+                "[%s] Deferred publish ledger false-failure recovery failed: %s",
+                upload_id,
+                _ledger_e,
+            )
+
+        if ctx and (ctx.is_success() or ctx.is_partial_success()):
+            ctx.state = "partial" if ctx.is_partial_success() else "succeeded"
+            ctx.finished_at = _now_utc()
+            reconcile_ok = False
+            try:
+                await db_stage.mark_processing_completed(db_pool, ctx)
+                reconcile_ok = True
+            except Exception as reconcile_err:
+                logger.exception(
+                    "[%s] Deferred publish reconcile write failed: %s",
+                    upload_id,
+                    reconcile_err,
+                )
+                try:
+                    await db_stage.mark_processing_completed(db_pool, ctx)
+                    reconcile_ok = True
+                except Exception as reconcile_err2:
+                    logger.error(
+                        "[%s] Deferred publish reconcile exhausted: %s",
+                        upload_id,
+                        reconcile_err2,
+                    )
+            if not reconcile_ok and ledger_recovered:
+                reconcile_ok = True
+            logger.warning(
+                "[%s] Deferred publish reconciled to %s after post-publish error "
+                "(db_ok=%s ledger=%s): %s",
+                upload_id,
+                ctx.state,
+                reconcile_ok,
+                ledger_recovered,
+                e,
+            )
+            try:
+                await notify_admin_error(
+                    "deferred_publish_reconcile",
+                    {
+                        "upload_id": upload_id,
+                        "user_id": str(user_id),
+                        "state": ctx.state,
+                        "db_ok": reconcile_ok,
+                        "error": str(e),
+                        "ok_platforms": list(ctx.get_success_platforms() or []),
+                    },
+                    db_pool,
+                )
+            except Exception:
+                pass
+            # Best-effort wallet + user success/partial notify (never "failed").
+            try:
+                put_cost, aic_cost = await _get_upload_costs(upload_id)
+                uid_str = str(user_id)
+                if put_cost > 0 or aic_cost > 0:
+                    if ctx.is_success():
+                        await _capture_tokens(upload_id, uid_str, put_cost, aic_cost)
+                    elif ctx.is_partial_success():
+                        await _capture_tokens(upload_id, uid_str, put_cost, aic_cost)
+                        async with db_pool.acquire() as _wconn:
+                            await partial_refund_tokens(
+                                _wconn,
+                                user_id=uid_str,
+                                upload_id=upload_id,
+                                succeeded_platforms=ctx.get_success_platforms(),
+                                failed_platforms=ctx.get_failed_platforms(),
+                                original_put_cost=put_cost,
+                            )
+            except Exception as wallet_err:
+                logger.error(
+                    "[%s] Deferred reconcile wallet finalize failed (non-fatal): %s",
+                    upload_id,
+                    wallet_err,
+                )
+            try:
+                _scene_dp = ""
+                if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                    _scene_dp = str(ctx.output_artifacts.get("scene_story") or "")
+                await notify_upload_terminal(
+                    db_pool,
+                    ctx,
+                    str(upload_id),
+                    status=str(ctx.state),
+                    scene_story=_scene_dp,
+                )
+            except Exception as _cce:
+                logger.warning(
+                    "[%s] deferred-publish reconcile notify failed: %s", upload_id, _cce
+                )
+            try:
+                from services.upload_funnel import emit_funnel_terminal_if_needed
+
+                emit_funnel_terminal_if_needed(str(upload_id), ctx)
+            except Exception:
+                pass
+            if ctx.is_success():
+                try:
+                    await db_stage.increment_upload_count(db_pool, user_id)
+                except Exception:
+                    pass
+            return True
+
+        # Ledger accepted but ctx had no local PlatformResult rows (stale worker /
+        # crashed before append). DB already terminalized — do not page upload_failed.
+        if ledger_recovered:
+            logger.warning(
+                "[%s] Deferred publish ledger-only recover after post-publish error: %s",
+                upload_id,
+                e,
+            )
+            try:
+                await notify_admin_error(
+                    "deferred_publish_reconcile",
+                    {
+                        "upload_id": upload_id,
+                        "user_id": str(user_id),
+                        "state": "succeeded",
+                        "db_ok": True,
+                        "ledger_only": True,
+                        "error": str(e),
+                    },
+                    db_pool,
+                )
+            except Exception:
+                pass
+            return True
+
         if ctx:
             err_code, err_detail = _pipeline_failure_code_and_detail(e)
             ctx.mark_error(err_code, err_detail)
@@ -3880,6 +4285,28 @@ async def run_scheduler_loop() -> None:
     logger.info("Scheduler loop stopped")
 
 
+# Stages that only mean "waiting for admission" — not an owned pipeline.
+# Writing these must NOT block stream reclaim / duplicate-job skip.
+_PRE_PIPELINE_WAIT_STAGES = frozenset({"slot_wait"})
+# Claim is a brief latch before the first real stage; do not treat it like FFmpeg.
+_CLAIMED_ACTIVE_STALE_SECONDS_DEFAULT = 120
+
+
+def _claimed_active_stale_seconds() -> int:
+    try:
+        raw = (os.environ.get("CLAIMED_ACTIVE_STALE_SEC") or "").strip()
+        if raw:
+            return max(30, int(raw))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from services.upload.orphan_processing import orphan_processing_grace_seconds
+
+        return max(30, int(orphan_processing_grace_seconds()))
+    except Exception:
+        return _CLAIMED_ACTIVE_STALE_SECONDS_DEFAULT
+
+
 def upload_row_indicates_active_pipeline(
     *,
     status: Any,
@@ -3893,35 +4320,53 @@ def upload_row_indicates_active_pipeline(
     ``status='processing'`` alone is NOT enough — ``/complete`` and enqueue set
     that before the consumer runs. Skipping on status deadlocks the job
     (stage stays null forever). ``claimed`` (set by mark_processing_started)
-    counts as active until a real stage overwrites it.
+    counts as active only briefly — a dead worker after claim must not block
+    reclaim for the full FFmpeg stale window.
+
+    ``slot_wait`` is NOT active — it is written *before* the user process slot
+    is acquired so the UI can show waiting; treating it as active blocked reclaim.
     """
     if str(status or "").strip().lower() != "processing":
         return False
     stage = str(processing_stage or "").strip()
     if not stage:
         return False
-    if stale_after_minutes is None:
-        try:
-            from services.worker_admission import active_pipeline_stale_minutes
-
-            stale_after_minutes = active_pipeline_stale_minutes()
-        except Exception:
-            stale_after_minutes = 90
-    if updated_at is not None and stale_after_minutes > 0:
+    if stage.lower() in _PRE_PIPELINE_WAIT_STAGES:
+        return False
+    if updated_at is not None:
         try:
             from datetime import datetime, timedelta, timezone
 
             ts = updated_at
             if getattr(ts, "tzinfo", None) is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - ts > timedelta(minutes=int(stale_after_minutes)):
-                return False
+            age = datetime.now(timezone.utc) - ts
+            if stage.lower() == "claimed":
+                if age > timedelta(seconds=int(_claimed_active_stale_seconds())):
+                    return False
+            else:
+                if stale_after_minutes is None:
+                    try:
+                        from services.worker_admission import active_pipeline_stale_minutes
+
+                        stale_after_minutes = active_pipeline_stale_minutes()
+                    except Exception:
+                        stale_after_minutes = 90
+                if stale_after_minutes > 0 and age > timedelta(
+                    minutes=int(stale_after_minutes)
+                ):
+                    return False
         except Exception:
             pass
     return True
 
 
 async def _upload_already_processing(upload_id: str) -> bool:
+    """True only when a live/stale worker owns this upload, or age latch says in-flight.
+
+    Heartbeat ownership is authoritative: orphan ``claimed`` / mid-pipeline rows
+    must NOT block Redis consumers (skip+xack was permanently losing jobs).
+    """
     if not upload_id or db_pool is None:
         return False
     try:
@@ -3936,6 +4381,24 @@ async def _upload_already_processing(upload_id: str) -> bool:
             )
         if not row:
             return False
+        from services.upload.orphan_processing import (
+            fetch_fleet_workers,
+            owning_worker_id,
+            pipeline_row_looks_active,
+        )
+
+        if not pipeline_row_looks_active(
+            status=row["status"],
+            processing_stage=row["processing_stage"],
+        ):
+            return False
+        try:
+            workers = await fetch_fleet_workers(db_pool)
+        except Exception:
+            workers = []
+        if owning_worker_id(str(upload_id), workers, include_stale=True):
+            return True
+        # Unowned: age latch only (short for claimed, long for real stages).
         return upload_row_indicates_active_pipeline(
             status=row["status"],
             processing_stage=row["processing_stage"],
@@ -3943,6 +4406,28 @@ async def _upload_already_processing(upload_id: str) -> bool:
         )
     except Exception:
         return False
+
+
+async def _clear_slot_wait_stage(upload_id: str) -> None:
+    """Drop pre-acquire slot_wait markers so reclaim / requeue can proceed."""
+    if not upload_id or db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET processing_stage = NULL,
+                    processing_progress = NULL,
+                    updated_at = NOW()
+                WHERE id = $1::uuid
+                  AND status = 'processing'
+                  AND LOWER(COALESCE(processing_stage, '')) = 'slot_wait'
+                """,
+                upload_id,
+            )
+    except Exception as e:
+        logger.debug("[%s] clear slot_wait stage skipped: %s", upload_id, e)
 
 
 async def _run_job_with_semaphore(job_data: dict) -> None:
@@ -3965,6 +4450,16 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
 
     slot_held = False
     try:
+        if upload_id and db_pool is not None and uid:
+            try:
+                await db_stage.update_stage_progress(
+                    db_pool,
+                    upload_id,
+                    "slot_wait",
+                    STAGE_PROGRESS["slot_wait"],
+                )
+            except Exception:
+                pass
         if uid and not await user_process_wait_acquire(
             redis_client,
             uid,
@@ -3975,6 +4470,7 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
                 (lambda: _upload_already_processing(upload_id)) if upload_id else None
             ),
         ):
+            await _clear_slot_wait_stage(upload_id)
             logger.warning(
                 "[%s] scheduler job skipped — user process slot unavailable; reverting queued → staged",
                 upload_id or "?",
@@ -4042,11 +4538,20 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
     Uses _publish_semaphore (PUBLISH_CONCURRENCY=5 slots by default).
     This NEVER blocks on FFmpeg transcode slots — separate lane entirely.
     """
-    async with _publish_semaphore:
-        try:
-            await run_deferred_publish(upload_id, user_id)
-        except Exception as e:
-            logger.exception(f"[{upload_id}] Unhandled deferred publish error: {e}")
+    from services.worker_runtime_state import track_publish_end, track_publish_start
+
+    # Own the job in heartbeats BEFORE the semaphore wait — otherwise orphan
+    # recovery on another worker sees the row unowned during a long wait and
+    # dispatches a second publisher for the same upload.
+    await track_publish_start(str(upload_id), stage="publish_wait")
+    try:
+        async with _publish_semaphore:
+            try:
+                await run_deferred_publish(upload_id, user_id)
+            except Exception as e:
+                logger.exception(f"[{upload_id}] Unhandled deferred publish error: {e}")
+    finally:
+        await track_publish_end(str(upload_id))
 
 
 def _ensure_worker_semaphores() -> None:
@@ -4242,11 +4747,96 @@ async def _publish_one_job(job_json: str) -> None:
     if not upload_id or not user_id:
         logger.error("Publish job missing upload_id or user_id")
         return
-    async with _publish_semaphore:
-        try:
-            await run_deferred_publish(str(upload_id), str(user_id))
-        except Exception as e:
-            logger.exception(f"[{upload_id}] publish lane job error: {e}")
+    # Skip reclaim/duplicate lane jobs once the upload is already terminal or
+    # fully covered by accepted ledger (publish_stage also idempotent-skips).
+    try:
+        if db_pool:
+            async with db_pool.acquire() as _pconn:
+                _st = await _pconn.fetchval(
+                    "SELECT status FROM uploads WHERE id = $1::uuid",
+                    str(upload_id),
+                )
+            _st_l = str(_st or "").strip().lower()
+            if _st_l in ("succeeded", "partial", "completed", "cancelled", "failed"):
+                logger.info(
+                    "[%s] publish lane skipped — already terminal (%s)",
+                    upload_id,
+                    _st_l,
+                )
+                return
+            from services.upload.publish_ledger_reconcile import (
+                load_publish_attempts_for_upload,
+                reconcile_stuck_processing_from_ledger,
+                ledger_covers_expected_slots,
+                resolve_live_target_token_ids,
+            )
+
+            _ur = await db_stage.load_upload_record(db_pool, str(upload_id))
+            _attempts = await load_publish_attempts_for_upload(db_pool, str(upload_id))
+            _live = await resolve_live_target_token_ids(db_pool, _ur)
+            if ledger_covers_expected_slots(_attempts, _ur, live_token_ids=_live):
+                _rec = await reconcile_stuck_processing_from_ledger(
+                    db_pool, str(upload_id), user_id=str(user_id)
+                )
+                if _rec.get("ok"):
+                    logger.info(
+                        "[%s] publish lane skipped — ledger complete (%s)",
+                        upload_id,
+                        _rec.get("reason"),
+                    )
+                    return
+            # Step A in-flight: pending ledger + no accepts yet — second publisher
+            # would double-post (stream reclaim race). Leave the owning worker alone.
+            _pending_n = sum(
+                1
+                for _a in _attempts
+                if str(_a.get("status") or "").lower() == "pending"
+            )
+            _accepted_n = sum(
+                1
+                for _a in _attempts
+                if str(_a.get("status") or "").lower() == "accepted"
+            )
+            if _pending_n > 0 and _accepted_n == 0:
+                from datetime import datetime, timezone
+
+                _fresh_pending = False
+                for _a in _attempts:
+                    if str(_a.get("status") or "").lower() != "pending":
+                        continue
+                    _ts = _a.get("updated_at") or _a.get("created_at")
+                    if _ts is None:
+                        _fresh_pending = True
+                        break
+                    if getattr(_ts, "tzinfo", None) is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    if (datetime.now(timezone.utc) - _ts).total_seconds() < 1800:
+                        _fresh_pending = True
+                        break
+                if _fresh_pending:
+                    logger.info(
+                        "[%s] publish lane skipped — Step A in-flight "
+                        "(pending=%s, avoid double-post)",
+                        upload_id,
+                        _pending_n,
+                    )
+                    return
+    except Exception as _skip_e:
+        logger.debug("[%s] publish lane pre-skip check: %s", upload_id, _skip_e)
+    from services.worker_runtime_state import track_publish_end, track_publish_start
+
+    # Heartbeat ownership must cover the semaphore wait (see
+    # _run_deferred_publish_with_semaphore) so orphan/stale recovery on other
+    # workers never treats this job as unowned mid-wait.
+    await track_publish_start(str(upload_id), stage="publish_wait")
+    try:
+        async with _publish_semaphore:
+            try:
+                await run_deferred_publish(str(upload_id), str(user_id))
+            except Exception as e:
+                logger.exception(f"[{upload_id}] publish lane job error: {e}")
+    finally:
+        await track_publish_end(str(upload_id))
 
 
 async def publish_jobs() -> None:
@@ -4525,9 +5115,39 @@ async def run_stale_job_recovery_loop() -> None:
                             """,
                             STALE_PROCESSING_MINUTES,
                         )
+                    # Heartbeat ownership: long FFmpeg encodes only touch
+                    # updated_at at stage entry and can legitimately exceed
+                    # STALE_PROCESSING_MINUTES — never reclaim a row a live or
+                    # stale worker still lists in its heartbeat.
+                    _fleet_workers: list = []
+                    if zomb:
+                        try:
+                            from services.upload.orphan_processing import (
+                                fetch_fleet_workers,
+                                owning_worker_id,
+                            )
+
+                            _fleet_workers = await fetch_fleet_workers(db_pool)
+                        except Exception as _fleet_e:
+                            logger.debug(
+                                "stale recovery fleet fetch skipped: %s", _fleet_e
+                            )
                     for row in zomb:
                         up = str(row["id"])
                         uid = str(row["user_id"])
+                        if _fleet_workers:
+                            try:
+                                _owner = owning_worker_id(
+                                    up, _fleet_workers, include_stale=True
+                                )
+                            except Exception:
+                                _owner = None
+                            if _owner:
+                                logger.info(
+                                    f"[{up}] stale recovery: worker-owned "
+                                    f"({_owner}) — skip reclaim"
+                                )
+                                continue
                         lock_key = f"stale_recover:{up}"
                         try:
                             got = await redis_client.set(lock_key, "1", nx=True, ex=180)
@@ -4641,20 +5261,146 @@ async def run_stale_job_recovery_loop() -> None:
 
                             # Publish-phase zombies already have encoded assets — do NOT
                             # re-enqueue FFmpeg (stale-recover-full → claim lost + OOM).
+                            # If Step A ledger already accepted, terminalize from ledger
+                            # instead of ready_to_publish (double-post risk).
+                            from services.upload.publish_ledger_reconcile import (
+                                expected_publish_slots,
+                                ledger_covers_expected_slots,
+                                load_publish_attempts_for_upload,
+                                reconcile_stuck_processing_from_ledger,
+                                resolve_live_target_token_ids,
+                            )
+                            from services.upload.orphan_processing import (
+                                classify_orphan_reclaim,
+                                has_publishable_processed_assets,
+                            )
+
+                            _attempt_rows = await load_publish_attempts_for_upload(
+                                db_pool, up
+                            )
+                            _accepted_n = sum(
+                                1
+                                for _a in _attempt_rows
+                                if str(_a.get("status") or "").lower() == "accepted"
+                            )
+                            _pending_n = sum(
+                                1
+                                for _a in _attempt_rows
+                                if str(_a.get("status") or "").lower() == "pending"
+                            )
+                            _live_ids = await resolve_live_target_token_ids(db_pool, ur)
+                            _covers = ledger_covers_expected_slots(
+                                _attempt_rows, ur, live_token_ids=_live_ids
+                            )
+                            _ledger = await reconcile_stuck_processing_from_ledger(
+                                db_pool, up, user_id=uid
+                            )
+                            if _ledger.get("ok") and _ledger.get("reason") in (
+                                "reconciled_from_ledger",
+                                "already_terminal",
+                            ):
+                                logger.warning(
+                                    f"[{up}] stale recovery: ledger → "
+                                    f"{_ledger.get('state')} ({_ledger.get('reason')}; "
+                                    f"accepted={_ledger.get('accepted_count')}; "
+                                    f"no re-publish; processing>{STALE_PROCESSING_MINUTES}m)"
+                                )
+                                continue
+
                             _assets = ur.get("processed_assets")
                             if isinstance(_assets, str):
                                 try:
                                     _assets = json.loads(_assets) if _assets.strip() else {}
                                 except Exception:
                                     _assets = {}
-                            _has_assets = isinstance(_assets, dict) and any(
-                                k and not str(k).startswith("thumb_") and k != "default"
-                                for k in _assets
-                                if _assets.get(k)
-                            )
+                            _has_assets = has_publishable_processed_assets(_assets)
                             _cp_pub = pipeline_checkpoint.load_resume(ur)
                             _stg_pub = str((_cp_pub or {}).get("stage") or "").lower()
-                            if _has_assets or _stg_pub in ("post_caption", "post_publish"):
+                            _reclaim = classify_orphan_reclaim(
+                                {"processed_assets": _assets},
+                                has_accepted_ledger=_covers,
+                            )
+                            if _reclaim == "ledger_complete":
+                                _ledger2 = await reconcile_stuck_processing_from_ledger(
+                                    db_pool, up, user_id=uid
+                                )
+                                if _ledger2.get("ok"):
+                                    logger.warning(
+                                        f"[{up}] stale recovery: ledger_complete → "
+                                        f"{_ledger2.get('state')} ({_ledger2.get('reason')})"
+                                    )
+                                    continue
+                                logger.error(
+                                    f"[{up}] stale recovery: full accepted ledger but "
+                                    f"reconcile failed ({_ledger2.get('reason')}) — "
+                                    f"leaving processing"
+                                )
+                                continue
+                            # Fresh pending = in-flight (leave alone). Aged pending
+                            # is abandoned even when some slots already accepted so
+                            # mid-fan-out crashes can retry remaining targets.
+                            if _pending_n > 0:
+                                from datetime import datetime, timezone
+
+                                _fresh_pending = False
+                                _stale_ids: list[str] = []
+                                for _a in _attempt_rows:
+                                    if str(_a.get("status") or "").lower() != "pending":
+                                        continue
+                                    _ts = _a.get("updated_at") or _a.get("created_at")
+                                    if _ts is None:
+                                        _fresh_pending = True
+                                        continue
+                                    if getattr(_ts, "tzinfo", None) is None:
+                                        _ts = _ts.replace(tzinfo=timezone.utc)
+                                    if (
+                                        datetime.now(timezone.utc) - _ts
+                                    ).total_seconds() < 1800:
+                                        _fresh_pending = True
+                                        continue
+                                    _aid = str(_a.get("id") or "")
+                                    if _aid:
+                                        _stale_ids.append(_aid)
+                                if _stale_ids:
+                                    try:
+                                        async with db_pool.acquire() as _pconn:
+                                            await _pconn.execute(
+                                                """
+                                                UPDATE publish_attempts
+                                                   SET status = 'failed',
+                                                       error_code = 'STALE_PENDING_ABANDONED',
+                                                       error_message = 'Abandoned aged pending ledger slot during stale recovery',
+                                                       updated_at = NOW()
+                                                 WHERE id = ANY($1::uuid[])
+                                                   AND status = 'pending'
+                                                """,
+                                                _stale_ids,
+                                            )
+                                        logger.warning(
+                                            f"[{up}] stale recovery: abandoned "
+                                            f"{len(_stale_ids)} aged pending ledger "
+                                            f"slot(s) (accepted={_accepted_n}) — "
+                                            f"allowing ready_to_publish re-entry"
+                                        )
+                                    except Exception as _abandon_e:
+                                        logger.warning(
+                                            f"[{up}] stale recovery: abandon pending "
+                                            f"failed: {_abandon_e}"
+                                        )
+                                if _fresh_pending and not _stale_ids:
+                                    logger.warning(
+                                        f"[{up}] stale recovery: publish in-flight "
+                                        f"(pending={_pending_n}, accepted={_accepted_n}) "
+                                        f"— leaving processing (avoid double-post)"
+                                    )
+                                    continue
+                            # Partial accepts: re-enter publish; publish_stage skips
+                            # accepted ledger rows and only posts remaining targets.
+                            if (
+                                _has_assets
+                                or _stg_pub in ("post_caption", "post_publish")
+                                or _accepted_n > 0
+                            ):
                                 async with db_pool.acquire() as uconn:
                                     await uconn.execute(
                                         """
@@ -4671,7 +5417,10 @@ async def run_stale_job_recovery_loop() -> None:
                                 )
                                 logger.warning(
                                     f"[{up}] stale recovery: publish-phase → ready_to_publish "
-                                    f"(skip full re-encode; processing>{STALE_PROCESSING_MINUTES}m)"
+                                    f"(accepted={_accepted_n}/"
+                                    f"{expected_publish_slots(ur, live_token_ids=_live_ids)}; "
+                                    f"ledger-idempotent re-entry; "
+                                    f"processing>{STALE_PROCESSING_MINUTES}m)"
                                 )
                                 continue
                         deferred = False
@@ -4815,6 +5564,153 @@ async def run_stale_job_recovery_loop() -> None:
     logger.info("Stale job recovery stopped")
 
 
+async def run_orphan_processing_recovery_loop() -> None:
+    """Reclaim processing rows no alive/stale worker owns (claim-crash / OOM).
+
+    Faster than STALE_PROCESSING_MINUTES: heartbeat ownership + short grace.
+    """
+    from services.upload.orphan_processing import (
+        classify_orphan_reclaim,
+        list_orphan_processing_upload_ids,
+        orphan_recovery_interval_seconds,
+        reset_orphan_processing_to_queued,
+        reset_orphan_processing_to_ready_to_publish,
+        still_orphan_for_reclaim,
+    )
+    from services.upload.publish_ledger_reconcile import (
+        has_fresh_pending_attempts,
+        ledger_covers_expected_slots,
+        load_publish_attempts_for_upload,
+        reconcile_stuck_processing_from_ledger,
+        resolve_live_target_token_ids,
+    )
+
+    interval = float(orphan_recovery_interval_seconds())
+    logger.info(
+        "Orphan processing recovery started | interval=%ss | grace=%ss",
+        int(interval),
+        _claimed_active_stale_seconds(),
+    )
+    while not shutdown_requested:
+        try:
+            if db_pool is not None:
+                orphans = await list_orphan_processing_upload_ids(db_pool, limit=15)
+                for od in orphans:
+                    up = str(od.get("id") or "")
+                    uid = str(od.get("user_id") or "")
+                    if not up:
+                        continue
+                    still, fresh = await still_orphan_for_reclaim(db_pool, up)
+                    if not still or not fresh:
+                        continue
+                    ur = await db_stage.load_upload_record(db_pool, up)
+                    if not ur:
+                        continue
+                    attempts = await load_publish_attempts_for_upload(db_pool, up)
+                    live_ids = await resolve_live_target_token_ids(db_pool, ur)
+                    covers = ledger_covers_expected_slots(
+                        attempts, ur, live_token_ids=live_ids
+                    )
+                    if covers:
+                        ledger = await reconcile_stuck_processing_from_ledger(
+                            db_pool, up, user_id=uid
+                        )
+                        if ledger.get("ok"):
+                            logger.warning(
+                                "[%s] orphan recovery: ledger → %s (%s)",
+                                up,
+                                ledger.get("state"),
+                                ledger.get("reason"),
+                            )
+                            continue
+                    stage_now = str(fresh.get("processing_stage") or "").lower()
+                    # Claim/slot latch or early stages: never jump to publish even if
+                    # leftover processed_assets keys exist from a prior attempt.
+                    if stage_now in ("claimed", "slot_wait", "download", "telemetry"):
+                        reclaim = "process"
+                    else:
+                        reclaim = classify_orphan_reclaim(
+                            fresh, has_accepted_ledger=covers
+                        )
+                    if reclaim == "publish":
+                        # Fresh pending ledger slot(s) = Step A likely in-flight
+                        # on a publisher whose heartbeat we can't see (e.g. it
+                        # registered late). Redispatching now risks a real
+                        # double-post once the slot is abandoned — leave it for
+                        # stale recovery to arbitrate.
+                        if has_fresh_pending_attempts(attempts):
+                            logger.warning(
+                                "[%s] orphan recovery: fresh pending ledger "
+                                "slot(s) — skip publish redispatch "
+                                "(avoid double-post)",
+                                up,
+                            )
+                            continue
+                        if await reset_orphan_processing_to_ready_to_publish(
+                            db_pool, up
+                        ):
+                            asyncio.create_task(
+                                _run_deferred_publish_with_semaphore(up, uid)
+                            )
+                            logger.warning(
+                                "[%s] orphan recovery: → ready_to_publish (unowned)",
+                                up,
+                            )
+                        continue
+                    if not await reset_orphan_processing_to_queued(db_pool, up):
+                        continue
+                    deferred = str(fresh.get("schedule_mode") or "immediate").lower() in (
+                        "scheduled",
+                        "smart",
+                    )
+                    cp = pipeline_checkpoint.load_resume(ur)
+                    stg = str((cp or {}).get("stage") or "").lower()
+                    resume_cp = bool(
+                        cp
+                        and stg
+                        in (
+                            "post_telemetry",
+                            "post_transcode",
+                            "post_audio",
+                            "post_caption",
+                        )
+                        and pipeline_checkpoint.checkpoint_matches_upload(cp, ur)
+                    )
+                    payload = await _build_process_job_payload(
+                        up,
+                        uid,
+                        deferred=deferred,
+                        job_id=f"orphan-reclaim-{up}",
+                        resume_from_checkpoint=resume_cp,
+                    )
+                    if payload and await enqueue_process_lane_job(payload):
+                        logger.warning(
+                            "[%s] orphan recovery: re-enqueued process "
+                            "(stage was %s, resume=%s)",
+                            up,
+                            fresh.get("processing_stage"),
+                            resume_cp,
+                        )
+                    else:
+                        logger.error(
+                            "[%s] orphan recovery: reset queued but enqueue failed",
+                            up,
+                        )
+        except Exception as e:
+            logger.warning("Orphan processing recovery cycle error: %s", e)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=interval,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Orphan processing recovery stopped")
+
+
 # ---------------------------------------------------------------------------
 # Redis job consumer (immediate uploads only)
 # ---------------------------------------------------------------------------
@@ -4870,6 +5766,19 @@ async def _process_one_job(job_json: str) -> None:
             except Exception as _heal_e:
                 logger.debug("[%s] user slot heal skipped: %s", upload_id or "?", _heal_e)
 
+            # Surface slot wait in UI (progress > 0 but ETA still suppressed until
+            # real pipeline stages start — avoids fake "~55m remaining").
+            if upload_id and db_pool is not None:
+                try:
+                    await db_stage.update_stage_progress(
+                        db_pool,
+                        upload_id,
+                        "slot_wait",
+                        STAGE_PROGRESS["slot_wait"],
+                    )
+                except Exception:
+                    pass
+
             got = await user_process_wait_acquire(
                 redis_client,
                 uid,
@@ -4881,6 +5790,8 @@ async def _process_one_job(job_json: str) -> None:
                 ),
             )
             if not got:
+                # Drop slot_wait so reclaim isn't confused if we exit / requeue.
+                await _clear_slot_wait_stage(upload_id)
                 # Another consumer may already be processing this upload — don't stack
                 # duplicate requeues (logs showed attempt 1/5 forever via stale recovery).
                 if upload_id and await _upload_already_processing(upload_id):
@@ -5426,7 +6337,14 @@ async def main() -> None:
     total_concurrency = WORKER_CONCURRENCY + PUBLISH_CONCURRENCY
     db_min = max(2, total_concurrency)
     db_max = max(15, total_concurrency * 3)
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=db_min, max_size=db_max)
+    # Match API pool codecs so jsonb binds accept Python lists/dicts (and
+    # still work with stages.db._jsonb_bind string encoding as a safety net).
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=db_min,
+        max_size=db_max,
+        init=_init_asyncpg_codecs,
+    )
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
     try:
@@ -5523,6 +6441,9 @@ async def main() -> None:
         background_loops.append(("stream_reclaim", run_stream_reclaim_loop))
     if STALE_JOB_RECOVERY_ENABLED:
         background_loops.append(("stale_recovery", run_stale_job_recovery_loop))
+        background_loops.append(
+            ("orphan_processing", run_orphan_processing_recovery_loop)
+        )
     def _loop_enabled(name: str, default: bool = True) -> bool:
         raw = (os.environ.get(name) or "").strip().lower()
         if not raw:

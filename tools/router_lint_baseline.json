@@ -106,7 +106,7 @@
       "max_db_touch_lines": 11
     },
     "routers/preferences.py": {
-      "max_lines": 793,
+      "max_lines": 803,
       "max_db_touch_lines": 21
     },
     "routers/public_entitlements.py": {

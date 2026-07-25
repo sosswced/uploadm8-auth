@@ -22,6 +22,9 @@ _UPLOAD_PREF_MIRROR_PAIRS = [
     ("max_hashtags", "maxHashtags"),
     ("default_vehicle_make_id", "defaultVehicleMakeId"),
     ("default_vehicle_model_id", "defaultVehicleModelId"),
+    ("youtube_shorts_copyright_trim", "youtubeShortsCopyrightTrim"),
+    ("use_audio_context", "useAudioContext"),
+    ("ai_service_music_detection", "aiServiceMusicDetection"),
 ]
 
 
@@ -62,19 +65,10 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
         v = bool(use_pkz)
         user_prefs["thumbnail_pikzels_enabled"] = v
         user_prefs["thumbnailPikzelsEnabled"] = v
-    elif use_eng is None:
-        # Presign default: when the server has Pikzels configured, opt uploads into
-        # studio unless the client explicitly disabled engine/pikzels on the body.
-        try:
-            from stages.pikzels_api import studio_renderer_enabled
-
-            if studio_renderer_enabled():
-                user_prefs["thumbnail_pikzels_enabled"] = True
-                user_prefs["thumbnailPikzelsEnabled"] = True
-                user_prefs.setdefault("thumbnail_studio_engine_enabled", True)
-                user_prefs.setdefault("thumbnailStudioEngineEnabled", True)
-        except Exception:
-            pass
+    # Do NOT auto-enable Pikzels just because PIKZELS_API_KEY is set when the
+    # client omitted the engine flag — that billed every API upload. Explicit
+    # thumbnail_use_studio_engine / thumbnail_use_pikzels (or saved Settings)
+    # must opt in. TUP once-per-setup gate relies on the client sending false.
 
     use_per = getattr(data, "thumbnail_use_persona", None)
     if use_per is True:

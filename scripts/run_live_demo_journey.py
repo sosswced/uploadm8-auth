@@ -45,14 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Upload + admin marathon (single Chrome window, admin while upload pending)"
     )
-    parser.add_argument(
-        "--video",
-        default=os.environ.get("E2E_TEST_VIDEO", r"C:\Users\Earl\Videos\20250301_0058_CAM_EVNT.MP4"),
-    )
-    parser.add_argument(
-        "--telemetry",
-        default=os.environ.get("E2E_TEST_TELEMETRY_MAP", r"C:\Users\Earl\Videos\20250301_0058_CAM_EVNT.map"),
-    )
+    # No fixed-fixture defaults here: a hard-coded clip re-posts the SAME video
+    # to live platforms on every run. Leave None so resolve_demo_paths() picks a
+    # fresh random pair from E2E_MEDIA_LIBRARY.
+    parser.add_argument("--video", default=os.environ.get("E2E_TEST_VIDEO") or None)
+    parser.add_argument("--telemetry", default=os.environ.get("E2E_TEST_TELEMETRY_MAP") or None)
     parser.add_argument("--base-url", default=e2e_base_url())
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--pipeline-timeout-min", type=int, default=120)
@@ -89,7 +86,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": "api_not_ready", "ready": ready}, indent=2))
         return 2
     print(f"API/DB ready @ {base} (attempt {ready.get('attempt')})", flush=True)
-    video, telemetry = resolve_demo_paths(Path(args.video), Path(args.telemetry) if args.telemetry else None)
+    video, telemetry = resolve_demo_paths(
+        Path(args.video) if args.video else None,
+        Path(args.telemetry) if args.telemetry else None,
+    )
     log = LiveDemoLog()
     report: dict = {
         "base_url": base,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 STAGE_LABELS: dict[str, str] = {
+    "claimed": "Starting — claiming worker",
+    "slot_wait": "Waiting for your process slot",
     "init": "Initialising",
     "download": "Copying your video",
     "telemetry": "Reading drive data",
@@ -12,12 +14,14 @@ STAGE_LABELS: dict[str, str] = {
     "vision": "AI scene scan",
     "twelvelabs": "AI scene scan",
     "video_intelligence": "AI scene scan",
+    "dashcam_osd": "Reading on-screen data",
     "thumbnail": "Creating thumbnails",
     "caption": "Writing title and captions",
     "upload": "Saving processed files",
     "publish": "Publishing to platforms",
     "verify": "Final checks",
     "notify": "Final checks",
+    "done": "Complete",
 }
 
 

@@ -24,10 +24,14 @@ we call ``enforce_hydration(ctx)`` to:
    evidence exists, by appending a deterministic factual anchor phrase
    (e.g. "Captured at 46 MPH near Guadalupe, California with The Eagles —
    Hotel California playing.").
-4. **Replace category-seed-only hashtags** with deterministic
+4. **Upgrade thin titles** that ignore timeline beats (speed / music) even
+   when a place name alone counts as evidence — e.g. replace
+   ``Logandale, CA`` with ``154 MPH · Logandale, CA · Fetty Wap``. Titles
+   never inherit the caption-style ``Captured at…`` sentence or VI dumps.
+5. **Replace category-seed-only hashtags** with deterministic
    evidence-driven hashtags when real signals exist. Category seeds only
    survive when they're the only thing we have.
-5. Apply identical treatment to every per-platform M8 variant
+6. Apply identical treatment to every per-platform M8 variant
    (``ctx.m8_platform_captions`` / ``..._titles`` / ``..._hashtags``) plus
    the legacy ``ctx.ai_caption`` / ``ctx.ai_title`` / ``ctx.ai_hashtags``
    used by ``get_effective_*`` fallbacks.
@@ -207,6 +211,10 @@ class EvidencePool:
     gazetteer_place: Optional[str] = None
     protected_area: Optional[str] = None
     near_protected_land: bool = False
+    # Welcome to / Entering signage from Vision or VI OCR
+    place_sign: Optional[str] = None
+    # OSD/telemetry start GPS reverse-geocode (when start ≠ mid by ~5+ mi)
+    location_start_display: Optional[str] = None
 
     # Speed (canonical: .map telemetry > OSD HUD > Vision OCR — see collect_evidence)
     max_speed_mph: float = 0.0
@@ -266,6 +274,7 @@ class EvidencePool:
         return any(
             (
                 self.road, self.city, self.gazetteer_place, self.protected_area,
+                self.place_sign, self.location_start_display,
                 self.max_speed_mph > 0, self.driver_name, self.trill_bucket,
                 self.music_artist, self.music_title, self.transcript_phrase,
                 self.transcript_topics, self.transcript_entities,
@@ -293,6 +302,8 @@ class EvidencePool:
                 "gazetteer_place": self.gazetteer_place,
                 "protected_area": self.protected_area,
                 "near_protected_land": self.near_protected_land,
+                "place_sign": self.place_sign,
+                "location_start_display": self.location_start_display,
             },
             "speed": {
                 "max_mph": self.max_speed_mph,
@@ -495,8 +506,8 @@ def _publishable_closing(text: Optional[str]) -> Optional[str]:
 def _vision_ocr_peak_mph(ocr: str) -> float:
     """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD).
 
-    Rejects roadside SPEED LIMIT copy and singleton OCR spikes (e.g. 154 when
-    the HUD samples are 87–92) so false peaks never enter caption anchors.
+    Only unit-labeled speeds (mph / kmh after the digits) on HUD-anchored lines
+    count — bare integers and roadside SPEED LIMIT copy never become peaks.
     """
     if not ocr:
         return 0.0
@@ -508,17 +519,19 @@ def _vision_ocr_peak_mph(ocr: str) -> float:
             ocr,
             flags=re.I,
         )
+    from stages.dashcam_osd_stage import parse_osd_line
+
+    chunks = [c.strip() for c in re.split(r"\n-{3,}\n", ocr) if c.strip()]
+    if len(chunks) <= 1:
+        chunks = [line.strip() for line in ocr.splitlines() if line.strip()]
     vals: List[float] = []
-    for m in re.finditer(r"\b(\d{1,3})\s*(?:mph|mi/h)\b", ocr, re.IGNORECASE):
-        try:
-            v = float(m.group(1))
-        except (TypeError, ValueError):
+    for chunk in chunks:
+        rec = parse_osd_line(chunk, require_hud_anchor_for_speed=True)
+        mph = rec.get("speed_mph")
+        if mph is None:
             continue
-        if 5.0 <= v <= 200.0:
-            vals.append(v)
-    for m in re.finditer(r"\b(\d{1,3})\s*(?:kmh|km/h)\b", ocr, re.IGNORECASE):
         try:
-            v = float(m.group(1)) * 0.621371
+            v = float(mph)
         except (TypeError, ValueError):
             continue
         if 5.0 <= v <= 200.0:
@@ -549,6 +562,9 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         pool.gazetteer_place = (getattr(tel, "gazetteer_place_name", None) or None)
         pool.protected_area = (getattr(tel, "padus_unit_name", None) or None)
         pool.near_protected_land = bool(getattr(tel, "near_padus", False))
+        start_disp = getattr(tel, "location_start_display", None)
+        if isinstance(start_disp, str) and start_disp.strip():
+            pool.location_start_display = start_disp.strip()
         pool.state_abbr = _state_abbr(pool.state, pool.country)
         try:
             tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
@@ -702,25 +718,44 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
                     if s and s not in pool.vision_highways:
                         pool.vision_highways.append(s)
             pool.vision_ocr_tokens = _extract_transcript_nouns(ocr, limit=8)
-        rec_flat = vc.get("recognition_flat") or {}
-        if not rec_flat:
-            vr = getattr(ctx, "visual_recognition", None) or {}
-            if isinstance(vr, dict):
-                rec_flat = vr.get("flat") or {}
-        if isinstance(rec_flat, dict) and rec_flat:
-            pool.recognition_entities = {
-                k: [str(x).strip() for x in v[:10] if str(x).strip()]
-                for k, v in rec_flat.items()
-                if isinstance(v, list) and v
-            }
-            for key in (
-                "vehicles", "food", "plants", "animals", "brands",
-                "outdoors", "sports", "art", "restaurants", "products",
-            ):
-                for name in (rec_flat.get(key) or [])[:6]:
-                    low = str(name).strip().lower()
-                    if low and low not in pool.vision_labels:
-                        pool.vision_labels.append(low)
+
+    # Welcome to / Entering signs (Vision OCR + VI on_screen_text)
+    try:
+        from services.scene_fusion import collect_place_signs
+
+        signs = collect_place_signs(ctx)
+        if signs:
+            pool.place_sign = signs[0]
+    except Exception:
+        pass
+
+    # recognition_flat lives on vision_context when present; never call .get on
+    # a non-dict (malformed ctx must not abort hydration).
+    rec_flat: Dict[str, Any] = {}
+    if isinstance(vc, dict):
+        raw_rf = vc.get("recognition_flat") or {}
+        if isinstance(raw_rf, dict):
+            rec_flat = raw_rf
+    if not rec_flat:
+        vr = getattr(ctx, "visual_recognition", None) or {}
+        if isinstance(vr, dict):
+            flat = vr.get("flat") or {}
+            if isinstance(flat, dict):
+                rec_flat = flat
+    if rec_flat:
+        pool.recognition_entities = {
+            k: [str(x).strip() for x in v[:10] if str(x).strip()]
+            for k, v in rec_flat.items()
+            if isinstance(v, list) and v
+        }
+        for key in (
+            "vehicles", "food", "plants", "animals", "brands",
+            "outdoors", "sports", "art", "restaurants", "products",
+        ):
+            for name in (rec_flat.get(key) or [])[:6]:
+                low = str(name).strip().lower()
+                if low and low not in pool.vision_labels:
+                    pool.vision_labels.append(low)
 
     # ── Twelve Labs / Video Intelligence narrative ──────────────────────
     vu = getattr(ctx, "video_understanding", None) or {}
@@ -732,7 +767,13 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             or ""
         )
         if isinstance(scene, str) and scene.strip():
-            pool.video_understanding_phrase = _first_sentence(scene, max_chars=140)
+            # TL/LLM prose invents speeds; strip claims that contradict the
+            # trusted peak before the phrase can reach titles/captions.
+            from core.speed_consensus import scrub_untrusted_speed_claims
+
+            scene = scrub_untrusted_speed_claims(scene, pool.max_speed_mph or 0.0)
+            if scene:
+                pool.video_understanding_phrase = _first_sentence(scene, max_chars=140)
 
     # ── Video Intelligence structured tracks (object/text/person/logo) ──
     # Populated by stages.video_intelligence_stage when full feature set is on.
@@ -920,8 +961,11 @@ def _base_file_anchor(ctx: JobContext, category: Optional[str] = None) -> str:
 
 
 def _format_place(pool: EvidencePool) -> Optional[str]:
-    """Compose a human place phrase like ``Guadalupe, CA`` or ``near I-15``."""
-    parts: List[str] = []
+    """Compose a human place phrase like ``Guadalupe, CA`` or ``near I-15``.
+
+    Priority: gazetteer/city → welcome/entering sign → OSD start display →
+    protected area → road → highway OCR → landmark handled by callers.
+    """
     if pool.gazetteer_place and pool.state_abbr:
         return f"{pool.gazetteer_place}, {pool.state_abbr}"
     if pool.gazetteer_place:
@@ -932,13 +976,17 @@ def _format_place(pool: EvidencePool) -> Optional[str]:
         return f"{pool.city}, {pool.state}"
     if pool.city:
         return pool.city
+    if pool.place_sign:
+        return pool.place_sign
+    if pool.location_start_display:
+        return pool.location_start_display
     if pool.protected_area:
         return pool.protected_area
     if pool.road:
         return pool.road
     if pool.vision_highways:
         return pool.vision_highways[0]
-    return " ".join(parts) if parts else None
+    return None
 
 
 def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) -> str:
@@ -1024,15 +1072,123 @@ def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) ->
     return f"{head}."
 
 
-def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) -> str:
-    """Short title filler — depth/substance only; never telemetry or VI dumps.
+def _title_suggestion_matches_trusted_peak(sug: str, pool: EvidencePool) -> bool:
+    """Reject TL/fusion suggestions whose MPH conflicts with trusted OSD/telemetry peak."""
+    if not sug:
+        return False
+    peak = float(pool.max_speed_mph or 0)
+    m = re.search(r"\b(\d{2,3})\s*mph\b", sug, re.I)
+    if peak < 5:
+        # No trusted peak → any MPH claim in the suggestion is unverifiable.
+        return m is None
+    if not m:
+        # Compact suggestion without MPH is OK only when it still has substance.
+        return " · " in sug
+    try:
+        sug_mph = float(m.group(1))
+    except (TypeError, ValueError):
+        return False
+    # Allow small rounding drift; reject wrong peaks (e.g. 46 vs 154).
+    from core.speed_consensus import speed_tolerance_mph
 
-    Titles must not inherit the caption-style ``Captured at X MPH…`` hydration
-    sentence or Video Intelligence label lists. Prefer a scene-understanding
-    hook, then a landmark, then a tight place name.
+    return abs(sug_mph - peak) <= speed_tolerance_mph(peak)
+
+
+def _compact_timeline_title(pool: EvidencePool) -> str:
+    """Canonical speed · place · music headline from EvidencePool (trusted peak)."""
+    parts: List[str] = []
+    if pool.max_speed_mph and pool.max_speed_mph >= 5:
+        parts.append(f"{int(round(pool.max_speed_mph))} MPH")
+
+    place = _format_place(pool)
+    if place:
+        parts.append(place)
+    elif pool.place_sign:
+        parts.append(str(pool.place_sign).strip())
+    elif pool.location_start_display:
+        parts.append(str(pool.location_start_display).strip())
+    elif pool.road:
+        parts.append(str(pool.road).strip())
+    elif pool.vision_highways:
+        parts.append(str(pool.vision_highways[0]).strip())
+    elif pool.vision_landmarks:
+        lm = str(pool.vision_landmarks[0]).strip()
+        if lm and not is_generic_vision_label(lm):
+            parts.append(lm)
+
+    music_bit = ""
+    if pool.music_artist:
+        music_bit = str(pool.music_artist).strip()
+    elif pool.music_title:
+        music_bit = str(pool.music_title).strip()
+    if music_bit:
+        parts.append(music_bit)
+
+    if len(parts) >= 2:
+        return _sanitize_anchor_fragment(" · ".join(parts[:3]), max_chars=90)
+    if len(parts) == 1:
+        if place and pool.road and pool.road.lower() not in place.lower():
+            return _sanitize_anchor_fragment(f"{place} · {pool.road}", max_chars=90)
+        return _sanitize_anchor_fragment(parts[0], max_chars=90)
+    return ""
+
+
+def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) -> str:
+    """Short title filler from timeline evidence — never caption prose or VI dumps.
+
+    Prefer compact ``title_suggestion`` only when it agrees with trusted peak speed,
+    else build speed · place · music from the EvidencePool (welcome-sign / OSD start
+    when city missing). Never emit caption-style ``Captured at…`` prose.
     """
+    # Always prefer the evidence-backed compact form when we have ≥2 timeline beats.
+    compact = _compact_timeline_title(pool)
+    if compact and " · " in compact:
+        # TL/fusion suggestion may win only if it matches trusted peak and is richer.
+        # When a trusted peak exists it must actually appear in the suggestion —
+        # a longer no-MPH suggestion must never beat a compact form carrying speed.
+        if ctx is not None:
+            vu = getattr(ctx, "video_understanding", None) or {}
+            if isinstance(vu, dict):
+                sug = scrub_machine_publish_dump(str(vu.get("title_suggestion") or "")).strip()
+                has_peak = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
+                # Tolerance agreement is enforced by _title_suggestion_matches_trusted_peak;
+                # here we only require that SOME speed token is present at all.
+                sug_has_peak = bool(has_peak and re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
+                if (
+                    sug
+                    and len(sug) >= 8
+                    and "captured at" not in sug.lower()
+                    and _title_suggestion_matches_trusted_peak(sug, pool)
+                    and (" · " in sug or re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
+                    and (sug_has_peak or not has_peak)
+                    and len(sug) >= len(compact)
+                ):
+                    return _sanitize_anchor_fragment(sug, max_chars=90)
+        return compact
+
+    if ctx is not None:
+        vu = getattr(ctx, "video_understanding", None) or {}
+        if isinstance(vu, dict):
+            sug = scrub_machine_publish_dump(str(vu.get("title_suggestion") or "")).strip()
+            if (
+                sug
+                and len(sug) >= 8
+                and "captured at" not in sug.lower()
+                and _title_suggestion_matches_trusted_peak(sug, pool)
+                and (" · " in sug or re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
+            ):
+                return _sanitize_anchor_fragment(sug, max_chars=90)
+
+    if compact:
+        return compact
+
     scene = _publishable_closing(pool.video_understanding_phrase)
     if scene and len(scene) >= 12:
+        # Scene hook must not hide available speed — prepend trusted peak.
+        if pool.max_speed_mph and pool.max_speed_mph >= 5:
+            mph = f"{int(round(pool.max_speed_mph))} MPH"
+            if mph.lower() not in scene.lower():
+                return _sanitize_anchor_fragment(f"{mph} · {scene}", max_chars=90)
         return _sanitize_anchor_fragment(scene, max_chars=90)
 
     if pool.vision_landmarks:
@@ -1040,16 +1196,11 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
         if lm and not is_generic_vision_label(lm):
             return _sanitize_anchor_fragment(lm, max_chars=90)
 
-    place = _format_place(pool)
-    if place:
-        return _sanitize_anchor_fragment(place, max_chars=90)
-
     if pool.vision_logos:
         logo = str(pool.vision_logos[0]).strip()
         if logo and not is_generic_vision_label(logo):
             return _sanitize_anchor_fragment(logo, max_chars=90)
 
-    # Thin filename/category only when we have nothing scenic — still no VI dump.
     if ctx is not None:
         fb = _base_file_anchor(ctx).rstrip(".").strip()
         if fb and not _is_machine_label_dump(fb):
@@ -1057,16 +1208,74 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
     return ""
 
 
+def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
+    """True when title ignores available timeline substance (speed/music/scene/sign).
+
+    Place-only titles are always thin when richer beats exist — including titles
+    longer than 36 chars that are still just geo prose without MPH/music.
+    Creative titles that already cite speed (or music+place) are left alone.
+    """
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t:
+        return True
+    has_speed = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
+    has_music = bool(pool.music_artist or pool.music_title)
+    has_scene = bool(
+        pool.video_understanding_phrase
+        and len(str(pool.video_understanding_phrase).strip()) >= 12
+    )
+    has_sign = bool(pool.place_sign)
+    if not has_speed and not has_music and not has_scene and not has_sign:
+        return False
+
+    blob = t.lower()
+    mentions_speed = bool(re.search(r"\b\d{2,3}\s*mph\b", blob))
+    if has_speed and mentions_speed:
+        # An MPH substring only counts when it agrees with the trusted peak —
+        # "46 MPH" on a 154 MPH run is a wrong claim, not coverage.
+        from core.speed_consensus import speed_tolerance_mph
+
+        tol = speed_tolerance_mph(pool.max_speed_mph)
+        mentions_speed = any(
+            abs(float(n) - float(pool.max_speed_mph)) <= tol
+            for n in re.findall(r"\b(\d{2,3})\s*mph\b", blob)
+        )
+    if has_speed and not mentions_speed:
+        mph_s = str(int(round(pool.max_speed_mph)))
+        mentions_speed = mph_s in blob and "mph" in blob
+
+    mentions_music = False
+    if pool.music_artist and str(pool.music_artist).lower() in blob:
+        mentions_music = True
+    if pool.music_title and str(pool.music_title).lower() in blob:
+        mentions_music = True
+
+    place = _format_place(pool)
+    if place and blob == place.lower():
+        return True
+    # Any title that skips trusted peak speed is thin — even long creative copy.
+    if has_speed and not mentions_speed:
+        return True
+    if has_music and not mentions_music and not mentions_speed and len(t) < 40:
+        return True
+    if has_scene and len(t) < 28 and not mentions_speed:
+        return True
+    if has_sign and pool.place_sign and str(pool.place_sign).lower() not in blob:
+        if len(t) < 28 and not mentions_speed:
+            return True
+    return False
+
+
 def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[str]:
     """Deterministic, evidence-driven hashtag bodies (no leading '#').
 
     Priority encodes survival under maxHashtags truncation:
-      1. landmark / place-entity names
+      1. landmark / place-entity names / welcome signs
       2. logos / brands (Vision + VI)
       3. music artist + title
       4. road / highway / route (+ place composites)
       5. gazetteer place + state composite
-      6. city / state / protected area
+      6. city / state / protected area / start display
       7. driver name (HUD)
       8. trill + speed bucket tags
       9. transcript entities (places/products/orgs)
@@ -1087,6 +1296,10 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     for lm in pool.vision_landmarks[:3]:
         _push(lm)
+
+    # Welcome to / Entering signs — first-class discovery tags.
+    if pool.place_sign:
+        _push(pool.place_sign)
 
     for beach in list(getattr(pool, "place_beaches", None) or [])[:2]:
         _push(beach)
@@ -1131,6 +1344,8 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         _push(pool.city)
     if pool.state:
         _push(pool.state)
+    if pool.location_start_display:
+        _push(pool.location_start_display)
     if pool.protected_area:
         _push(pool.protected_area)
     elif pool.near_protected_land:
@@ -1232,6 +1447,7 @@ def _caption_uses_evidence(caption: str, pool: EvidencePool) -> bool:
     candidates: List[str] = []
     for v in (
         pool.road, pool.city, pool.state, pool.gazetteer_place, pool.protected_area,
+        pool.place_sign, pool.location_start_display,
         pool.driver_name, pool.music_artist, pool.music_title, pool.music_genre,
         pool.trill_bucket, pool.video_understanding_phrase, pool.video_summary_phrase,
         pool.yamnet_top,
@@ -1670,6 +1886,10 @@ def enforce_hydration(
             if anchor:
                 return _hydrate_caption("", anchor)
             return scrubbed or None
+        # Wrong-MPH claims (LLM inventions) never survive into published copy.
+        from core.speed_consensus import scrub_untrusted_speed_claims
+
+        scrubbed = scrub_untrusted_speed_claims(scrubbed, pool.max_speed_mph or 0.0) or scrubbed
         working = scrubbed
         if not anchor:
             return working if working != raw.strip() else None
@@ -1688,14 +1908,27 @@ def enforce_hydration(
         )
 
     def _maybe_rewrite_title(ttl_str: str) -> Optional[str]:
-        """Titles never get caption-style Captured-at / VI dump anchors."""
+        """Titles never get caption-style Captured-at / VI dump anchors.
+
+        Place-only titles (e.g. ``Logandale, CA``) are upgraded when the
+        timeline has speed/music the title ignored — even if the place token
+        already counts as "using evidence".
+        """
         raw = ttl_str or ""
         scrubbed = scrub_machine_publish_dump(raw)
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
             return title_anchor or scrubbed or None
+        from core.speed_consensus import scrub_untrusted_speed_claims
+
+        scrubbed = scrub_untrusted_speed_claims(scrubbed, pool.max_speed_mph or 0.0) or scrubbed
         working = scrubbed
         if not title_anchor:
             return working if working != raw.strip() else None
+        if _title_is_timeline_thin(working, pool):
+            new = title_anchor[:100]
+            return new if new and new != raw.strip() else (
+                working if working != raw.strip() else None
+            )
         if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
             return working if working != raw.strip() else None
         if used_fallback:

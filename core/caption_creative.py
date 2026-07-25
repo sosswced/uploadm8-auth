@@ -12,7 +12,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 # Caption STYLE = structural architecture of the line.
-STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+#
+# Every entry carries two layers:
+#   - "blueprint": rich prose contract (legacy consumers + deep elaboration)
+#   - "facets": machine-composable levers consumed by compose_creative_directive().
+#     STYLE owns ONLY these levers: architecture, hook mechanic, length band,
+#     timeline-beat plan, and variant rotation. It never dictates emotional heat
+#     (TONE's job) or pronouns/diction (VOICE's job).
+STYLE_DIRECTIVES: Dict[str, Dict[str, Any]] = {
     "story": {
         "label": "STORY — narrative arc",
         "ui_label": "Story — narrative arc from start to finish",
@@ -23,6 +30,13 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Caption length 150–320 characters. Connective momentum; no bullet fragments. "
             "Each of the 5 variants must enter/exit on DIFFERENT timeline beats so they feel like five retellings."
         ),
+        "facets": {
+            "architecture": "three-beat micro-arc: entry beat → pivot/peak beat → exit beat, with connective momentum (no bullet fragments)",
+            "hook": "open on a concrete EARLY timeline beat (HUD time, place, first speed sample, opening OCR) — never a summary of 'a video'",
+            "length": "150–320 characters",
+            "beats": "consume at least 3 ordered beats from scene_graph.timeline / hydration_story: early entry, mid/peak pivot, late close",
+            "rotation": "each variant must enter AND exit on different timeline beats so the 5 read as five retellings",
+        },
     },
     "punchy": {
         "label": "PUNCHY — hook in first 3 words",
@@ -34,6 +48,13 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "No narrative ramp — impact then stop. Across the 5 variants, rotate WHICH evidence token leads "
             "(speed → place → object → audio → trill) so no two hooks open on the same word class."
         ),
+        "facets": {
+            "architecture": "one or two telegraphic lines — impact then stop; cut every connective and hedge",
+            "hook": "the single most arresting CONCRETE fact lands inside the first 3 words (number, place, named object, speed)",
+            "length": "under 120 characters",
+            "beats": "exactly 1–2 beats — only the strongest evidence tokens survive the cut",
+            "rotation": "rotate which evidence class leads (speed → place → object → audio → trill) so no two hooks open on the same word class",
+        },
     },
     "factual": {
         "label": "FACTUAL — lead with the strongest stat",
@@ -44,6 +65,13 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "100–220 characters. State the metric, then one tight line of grounded context from the timeline. "
             "Across the 5 variants, lead with a different verified figure each time."
         ),
+        "facets": {
+            "architecture": "metric-first statement, then ONE tight line of grounded context from the timeline",
+            "hook": "the most impressive VERIFIABLE data point leads (trusted MPH sample, count, precise place/road, HUD date/time, artist/title)",
+            "length": "100–220 characters",
+            "beats": "1 headline metric + 1 supporting timeline beat; zero fluff between them",
+            "rotation": "each variant leads with a DIFFERENT verified figure",
+        },
     },
     "diary": {
         "label": "DIARY — first-person log of what happened",
@@ -53,6 +81,13 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Use at least two timestamped or ordered beats from scene_graph.timeline (e.g. early MPH sample, "
             "later MPH sample, music ID). 140–280 characters. Intimate, sequential, never omniscient filler."
         ),
+        "facets": {
+            "architecture": "dated field-note sequence: HUD clock → place → what changed next; intimate and sequential, never omniscient filler",
+            "hook": "a timestamp / HUD-clock or ordered opening beat anchors the entry",
+            "length": "140–280 characters",
+            "beats": "at least 2 timestamped or ordered timeline beats, kept in chronological order",
+            "rotation": "vary which timestamps anchor each variant's log entry",
+        },
     },
     "listicle": {
         "label": "LISTICLE — stacked evidence beats",
@@ -62,6 +97,13 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Every beat must be a token from hydration_story or timeline. Under 200 characters. No prose throat-clearing "
             "('The video is…'). Rotate which evidence leads across the 5 variants."
         ),
+        "facets": {
+            "architecture": "3 stacked short beats separated by · or / or line breaks; no prose throat-clearing",
+            "hook": "the first stacked beat is the strongest evidence token",
+            "length": "under 200 characters",
+            "beats": "every list item IS a token from hydration_story or the timeline — no connective prose",
+            "rotation": "rotate which evidence class leads the stack across the 5 variants",
+        },
     },
     "freestyle": {
         "label": "FREESTYLE — no rails, hydration-first invention of shape",
@@ -74,11 +116,22 @@ STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Ban generic wrappers: 'The video is a…', 'high-energy first-person dashcam', 'capturing a journey along'. "
             "The 5 variants must differ in STRUCTURE (not just synonyms)."
         ),
+        "facets": {
+            "architecture": "invent a fresh SHAPE per variant (question, mid-scene entry, music/speed braid, diary stamp) — no fixed arc",
+            "hook": "free — may open mid-scene, on a question, or on driver/HUD time; generic wrappers stay banned",
+            "length": "free (soft rails; platform limits still apply)",
+            "beats": "hydration_story + timeline are raw material; evidence density mandatory, ordering optional",
+            "rotation": "the 5 variants must differ in STRUCTURE itself, not just synonyms",
+        },
     },
 }
 
 # Caption TONE = emotional register.
-TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+#
+# TONE facets own ONLY the temperature levers: intensity (1 = flattest,
+# 5 = hottest), pacing, punctuation policy, and word-field. TONE never changes
+# the structure (STYLE's job) or the speaker's pronouns/diction (VOICE's job).
+TONE_DIRECTIVES: Dict[str, Dict[str, Any]] = {
     "authentic": {
         "label": "AUTHENTIC — real talk, first-person, no fluff",
         "ui_label": "Authentic — real talk, first-person, no fluff",
@@ -87,6 +140,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Sound like a real person who was actually there. One honest observation beats a manufactured hook. "
             "Ban influencer filler ('okay guys', 'here's the thing', 'let me tell you'). No exclamation inflation."
         ),
+        "facets": {
+            "intensity": 2,
+            "pacing": "natural speech rhythm, unforced; one honest observation beats a manufactured hook",
+            "punctuation": "no exclamation inflation; plain periods and commas",
+            "word_field": "plain words over marketing speak; ban influencer filler ('okay guys', 'here's the thing', 'let me tell you')",
+        },
     },
     "hype": {
         "label": "HYPE — high energy, power words, stop-the-scroll",
@@ -97,6 +156,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "party-bro shouting). Every spike of energy must trace to something literally on screen or in the audio. "
             "Never invent stakes the footage does not earn."
         ),
+        "facets": {
+            "intensity": 4,
+            "pacing": "high momentum: tight clauses, forward pull; scale intensity to the actual subject",
+            "punctuation": "occasional emphatic mark allowed — never stacked (!!), never on invented stakes",
+            "word_field": "strong verbs and power nouns; every spike of energy must trace to something literally on screen or in the audio",
+        },
     },
     "cinematic": {
         "label": "CINEMATIC — poetic, atmospheric, film-trailer feel",
@@ -106,6 +171,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Present tense where it heightens immediacy; trailer-like rhythm without melodrama or clichés that could "
             "apply to any clip. Every image must tether to a visible detail or a spoken line. Restraint over purple prose."
         ),
+        "facets": {
+            "intensity": 3,
+            "pacing": "trailer-like rhythm; present tense where it heightens immediacy",
+            "punctuation": "ellipses / dashes sparingly for atmosphere; no melodrama",
+            "word_field": "sensory language (light, shadow, motion, scale, texture) tethered to a visible detail or spoken line; restraint over purple prose",
+        },
     },
     "calm": {
         "label": "CALM — measured, confident, let the footage speak",
@@ -114,6 +185,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Measured, breathable pacing; let concrete details carry the weight. Understatement over exclamation; "
             "cool, trustworthy register. No urgency theatrics. Confidence shown through specificity, not volume."
         ),
+        "facets": {
+            "intensity": 1,
+            "pacing": "measured, breathable; let concrete details carry the weight",
+            "punctuation": "no exclamation marks; understatement over emphasis",
+            "word_field": "specific, cool, trustworthy nouns over adjectives; confidence through specificity, not volume",
+        },
     },
     "documentary": {
         "label": "DOCUMENTARY — observational, reportorial",
@@ -122,6 +199,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Observational and precise: report what the HUD, GPS, and audio actually show. Prefer time, place, "
             "speed samples, and named music over vibes. Third-person or neutral first-person. No petrolhead filler."
         ),
+        "facets": {
+            "intensity": 2,
+            "pacing": "even, reportorial cadence; observation before interpretation",
+            "punctuation": "neutral; no rhetorical marks or dramatics",
+            "word_field": "time / place / measurement vocabulary from HUD, GPS, and audio; zero vibes words, no petrolhead filler",
+        },
     },
     "dry": {
         "label": "DRY — deadpan, understated wit",
@@ -130,6 +213,12 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Deadpan delivery: let absurd or intense facts (triple-digit MPH, named track, specific town) land "
             "without hype adjectives. Dry humor only when the evidence earns it. Short clauses, cool distance."
         ),
+        "facets": {
+            "intensity": 2,
+            "pacing": "short clauses with a beat of silence between facts; cool distance",
+            "punctuation": "flat periods — the joke is the fact, not the mark",
+            "word_field": "no hype adjectives; let absurd or intense facts land bare; dry humor only when the evidence earns it",
+        },
     },
     "chaotic": {
         "label": "CHAOTIC — kinetic, clipped, interruptive",
@@ -138,11 +227,21 @@ TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Kinetic and interruptive: fragments OK, mid-thought jumps OK, but every fragment must be an evidence "
             "token (MPH sample, place, song, driver, HUD clock). Energy from pacing, not invented drama."
         ),
+        "facets": {
+            "intensity": 5,
+            "pacing": "interruptive: fragments OK, mid-thought jumps OK — energy comes from pacing, not invented drama",
+            "punctuation": "hard cuts, dashes, fragments; never trailing filler",
+            "word_field": "every fragment must be an evidence token (MPH sample, place, song, driver, HUD clock)",
+        },
     },
 }
 
 # Caption VOICE / PERSONA = who is speaking.
-VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+#
+# VOICE facets own ONLY the speaker levers: point of view (pronouns), diction,
+# sentence habits, and one signature move. VOICE never changes structure or
+# length (STYLE's job) and never changes emotional heat (TONE's job).
+VOICE_DIRECTIVES: Dict[str, Dict[str, Any]] = {
     "default": {
         "label": "DEFAULT — balanced, platform-friendly creator",
         "ui_label": "Default",
@@ -152,6 +251,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Match slang and terminology to what the content actually is (chef terms for food, dev terms for code, "
             "driver terms for a drive). Neutral, broadly likeable point of view."
         ),
+        "facets": {
+            "pov": "neutral, broadly likeable creator; first or close second person as the content suggests",
+            "diction": "match terminology to what the content actually is (chef terms for food, driver terms for a drive)",
+            "habits": "clear hook, specific middle, satisfying close",
+            "signature": "confident but never performative",
+        },
     },
     "mentor": {
         "label": "MENTOR — wise, educational, authority",
@@ -162,6 +267,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "specifics, never a credentials flex. When the clip teaches or demonstrates anything, land one usable "
             "takeaway. Calm authority — the voice of someone who has done this many times."
         ),
+        "facets": {
+            "pov": "second person 'you'-oriented, experienced guide",
+            "diction": "precise specifics and practical verbs; zero condescension, never a credentials flex",
+            "habits": "land one usable takeaway when the clip teaches or demonstrates anything",
+            "signature": "the calm authority of someone who has done this many times",
+        },
     },
     "hypebeast": {
         "label": "HYPEBEAST — all-caps energy, slang, viral",
@@ -172,6 +283,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "word that matters. Slang only when it fits the subject and platform — never empty viral filler "
             "('this is insane', 'no way'). All the hype must trace to a real on-screen or audio moment."
         ),
+        "facets": {
+            "pov": "street-energy first person, talking to the feed",
+            "diction": "street/viral cadence; slang only when it fits the subject; sparing ALL-CAPS on the one word that matters",
+            "habits": "clipped sentences with rhythm; never empty viral filler ('this is insane', 'no way')",
+            "signature": "every ounce of hype traces to a real on-screen or audio moment",
+        },
     },
     "best_friend": {
         "label": "BEST FRIEND — casual, real, relatable",
@@ -182,6 +299,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "humor when the content allows, relatable aside. Never mean-spirited or faux-chaos. Reads like a friend, "
             "not a brand. Second-person ('you') and shared-moment framing welcome."
         ),
+        "facets": {
+            "pov": "second person 'you', warm peer texting a friend; shared-moment framing welcome",
+            "diction": "conversational fragments OK; light self-aware humor when the content allows",
+            "habits": "one relatable aside; never mean-spirited or faux-chaos",
+            "signature": "reads like a friend, never a brand",
+        },
     },
     "teacher": {
         "label": "TEACHER — clear, informative, structured",
@@ -192,6 +315,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "it. If the clip is not instructional, still be precise — teach what happened or what to notice in the "
             "footage, not an unrelated life lesson. Structure and signposting over flourish."
         ),
+        "facets": {
+            "pov": "structured educator addressing learners; neutral person",
+            "diction": "minimal jargon unless the visuals expect it; signposting words over flourish",
+            "habits": "one central idea carried through a logical mini-arc",
+            "signature": "teach what happened or what to notice in the footage — never an unrelated life lesson",
+        },
     },
     "cinematic_narrator": {
         "label": "CINEMATIC — film narrator, epic, atmospheric",
@@ -202,6 +331,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Anchored to real events in the clip — no epic narration of nothing happening. Reserve the biggest "
             "flourish for the genuine peak in the footage. Think voiceover, not influencer."
         ),
+        "facets": {
+            "pov": "third-person omniscient trailer narrator",
+            "diction": "declarative, image-stacking, slightly elevated register",
+            "habits": "reserve the biggest flourish for the genuine peak in the footage",
+            "signature": "voiceover, not influencer — no epic narration of nothing happening",
+        },
     },
     "radio_host": {
         "label": "RADIO HOST — drive-time DJ energy",
@@ -211,6 +346,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Drive-time host: call out the track, the town, and the speed like a live break — punchy intros, "
             "warm banter cadence, never fake caller bits. Music + place + motion from the Scene Graph only."
         ),
+        "facets": {
+            "pov": "live drive-time host addressing listeners on-air",
+            "diction": "track + town + speed callouts; warm banter cadence",
+            "habits": "punchy intro like a live break; never fake caller bits",
+            "signature": "music + place + motion, all from the Scene Graph only",
+        },
     },
     "journalist": {
         "label": "JOURNALIST — tight lede, who/what/where",
@@ -220,6 +361,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "News lede voice: who/what/where/when from HUD + geo + music ID. Neutral verbs, specific nouns, "
             "no hype adjectives. Think wire-copy tightness with one vivid detail from the timeline."
         ),
+        "facets": {
+            "pov": "neutral third-person wire reporter",
+            "diction": "neutral verbs, specific nouns, no hype adjectives",
+            "habits": "who/what/where/when lede built from HUD + geo + music ID",
+            "signature": "wire-copy tightness with one vivid detail from the timeline",
+        },
     },
     "passenger": {
         "label": "PASSENGER — shotgun seat, you-are-there",
@@ -229,6 +376,12 @@ VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
             "Shotgun-seat witness: 'we're doing X MPH near Y with Z on the speakers' energy. Present tense, "
             "body-in-the-cabin details only when visible (HUD, road, cabin cues). Never invent passengers or drama."
         ),
+        "facets": {
+            "pov": "first-person present tense from the shotgun seat — 'we're doing X near Y with Z on the speakers'",
+            "diction": "cabin-visible details only (HUD, road, speaker cues)",
+            "habits": "you-are-there immediacy; ride the moment as it happens",
+            "signature": "never invent passengers or drama",
+        },
     },
 }
 
@@ -273,16 +426,214 @@ def normalize_caption_voice(value: Any, *, default: str = DEFAULT_CAPTION_VOICE)
     return default
 
 
-def style_directive(style_ui: str) -> Dict[str, str]:
+def style_directive(style_ui: str) -> Dict[str, Any]:
     return STYLE_DIRECTIVES[normalize_caption_style(style_ui)]
 
 
-def tone_directive(tone_ui: str) -> Dict[str, str]:
+def tone_directive(tone_ui: str) -> Dict[str, Any]:
     return TONE_DIRECTIVES[normalize_caption_tone(tone_ui)]
 
 
-def voice_directive(voice_ui: str) -> Dict[str, str]:
+def voice_directive(voice_ui: str) -> Dict[str, Any]:
     return VOICE_DIRECTIVES[normalize_caption_voice(voice_ui)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combinatorial composer
+#
+# Every (style, tone, voice) triple composes into ONE coherent brief instead of
+# three stacked paragraphs. Ownership is strict:
+#   STYLE  → architecture, hook mechanic, length band, beat plan, rotation
+#   TONE   → intensity (1–5), pacing, punctuation, word-field
+#   VOICE  → point of view, diction, sentence habits, signature move
+# Interaction rules below are DERIVED from the facets, so adding a new style,
+# tone, or voice to the registries automatically yields new valid combinations
+# (currently len(styles) × len(tones) × len(voices)) with no extra wiring.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COMPACT_STYLES = frozenset({"punchy", "listicle", "factual"})
+_ARC_STYLES = frozenset({"story", "diary"})
+_FIRST_PERSON_STYLES = frozenset({"diary"})
+_DISCIPLINED_VOICES = frozenset({"teacher", "journalist", "mentor"})
+_THIRD_PERSON_VOICES = frozenset({"cinematic_narrator", "journalist"})
+_EVIDENCE_LEAD_ROTATION: Tuple[str, ...] = (
+    "speed/telemetry",
+    "place/geo",
+    "object/visual",
+    "music/audio",
+    "trill/energy",
+)
+
+
+def total_combinations() -> int:
+    return len(STYLE_DIRECTIVES) * len(TONE_DIRECTIVES) * len(VOICE_DIRECTIVES)
+
+
+def combination_index(style_ui: str, tone_ui: str, voice_ui: str) -> int:
+    """Stable 1-based index of a combo in registry order (for logs/telemetry)."""
+    s = normalize_caption_style(style_ui)
+    t = normalize_caption_tone(tone_ui)
+    v = normalize_caption_voice(voice_ui)
+    si = CAPTION_STYLES.index(s)
+    ti = CAPTION_TONES.index(t)
+    vi = CAPTION_VOICES.index(v)
+    return si * len(CAPTION_TONES) * len(CAPTION_VOICES) + ti * len(CAPTION_VOICES) + vi + 1
+
+
+def _interaction_rules(style_key: str, tone_key: str, voice_key: str) -> List[str]:
+    """Deterministic tension-resolution rules derived from the facets.
+
+    These are what make each combination feel COMPOSED rather than three
+    directives pasted together: the hot/cold and compact/arc collisions get an
+    explicit resolution instead of letting the model pick a winner silently.
+    """
+    intensity = int(TONE_DIRECTIVES[tone_key]["facets"]["intensity"])
+    rules: List[str] = [
+        "If two rules collide: structure/length → STYLE wins; emotional heat → TONE wins; pronouns/diction → VOICE wins.",
+    ]
+    if intensity >= 4 and style_key in _ARC_STYLES:
+        rules.append(
+            f"High heat ({intensity}/5) inside an arc style: compress — shorter sentences INSIDE the "
+            "style's length band and beat plan, never a longer caption."
+        )
+    if intensity >= 4 and style_key in _COMPACT_STYLES:
+        rules.append(
+            f"High heat ({intensity}/5) on a compact style: the energy lives in verb choice and cut rhythm; "
+            "the character budget does not grow."
+        )
+    if intensity <= 2 and style_key in _COMPACT_STYLES:
+        rules.append(
+            f"Low heat ({intensity}/5) on a compact style: keep the compression, strip the urgency — "
+            "the hook lands through specificity, not volume."
+        )
+    if intensity <= 2 and style_key == "freestyle":
+        rules.append(
+            f"Low heat ({intensity}/5) freestyle: invention shows in the SHAPE, not in energy words."
+        )
+    if intensity >= 4 and voice_key in _DISCIPLINED_VOICES:
+        rules.append(
+            f"High heat ({intensity}/5) through a disciplined voice: the speaker stays composed — energy "
+            "shows in verbs and pacing, never slang or caps beyond the voice's own rules."
+        )
+    if intensity <= 2 and voice_key == "hypebeast":
+        rules.append(
+            f"Hypebeast at low heat ({intensity}/5): keep the cadence and diction, drop the caps and emphatics."
+        )
+    if style_key in _FIRST_PERSON_STYLES and voice_key in _THIRD_PERSON_VOICES:
+        rules.append(
+            "POV clash: keep the STYLE's log/diary structure but write it in the VOICE's third-person "
+            "pronouns — a field report ABOUT the drive, same beat order."
+        )
+    rules.append(
+        "Swap-test: if any ONE of the three knobs changed, the copy must read audibly different — "
+        "different opening rhythm, sentence lengths, and word choices, not the same caption reskinned."
+    )
+    return rules
+
+
+def interaction_contract(style_ui: str, tone_ui: str, voice_ui: str) -> str:
+    """Bullet list of the composed tension-resolution rules for a combo.
+
+    For consumers (legacy caption_stage prompt) that already print the three
+    directives separately and only need the per-combination interaction rules.
+    """
+    s_key = normalize_caption_style(style_ui)
+    t_key = normalize_caption_tone(tone_ui)
+    v_key = normalize_caption_voice(voice_ui)
+    intensity = int(TONE_DIRECTIVES[t_key]["facets"]["intensity"])
+    head = (
+        f"- Build the {s_key.upper()} structure, delivered at {t_key.upper()} intensity "
+        f"({intensity}/5), spoken as {v_key.upper()}."
+    )
+    rules = "\n".join(f"- {r}" for r in _interaction_rules(s_key, t_key, v_key))
+    return f"{head}\n{rules}"
+
+
+def compose_creative_directive(
+    style_ui: str,
+    tone_ui: str,
+    voice_ui: str,
+    *,
+    variant_seed: Optional[int] = None,
+) -> str:
+    """Compose one coherent creative brief for a (style, tone, voice) triple.
+
+    Output changes materially when ANY single knob changes, and an optional
+    ``variant_seed`` (e.g. derived from the upload id) rotates which evidence
+    class leads variant 1 so identical settings still produce fresh openings
+    run-to-run.
+    """
+    s_key = normalize_caption_style(style_ui)
+    t_key = normalize_caption_tone(tone_ui)
+    v_key = normalize_caption_voice(voice_ui)
+    style = STYLE_DIRECTIVES[s_key]
+    tone = TONE_DIRECTIVES[t_key]
+    voice = VOICE_DIRECTIVES[v_key]
+    sf, tf, vf = style["facets"], tone["facets"], voice["facets"]
+    combo = f"{s_key.upper()} × {t_key.upper()} × {v_key.upper()}"
+    idx = combination_index(s_key, t_key, v_key)
+    intensity = int(tf["intensity"])
+
+    interaction = "\n".join(f"- {r}" for r in _interaction_rules(s_key, t_key, v_key))
+
+    rotation_line = ""
+    if variant_seed is not None:
+        lead = _EVIDENCE_LEAD_ROTATION[int(variant_seed) % len(_EVIDENCE_LEAD_ROTATION)]
+        rotation_line = (
+            f"\nFRESHNESS ROTATION (seed {int(variant_seed)}): variant 1 foregrounds a {lead} token "
+            "(when that evidence exists), then continue the style's own rotation order. "
+            "This keeps repeat uploads with identical settings from opening the same way.\n"
+        )
+
+    return f"""━━ CREATIVE COMBINATION BRIEF — {combo} (combination {idx}/{total_combinations()}) ━━
+This is ONE composed contract, not three stacked essays. Each axis owns different levers; apply all
+three simultaneously. Delivery only — every fact, name, number still comes from Scene Graph evidence.
+
+ARCHITECTURE — owned by STYLE = {style['label']}:
+  structure: {sf['architecture']}
+  hook mechanic: {sf['hook']}
+  length: {sf['length']}
+  beat plan: {sf['beats']}
+  variant rotation: {sf['rotation']}
+  full contract: {style['blueprint']}
+
+ENERGY — owned by TONE = {tone['label']} (intensity {intensity}/5):
+  pacing: {tf['pacing']}
+  punctuation: {tf['punctuation']}
+  word-field: {tf['word_field']}
+  full register: {tone['register']}
+
+SPEAKER — owned by VOICE = {voice['label']}:
+  point of view: {vf['pov']}
+  diction: {vf['diction']}
+  sentence habits: {vf['habits']}
+  signature: {vf['signature']}
+  full persona: {voice['persona']}
+
+INTERACTION CONTRACT (composed for THIS combination — non-negotiable):
+- Build the {s_key.upper()} structure, delivered at {t_key.upper()} intensity ({intensity}/5), spoken as {v_key.upper()}.
+{interaction}
+- Do NOT fall back to a neutral house voice. The selected voice's diction and point of view must be
+  audible in every variant; the tone's temperature must be felt in every sentence.
+- Stay evidence-grounded: this brief is HOW it is said; the Scene Graph is WHAT is said.
+{rotation_line}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+
+def cell_micro_brief(style_ui: str, tone_ui: str, voice_ui: str) -> str:
+    """Compact one-line composed brief for evidence-matrix cells."""
+    s_key = normalize_caption_style(style_ui)
+    t_key = normalize_caption_tone(tone_ui)
+    v_key = normalize_caption_voice(voice_ui)
+    sf = STYLE_DIRECTIVES[s_key]["facets"]
+    tf = TONE_DIRECTIVES[t_key]["facets"]
+    vf = VOICE_DIRECTIVES[v_key]["facets"]
+    hook = str(sf["hook"]).split("—")[0].split("(")[0].strip().rstrip(";,. ")
+    pacing = str(tf["pacing"]).split(";")[0].split("—")[0].strip().rstrip(";,. ")
+    pov = str(vf["pov"]).split("—")[0].split(";")[0].strip().rstrip(";,. ")
+    return (
+        f"{s_key} structure ({sf['length']}), heat {int(tf['intensity'])}/5 ({pacing}), "
+        f"spoken as {pov}; hook: {hook}"
+    )
 
 
 def ui_style_options() -> List[Dict[str, str]]:
@@ -430,6 +781,11 @@ __all__ = [
     "style_directive",
     "tone_directive",
     "voice_directive",
+    "total_combinations",
+    "combination_index",
+    "compose_creative_directive",
+    "interaction_contract",
+    "cell_micro_brief",
     "ui_style_options",
     "ui_tone_options",
     "ui_voice_options",

@@ -344,8 +344,8 @@ async def verify_single_attempt(
                             if updated:
                                 await conn.execute(
                                     "UPDATE uploads SET platform_results = $1::jsonb, updated_at = NOW() WHERE id = $2",
-                                    # Pass list — codecs that always dumps() must not see a pre-dumped str.
-                                    pr_list,
+                                    # String bind works with or without pool codecs (no double-encode).
+                                    db_stage._jsonb_bind(pr_list),
                                     upload_id,
                                 )
                                 logger.info(

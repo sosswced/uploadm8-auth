@@ -34,12 +34,19 @@ async def _init_asyncpg_codecs(conn):
         return
     except Exception:
         pass
+    # Fallback must use string-passthrough encoder — callers (e.g. _jsonb_bind)
+    # may already json.dumps(); raw dumps() here double-encodes jsonb scalars.
+    try:
+        from stages.asyncpg_json_codecs import json_param_encoder as _json_enc
+    except Exception:
+        def _json_enc(v):
+            if isinstance(v, str):
+                return v
+            return json.dumps(v, separators=(",", ":"), ensure_ascii=False, default=str)
     try:
         await conn.set_type_codec(
             'json',
-            encoder=lambda v: json.dumps(
-                v, separators=(',', ':'), ensure_ascii=False, default=str
-            ),
+            encoder=_json_enc,
             decoder=json.loads,
             schema='pg_catalog',
         )
@@ -48,9 +55,7 @@ async def _init_asyncpg_codecs(conn):
     try:
         await conn.set_type_codec(
             'jsonb',
-            encoder=lambda v: json.dumps(
-                v, separators=(',', ':'), ensure_ascii=False, default=str
-            ),
+            encoder=_json_enc,
             decoder=json.loads,
             schema='pg_catalog',
         )

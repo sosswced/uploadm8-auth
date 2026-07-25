@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from services.deferred_publish_schedule import (
+    expected_publish_targets_resolved,
     next_due_scheduled_time,
     platforms_due_for_publish,
     still_has_pending_publish_slots,
@@ -72,6 +73,53 @@ ABANDONED_PENDING_HOURS = _env_int("ABANDONED_PENDING_HOURS", 24)
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _resolve_ready_publish_targets(
+    conn: Any, upload: dict[str, Any]
+) -> list[tuple[str, Optional[str]]]:
+    """Resolve ``(platform, token_row_id)`` for ready_to_publish due checks."""
+    platforms = [
+        str(p).strip().lower()
+        for p in (upload.get("platforms") or [])
+        if str(p).strip()
+    ]
+    raw_targets = upload.get("target_accounts") or []
+    if isinstance(raw_targets, str):
+        try:
+            raw_targets = json.loads(raw_targets) if raw_targets.strip() else []
+        except Exception:
+            raw_targets = [raw_targets] if raw_targets.strip() else []
+    token_ids = [str(t).strip() for t in (raw_targets or []) if str(t).strip()]
+    if not token_ids:
+        return [(p, None) for p in platforms]
+
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id::text AS id, lower(platform) AS platform
+              FROM platform_tokens
+             WHERE id = ANY($1::uuid[])
+               AND revoked_at IS NULL
+            """,
+            token_ids,
+        )
+    except Exception as e:
+        logger.warning(
+            "ready_to_publish: target_accounts resolve failed (%s) — platform fallback",
+            e,
+        )
+        return [(p, None) for p in platforms]
+
+    by_id = {str(r["id"]): str(r["platform"] or "").strip().lower() for r in rows}
+    pairs: list[tuple[str, str]] = []
+    for tid in token_ids:
+        plat = by_id.get(tid)
+        if plat:
+            pairs.append((plat, tid))
+    if pairs:
+        return expected_publish_targets_resolved(platforms, pairs)
+    return [(p, None) for p in platforms]
 
 
 async def recover_staged_without_schedule(
@@ -492,12 +540,59 @@ async def recover_stuck_ready_to_publish(
         limit,
     )
 
-    stats = {"repaired": 0, "redispatched": 0, "failed": 0, "skipped": 0}
+    stats = {"repaired": 0, "redispatched": 0, "failed": 0, "skipped": 0, "reconciled": 0}
     for row in rows:
         upload_id = str(row["id"])
         user_id = str(row["user_id"])
         upload = dict(row)
         mode = str(upload.get("schedule_mode") or "scheduled").strip().lower()
+
+        # Ledger already covers all expected slots → terminalize, never redispatch.
+        _attempts: list = []
+        try:
+            from services.upload.publish_ledger_reconcile import (
+                ledger_covers_expected_slots,
+                load_publish_attempts_for_upload,
+                reconcile_stuck_processing_from_ledger,
+                resolve_live_target_token_ids,
+            )
+
+            _attempts = await load_publish_attempts_for_upload(db_pool, upload_id)
+            _live = await resolve_live_target_token_ids(db_pool, upload)
+            if ledger_covers_expected_slots(_attempts, upload, live_token_ids=_live):
+                _rec = await reconcile_stuck_processing_from_ledger(
+                    db_pool, upload_id, user_id=user_id
+                )
+                if _rec.get("ok"):
+                    stats["reconciled"] += 1
+                    logger.warning(
+                        "[%s] ready_to_publish: ledger complete → reconciled (%s)",
+                        upload_id,
+                        _rec.get("reason"),
+                    )
+                    continue
+        except Exception as _led_e:
+            logger.debug("[%s] ready_to_publish ledger check: %s", upload_id, _led_e)
+
+        # Fresh pending ledger slot(s) = Step A likely in-flight on another
+        # publisher — never redispatch on top of it (double-post risk).
+        try:
+            from services.upload.publish_ledger_reconcile import (
+                has_fresh_pending_attempts,
+            )
+
+            if has_fresh_pending_attempts(_attempts):
+                stats["skipped"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish: fresh pending ledger slot(s) — "
+                    "skip redispatch (avoid double-post)",
+                    upload_id,
+                )
+                continue
+        except Exception as _pend_e:
+            logger.debug("[%s] ready_to_publish pending check: %s", upload_id, _pend_e)
+
+        publish_targets = await _resolve_ready_publish_targets(conn, upload)
 
         # --- Missing scheduled_time ---
         if upload.get("scheduled_time") is None:
@@ -565,9 +660,13 @@ async def recover_stuck_ready_to_publish(
         if hasattr(st, "tzinfo") and st is not None and st.tzinfo is None:
             st = st.replace(tzinfo=timezone.utc)
 
-        due = platforms_due_for_publish(upload, now)
-        next_anchor = next_due_scheduled_time(upload, upload.get("platform_results"))
-        has_pending = still_has_pending_publish_slots(upload, upload.get("platform_results"))
+        due = platforms_due_for_publish(upload, now, publish_targets=publish_targets)
+        next_anchor = next_due_scheduled_time(
+            upload, upload.get("platform_results"), publish_targets=publish_targets
+        )
+        has_pending = still_has_pending_publish_slots(
+            upload, upload.get("platform_results"), publish_targets=publish_targets
+        )
 
         # Smart with remaining targets but no resolvable slot → repair once, then fail
         if mode == "smart" and has_pending and next_anchor is None and not due:
@@ -576,10 +675,12 @@ async def recover_stuck_ready_to_publish(
                 upload["scheduled_time"] = repaired_st
                 if repaired_meta is not None:
                     upload["schedule_metadata"] = repaired_meta
-                next_anchor = next_due_scheduled_time(upload, upload.get("platform_results"))
-                due = platforms_due_for_publish(upload, now)
+                next_anchor = next_due_scheduled_time(
+                    upload, upload.get("platform_results"), publish_targets=publish_targets
+                )
+                due = platforms_due_for_publish(upload, now, publish_targets=publish_targets)
                 has_pending = still_has_pending_publish_slots(
-                    upload, upload.get("platform_results")
+                    upload, upload.get("platform_results"), publish_targets=publish_targets
                 )
                 if next_anchor is not None or due:
                     stats["repaired"] += 1

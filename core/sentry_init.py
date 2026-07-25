@@ -82,6 +82,60 @@ def _should_drop_fastapi_testclient_request(event: dict[str, Any]) -> bool:
     return False
 
 
+def _should_drop_pytest_process(event: dict[str, Any] | None = None) -> bool:
+    """Drop events when unit tests opt in via ``SENTRY_DROP_PYTEST_EVENTS=1``.
+
+    Set from ``tests/conftest.py`` so fail-closed / logger.error paths cannot
+    open Sentry issues (UPLOADM8-AP). Not inferred from argv alone — that would
+    blank ``tests/test_sentry_init.py`` assertions on before_send keep/drop.
+    """
+    del event
+    flag = (os.environ.get("SENTRY_DROP_PYTEST_EVENTS") or "").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _should_drop_pipeline_control_flow(event: dict[str, Any], hint: dict[str, Any] | None) -> bool:
+    """SkipStage / expected user-config skips are not actionable (UPLOADM8-8G/8N/8P)."""
+    info = hint.get("exc_info") if hint else None
+    if info and len(info) >= 1 and info[0] is not None:
+        try:
+            if getattr(info[0], "__name__", "") == "SkipStage":
+                return True
+        except Exception:
+            pass
+    for entry in (event.get("exception") or {}).get("values", []) or []:
+        if str(entry.get("type") or "") == "SkipStage":
+            return True
+    blob = " ".join(_exception_chain_values(event, hint))
+    le = event.get("logentry") or {}
+    if isinstance(le, dict):
+        blob += f" {le.get('message') or ''} {le.get('formatted') or ''}"
+    blob_l = f"{blob} {event.get('message') or ''}".lower()
+    if "linked pikzels persona required" in blob_l:
+        return True
+    if "disabled in upload preferences" in blob_l:
+        return True
+    return False
+
+
+def _should_drop_openai_quota_log(event: dict[str, Any]) -> bool:
+    """OpenAI billing/quota exhaustion is ops, not a code bug (UPLOADM8-8J/8K)."""
+    le = event.get("logentry") or {}
+    parts = [str(event.get("message") or "")]
+    if isinstance(le, dict):
+        parts.extend([str(le.get("message") or ""), str(le.get("formatted") or "")])
+    blob = " ".join(parts).lower()
+    if "insufficient_quota" in blob:
+        return True
+    if "exceeded your current quota" in blob:
+        return True
+    if "m8 engine http 429" in blob:
+        return True
+    if "openai api error: 429" in blob:
+        return True
+    return False
+
+
 def _should_drop_uvicorn_lifespan_shutdown_event(event: dict[str, Any]) -> bool:
     """
     Uvicorn logs ``CancelledError`` / ``KeyboardInterrupt`` from the lifespan ASGI
@@ -159,9 +213,35 @@ def _should_drop_localhost_db_acquire_noise(event: dict[str, Any], hint: dict[st
         log_blob = f"{le.get('message') or ''} {le.get('formatted') or ''}"
     if "unexpected connection_lost()" in log_blob or "Future exception was never retrieved" in log_blob:
         return True
-    if not _is_localhost_url(_request_url(event)) and not _is_local_uvicorn_process():
-        return False
-    if "TimeoutError" in type_blob:
+    # Local / laptop API: Neon wake, pool churn, and mid-flight closes are not
+    # product bugs — they flood Sentry during TUP / overnight (false signal).
+    transient_types = (
+        "TimeoutError",
+        "ConnectionDoesNotExistError",
+        "CannotConnectNowError",
+        "InterfaceError",
+        "ConnectionResetError",
+        "ConnectionError",
+    )
+    # Drop only when the *event* is local traffic. Do not use process-wide
+    # ``_is_local_uvicorn_process`` (E2E_TUP in the shell) — that would hide
+    # production-URL errors during TUP/unit runs.
+    req_url = _request_url(event)
+    local_req = _is_localhost_url(req_url)
+    no_req_local_proc = (not req_url) and _is_local_uvicorn_process()
+    local_noise = local_req or no_req_local_proc
+    if any(t in type_blob for t in transient_types) and local_noise:
+        return True
+    values = " ".join(_exception_chain_values(event, hint)).lower()
+    if any(
+        n in values
+        for n in (
+            "connection was closed in the middle of operation",
+            "the database system is in recovery mode",
+            "the database system is not yet accepting connections",
+            "server closed the connection unexpectedly",
+        )
+    ) and local_noise:
         return True
     return False
 
@@ -188,6 +268,12 @@ def _exception_chain_values(event: dict[str, Any], hint: dict[str, Any] | None) 
 
 def _before_send(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str, Any] | None:
     try:
+        if _should_drop_pytest_process(event):
+            return None
+        if _should_drop_pipeline_control_flow(event, hint):
+            return None
+        if _should_drop_openai_quota_log(event):
+            return None
         if _should_drop_async_shutdown_noise(event, hint):
             return None
         if _should_drop_uvicorn_lifespan_shutdown_event(event):

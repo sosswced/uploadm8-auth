@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -33,6 +34,13 @@ from core.sql_allowlist import (
 from .context import JobContext, is_placeholder_upload_caption, is_placeholder_upload_title
 
 logger = logging.getLogger("uploadm8-worker")
+
+# Pending ledger slots older than this are treated as abandoned by their owner
+# and may be reclaimed for a retry. Keep aligned with
+# services.upload.publish_ledger_reconcile.has_fresh_pending_attempts (1800s).
+PENDING_ATTEMPT_RECLAIM_AGE_SEC = max(
+    300, int(os.environ.get("PENDING_ATTEMPT_RECLAIM_AGE_SEC", "1800") or 1800)
+)
 
 
 # ============================================================
@@ -401,15 +409,13 @@ async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> O
 # ============================================================
 
 def _platform_results_payload(ctx: JobContext) -> Optional[list]:
-    """Return a Python list for asyncpg jsonb binding.
+    """Return a Python list of platform result dicts (or None).
 
-    Pass the list (not ``json.dumps``) so codecs that always ``json.dumps`` the
-    parameter do not double-encode into a JSON *string* row. That double-encode
-    made the UI treat platform_results as empty and stuck on Awaiting confirmation.
+    Dedupes on write so poll detail and queue chips share one chip model.
     """
     if not ctx.platform_results:
         return None
-    return [
+    raw = [
         {
             "platform": r.platform,
             "success": r.success,
@@ -430,11 +436,33 @@ def _platform_results_payload(ctx: JobContext) -> Optional[list]:
         }
         for r in ctx.platform_results
     ]
+    try:
+        from services.uploads_api import dedupe_platform_result_entries
+
+        return dedupe_platform_result_entries(raw)
+    except Exception:
+        return raw
 
 
 # Back-compat alias (tests / older callers).
 def _platform_results_json(ctx: JobContext) -> Optional[list]:
     return _platform_results_payload(ctx)
+
+
+def _jsonb_bind(value: Any) -> Optional[str]:
+    """Encode a value for ``$n::jsonb`` binds on pools with or without codecs.
+
+    Worker pools historically omitted jsonb codecs, so passing a raw list made
+    asyncpg raise ``expected str, got list`` *after* TikTok already accepted the
+    publish — leaving the UI on Processing 0% and emailing a false failure.
+    ``json_param_encoder`` dumps objects once and passes pre-dumped strings through
+    so API pools with codecs do not double-encode.
+    """
+    if value is None:
+        return None
+    from stages.asyncpg_json_codecs import json_param_encoder
+
+    return json_param_encoder(value)
 
 
 async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
@@ -444,20 +472,35 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
     entered a pipeline stage (API/complete often sets status=processing before the
     worker runs — refusing those claims deadlocks the job forever).
 
+    Also reclaims aged ``processing_stage='claimed'`` rows: a worker can die after
+    claim and before the first real stage update; without this, Redis consumers
+    skip forever while the UI stays on Claimed.
+
     Atomically sets ``processing_stage='claimed'`` when stage is empty so two
     workers cannot both win the orphan/queued race (UPDATE … WHERE stage='' ).
     Never revives ``failed`` / terminal rows.
     """
+    try:
+        from services.upload.orphan_processing import orphan_processing_grace_seconds
+
+        claimed_grace = int(orphan_processing_grace_seconds())
+    except Exception:
+        claimed_grace = 90
+    claimed_grace = max(15, claimed_grace)
+
     async with pool.acquire() as conn:
         tag = await conn.execute(
             """
             UPDATE uploads
             SET status = 'processing',
-                processing_started_at = COALESCE(processing_started_at, $2),
-                processing_stage = CASE
-                    WHEN COALESCE(NULLIF(BTRIM(processing_stage), ''), '') = ''
-                    THEN 'claimed'
-                    ELSE processing_stage
+                processing_started_at = COALESCE($2, NOW()),
+                processing_stage = 'claimed',
+                -- Seed a tiny progress so the UI is not stuck at 0% during claim/slot wait
+                -- (fake "~55m remaining" was est−elapsed with progress never written).
+                processing_progress = CASE
+                    WHEN processing_progress IS NULL OR processing_progress <= 0
+                    THEN 3
+                    ELSE processing_progress
                 END,
                 error_code = NULL,
                 error_detail = NULL,
@@ -469,42 +512,134 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
                         status = 'processing'
                         AND COALESCE(NULLIF(BTRIM(processing_stage), ''), '') = ''
                     )
+                    OR (
+                        status = 'processing'
+                        AND LOWER(BTRIM(COALESCE(processing_stage, ''))) = 'claimed'
+                        AND COALESCE(updated_at, processing_started_at, created_at)
+                            < NOW() - ($3::int * INTERVAL '1 second')
+                    )
                   )
             """,
             ctx.upload_id,
             ctx.started_at or datetime.now(timezone.utc),
+            claimed_grace,
         )
         return str(tag or "") != "UPDATE 0"
 
 
-async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
-    """Mark upload as completed."""
-    platform_results_payload = _platform_results_payload(ctx)
+async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext) -> str:
+    """Mark upload as completed.
+
+    Returns ``\"full\"`` when status + platform_results land together, or
+    ``\"degraded\"`` when status is terminalized first and results are best-effort
+    (jsonb bind failures must never leave a successful publish stuck in
+    ``processing``).
+
+    On ``succeeded`` / ``partial``, clears stale ``output_artifacts.failure_phase``
+    so a prior fail-at-notify does not linger on a live publish.
+    """
+    platform_results_payload = _jsonb_bind(_platform_results_payload(ctx))
+    finished = ctx.finished_at or datetime.now(timezone.utc)
+    clear_failure_phase = str(ctx.state or "").strip().lower() in ("succeeded", "partial")
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE uploads
-            SET status = $2,
-                processing_finished_at = $3,
-                completed_at = CASE WHEN $2 IN ('succeeded','partial') THEN $3 ELSE completed_at END,
-                error_code = $4,
-                error_detail = $5,
-                platform_results = $6::jsonb,
-                compute_seconds = $7,
-                thumbnail_r2_key = COALESCE($8, thumbnail_r2_key),
-                updated_at = NOW()
-            WHERE id = $1
-            """,
-            ctx.upload_id,
-            ctx.state,
-            ctx.finished_at or datetime.now(timezone.utc),
-            ctx.error_code,
-            ctx.error_message,
-            platform_results_payload,
-            ctx.compute_seconds,
-            ctx.thumbnail_r2_key or None,
-        )
+        try:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET status = $2,
+                    processing_finished_at = $3,
+                    completed_at = CASE WHEN $2 IN ('succeeded','partial') THEN $3 ELSE completed_at END,
+                    error_code = $4,
+                    error_detail = $5,
+                    platform_results = $6::jsonb,
+                    compute_seconds = $7,
+                    thumbnail_r2_key = COALESCE($8, thumbnail_r2_key),
+                    processing_stage = CASE
+                        WHEN $2 IN ('succeeded','partial','failed','cancelled') THEN 'done'
+                        ELSE processing_stage
+                    END,
+                    processing_progress = CASE
+                        WHEN $2 IN ('succeeded','partial','failed','cancelled') THEN 100
+                        ELSE processing_progress
+                    END,
+                    output_artifacts = CASE
+                        WHEN $9 THEN COALESCE(output_artifacts, '{}'::jsonb) - 'failure_phase'
+                        ELSE output_artifacts
+                    END,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                ctx.state,
+                finished,
+                ctx.error_code,
+                ctx.error_message,
+                platform_results_payload,
+                ctx.compute_seconds,
+                ctx.thumbnail_r2_key or None,
+                clear_failure_phase,
+            )
+            return "full"
+        except Exception as full_err:
+            logger.warning(
+                "[%s] mark_processing_completed full write failed — status-first fallback: %s",
+                ctx.upload_id,
+                full_err,
+            )
+            # Terminalize status first so the UI / reclaim leave "processing".
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET status = $2,
+                    processing_finished_at = $3,
+                    completed_at = CASE WHEN $2 IN ('succeeded','partial') THEN $3 ELSE completed_at END,
+                    error_code = $4,
+                    error_detail = $5,
+                    compute_seconds = $6,
+                    thumbnail_r2_key = COALESCE($7, thumbnail_r2_key),
+                    processing_stage = CASE
+                        WHEN $2 IN ('succeeded','partial','failed','cancelled') THEN 'done'
+                        ELSE processing_stage
+                    END,
+                    processing_progress = CASE
+                        WHEN $2 IN ('succeeded','partial','failed','cancelled') THEN 100
+                        ELSE processing_progress
+                    END,
+                    output_artifacts = CASE
+                        WHEN $8 THEN COALESCE(output_artifacts, '{}'::jsonb) - 'failure_phase'
+                        ELSE output_artifacts
+                    END,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                ctx.state,
+                finished,
+                ctx.error_code,
+                ctx.error_message,
+                ctx.compute_seconds,
+                ctx.thumbnail_r2_key or None,
+                clear_failure_phase,
+            )
+            if platform_results_payload is not None:
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE uploads
+                        SET platform_results = $2::jsonb, updated_at = NOW()
+                        WHERE id = $1
+                        """,
+                        ctx.upload_id,
+                        platform_results_payload,
+                    )
+                except Exception as pr_err:
+                    logger.error(
+                        "[%s] platform_results persist failed after status terminalize: %s",
+                        ctx.upload_id,
+                        pr_err,
+                    )
+            return "degraded"
 
 
 async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> None:
@@ -518,7 +653,7 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
     """
     from services.deferred_publish_schedule import next_due_scheduled_time
 
-    platform_results_payload = _platform_results_payload(ctx)
+    platform_results_payload = _jsonb_bind(_platform_results_payload(ctx))
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -728,24 +863,32 @@ async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, 
         pass
     try:
         async with pool.acquire() as conn:
+            # Cast $2 consistently — asyncpg AmbiguousParameterError when the same
+            # param is inferred as varchar (column) and text (jsonb_build_object).
             await conn.execute(
                 """
                 UPDATE uploads
-                SET processing_stage    = $2,
+                SET processing_stage    = $2::text,
                     processing_progress = $3,
                     output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
                         || jsonb_build_object('last_processing_stage', $2::text),
                     updated_at          = NOW()
-                WHERE id = $1
+                WHERE id = $1::uuid
                 """,
                 upload_id,
-                stage,
-                progress,
+                str(stage or ""),
+                int(progress),
             )
-    except Exception:
-        # Non-fatal — if columns don't exist yet neither screen will show progress,
-        # but the pipeline won't crash
-        pass
+    except Exception as e:
+        # Non-fatal for the pipeline, but must be visible — silent failure leaves
+        # the UI stuck on ``claimed`` and freezes updated_at (false orphan reclaim).
+        logger.warning(
+            "[%s] update_stage_progress failed stage=%s progress=%s: %s",
+            upload_id,
+            stage,
+            progress,
+            e,
+        )
 
 
 # ============================================================
@@ -1555,29 +1698,145 @@ async def insert_publish_attempt(
     upload_id: str,
     user_id: str,
     platform: str,
-) -> Optional[str]:
-    """Insert a publish attempt row and return its ID."""
+    token_row_id: Optional[str] = None,
+) -> tuple[Optional[str], bool]:
+    """Claim a publish ledger slot.
+
+    Returns ``(attempt_id, skip_api)``:
+    - ``skip_api=True`` when an open accepted/fresh-pending slot already exists
+      (caller must not call the platform API again).
+    - ``attempt_id`` is the new or reused pending row id when API may proceed.
+    - ``(None, False)`` when the ledger table is missing / insert failed soft.
+    """
     attempt_id = str(uuid.uuid4())
+    tid = str(token_row_id).strip() if token_row_id else None
     try:
         async with pool.acquire() as conn:
             try:
+                if tid:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT id, status, updated_at, created_at
+                          FROM publish_attempts
+                         WHERE upload_id = $1::uuid
+                           AND lower(platform) = lower($2)
+                           AND token_row_id = $3::uuid
+                           AND status IN ('pending', 'accepted')
+                         ORDER BY created_at ASC
+                         LIMIT 1
+                        """,
+                        upload_id,
+                        platform,
+                        tid,
+                    )
+                else:
+                    existing = await conn.fetchrow(
+                        """
+                        SELECT id, status, updated_at, created_at
+                          FROM publish_attempts
+                         WHERE upload_id = $1::uuid
+                           AND lower(platform) = lower($2)
+                           AND token_row_id IS NULL
+                           AND status IN ('pending', 'accepted')
+                         ORDER BY created_at ASC
+                         LIMIT 1
+                        """,
+                        upload_id,
+                        platform,
+                    )
+                if existing:
+                    st = str(existing["status"] or "").strip().lower()
+                    if st == "accepted":
+                        return str(existing["id"]), True
+                    if st == "pending":
+                        # Fresh pending → another publisher's Step A is likely in
+                        # flight: skip. Aged pending → the owner died mid-call;
+                        # reclaim the slot atomically (single UPDATE winner) so
+                        # retries are not deadlocked forever by a zombie row.
+                        reclaimed = await conn.fetchval(
+                            """
+                            UPDATE publish_attempts
+                               SET updated_at = NOW()
+                             WHERE id = $1
+                               AND status = 'pending'
+                               AND COALESCE(updated_at, created_at)
+                                   < NOW() - ($2::int * INTERVAL '1 second')
+                            RETURNING id
+                            """,
+                            existing["id"],
+                            PENDING_ATTEMPT_RECLAIM_AGE_SEC,
+                        )
+                        if reclaimed:
+                            logger.warning(
+                                "insert_publish_attempt reclaimed aged pending slot "
+                                "upload=%s platform=%s token=%s attempt=%s",
+                                upload_id,
+                                platform,
+                                (tid[:8] + "…") if tid else "-",
+                                existing["id"],
+                            )
+                            return str(existing["id"]), False
+                        return str(existing["id"]), True
+
                 await conn.execute(
                     """
-                    INSERT INTO publish_attempts (id, upload_id, user_id, platform, status, created_at)
-                    VALUES ($1, $2, $3, $4, 'pending', NOW())
+                    INSERT INTO publish_attempts (
+                        id, upload_id, user_id, platform, status, token_row_id, created_at, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, 'pending', $5::uuid, NOW(), NOW())
                     """,
                     attempt_id,
                     upload_id,
                     user_id,
                     platform,
+                    tid,
                 )
-                return attempt_id
+                return attempt_id, False
+            except asyncpg.exceptions.UniqueViolationError:
+                # Race: another worker claimed the open slot — do not double-post.
+                logger.info(
+                    "insert_publish_attempt unique conflict upload=%s platform=%s token=%s — skip_api",
+                    upload_id,
+                    platform,
+                    (tid[:8] + "…") if tid else "-",
+                )
+                return None, True
             except asyncpg.exceptions.UndefinedTableError:
                 logger.debug("publish_attempts table not found, skipping ledger")
-                return None
+                return None, False
+            except asyncpg.exceptions.UndefinedColumnError:
+                # Pre-migration: insert without token_row_id.
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO publish_attempts (id, upload_id, user_id, platform, status, created_at)
+                        VALUES ($1, $2, $3, $4, 'pending', NOW())
+                        """,
+                        attempt_id,
+                        upload_id,
+                        user_id,
+                        platform,
+                    )
+                    return attempt_id, False
+                except Exception as legacy_e:
+                    # Fail-closed: we cannot prove no open slot exists — skip the
+                    # platform API rather than risk a duplicate post. Recovery
+                    # loops re-enter with the ledger once the DB is healthy.
+                    logger.warning(
+                        "insert_publish_attempt legacy insert failed (fail-closed, skip_api): %s",
+                        legacy_e,
+                    )
+                    return None, True
+    except asyncpg.exceptions.UndefinedTableError:
+        # Ledger not provisioned yet (pre-migration bootstrap) — the only
+        # deliberate fail-open: behave like the ledger feature is absent.
+        logger.debug("publish_attempts table not found, skipping ledger")
+        return None, False
     except Exception as e:
-        logger.warning(f"insert_publish_attempt failed: {e}")
-        return None
+        # Fail-closed on transient DB errors: a duplicate post is worse than a
+        # skipped platform (stale/ready recovery re-enters via the ledger).
+        logger.warning("insert_publish_attempt failed (fail-closed, skip_api): %s", e)
+        return None, True
 
 
 async def update_publish_attempt_success(

@@ -43,8 +43,10 @@ TWELVELABS_INDEX_ID = os.environ.get("TWELVELABS_INDEX_ID", "")  # Pre-created i
 # This flag lets ops auto-skip TL for clips that already have evidence floor.
 # Default ON (skip TL when VI gives us enough). Set to "false" to keep both
 # services running every time.
+# Default OFF: Scene Understanding should run whenever the user toggle + API key
+# are set. Set TWELVELABS_SKIP_WHEN_VI_RICH=true to re-enable the VI cost gate.
 TWELVELABS_SKIP_WHEN_VI_RICH = (
-    os.environ.get("TWELVELABS_SKIP_WHEN_VI_RICH", "true").lower() == "true"
+    os.environ.get("TWELVELABS_SKIP_WHEN_VI_RICH", "false").lower() == "true"
 )
 TWELVELABS_VI_RICH_OBJECT_MIN = int(os.environ.get("TWELVELABS_VI_RICH_OBJECT_MIN", "3") or 3)
 TWELVELABS_VI_RICH_LOGO_MIN = int(os.environ.get("TWELVELABS_VI_RICH_LOGO_MIN", "1") or 1)
@@ -146,9 +148,13 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
             raise SkipStage("Could not get/create Twelve Labs index")
 
         # Upload and index the video
-        video_id = await _upload_and_index(video_path, index_id, ctx.upload_id, ctx=ctx)
+        video_id, index_fail = await _upload_and_index(
+            video_path, index_id, ctx.upload_id, ctx=ctx
+        )
         if not video_id:
-            raise SkipStage("Video indexing failed")
+            raise SkipStage(
+                f"Video indexing failed{(': ' + index_fail) if index_fail else ''}"
+            )
 
         # Generate scene description
         description = await _generate_description(video_id, ctx=ctx)
@@ -163,6 +169,7 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
             "title_suggestion":  title_suggestion or "",
             "video_id":          video_id,
             "index_id":          index_id,
+            "source":            "twelve_labs",
         }
 
         # Custom queries — domain-specific prompts (brands, quotes, locations,
@@ -273,8 +280,11 @@ async def _upload_and_index(
     upload_id: str,
     *,
     ctx: Optional[JobContext] = None,
-) -> Optional[str]:
-    """Upload video file to Twelve Labs and wait for indexing to complete."""
+) -> tuple[Optional[str], str]:
+    """Upload video file to Twelve Labs and wait for indexing to complete.
+
+    Returns ``(video_id, fail_reason)``. ``fail_reason`` is empty on success.
+    """
     headers = {"x-api-key": TWELVE_LABS_API_KEY}
 
     file_size_mb = video_path.stat().st_size / 1024 / 1024
@@ -314,12 +324,12 @@ async def _upload_and_index(
                     http_status=resp.status_code,
                     response_body_snippet=resp.text[:1200],
                 )
-            return None
+            return None, f"upload HTTP {resp.status_code}"
 
         task_id = resp.json().get("_id") or resp.json().get("id")
         if not task_id:
             logger.warning("[twelvelabs] No task_id in upload response")
-            return None
+            return None, "no task_id in upload response"
 
         logger.info(f"[twelvelabs] Task created: {task_id} — polling for completion...")
 
@@ -358,7 +368,7 @@ async def _upload_and_index(
             if status == "ready":
                 video_id = data.get("video_id")
                 logger.info(f"[twelvelabs] Indexing complete — video_id={video_id}")
-                return video_id
+                return video_id, ""
 
             elif status in ("failed", "error"):
                 logger.warning(f"[twelvelabs] Indexing failed: {data}")
@@ -371,7 +381,13 @@ async def _upload_and_index(
                         message=f"task status={status}",
                         response_body_snippet=json.dumps(data, default=str)[:1200],
                     )
-                return None
+                err_msg = str(
+                    data.get("error")
+                    or data.get("message")
+                    or data.get("status")
+                    or "task failed"
+                )[:160]
+                return None, f"task {task_id}: {err_msg}"
 
             logger.debug(f"[twelvelabs] Polling attempt {attempt + 1}/{poll_budget}: status={status}")
 
@@ -380,7 +396,7 @@ async def _upload_and_index(
             poll_budget,
             (poll_budget * INDEX_POLL_INTERVAL) / 60.0,
         )
-        return None
+        return None, f"indexing timed out after ~{max_wait_min:.0f} min"
 
 
 async def _generate_description(video_id: str, *, ctx: Optional[JobContext] = None) -> Optional[str]:

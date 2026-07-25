@@ -20,8 +20,9 @@ Pipeline:
 3. Run Cloud Vision ``batch_annotate_images`` (``TEXT_DETECTION``) over the
    cropped strips in chunks of 16.
 4. Parse each strip with M8/Escort-tuned regexes for date, time, lat/lon,
-   speed (mph/kph), heading and driver name. The ``ESCORT.`` watermark is
-   filtered.
+   speed (**only** when ``mph`` / ``kmh`` / ``kph`` / ``km/h`` follows the
+   digits — bare numbers are never speeds), heading and driver name. The
+   ``ESCORT.`` watermark is filtered.
 5. Aggregate into ``ctx.dashcam_osd_context`` (``samples``, ``first_seen``,
    ``last_seen``, ``max_speed_mph``, ``gps_path``, ``coverage_pct`` …).
 6. **Backfill** ``ctx.telemetry_data`` when the user did not upload a .map file
@@ -136,7 +137,27 @@ _LATLON_RE = re.compile(
     + r"([+\-\u2010-\u2015]?\d{1,3}\.\d{2,7})" + _DEG
 )
 
-_SPEED_RE = re.compile(r"\b(\d{1,3})\s*(MPH|KMH|KPH|KM/H)\b", re.IGNORECASE)
+# Speed REQUIRES an explicit unit immediately after the number (mph / kmh).
+# Bare integers after GPS (road exits, lon fragments, house numbers) never count.
+_SPEED_RE = re.compile(
+    r"\b(\d{1,3})\s*(MPH|KMH|KPH|KM/H|MI/H)\b",
+    re.IGNORECASE,
+)
+
+# OCR often inserts junk between digits and the unit glyph (46°MPH, 46|MPH).
+_SPEED_OCR_SEP_RE = re.compile(
+    r"(\d{1,3})\s*[\|°·•./:`'\"]+\s*(?=(?:MPH|KMH|KPH|KM/H|MI/H)\b)",
+    re.IGNORECASE,
+)
+
+# Collapse OCR-mangled unit spellings before matching.
+_SPEED_UNIT_NORMALIZE = (
+    (re.compile(r"\bM\s*\.?\s*P\s*\.?\s*H\.?\b", re.IGNORECASE), "MPH"),
+    (re.compile(r"\bK\s*\.?\s*M\s*\.?\s*H\.?\b", re.IGNORECASE), "KMH"),
+    (re.compile(r"\bK\s*\.?\s*P\s*\.?\s*H\.?\b", re.IGNORECASE), "KPH"),
+    (re.compile(r"\bKM\s*/\s*H\b", re.IGNORECASE), "KM/H"),
+    (re.compile(r"\bMI\s*/\s*H\b", re.IGNORECASE), "MI/H"),
+)
 
 # Roadside / signage context — never treat these as vehicle HUD speed.
 _SPEED_LIMIT_CONTEXT_RE = re.compile(
@@ -159,7 +180,7 @@ _HEADING_RE = re.compile(
 # Trailing driver name (1–3 capitalized words after speed/heading, before
 # the ESCORT watermark). Heuristic — only kept when matched cleanly.
 _DRIVER_TAIL_RE = re.compile(
-    r"(?:MPH|KPH|KMH|KM/H)\s+([A-Z][A-Za-z\.]{0,15}(?:\s[A-Z][A-Za-z\.]{0,15}){0,2})",
+    r"(?:MPH|KPH|KMH|KM/H|MI/H)\s+([A-Z][A-Za-z\.]{0,15}(?:\s[A-Z][A-Za-z\.]{0,15}){0,2})",
 )
 
 # Brand watermarks that must never be parsed as driver names.
@@ -250,15 +271,31 @@ def _max_plausible_mph() -> float:
     return _env_float("DASHCAM_OSD_MAX_PLAUSIBLE_MPH", _SPEED_MPH_MAX_DEFAULT, 80.0, 300.0)
 
 
+def _normalize_speed_unit_text(line: str) -> str:
+    """Normalize OCR unit spellings so only unit-labeled speeds can match.
+
+    Bare integers are intentionally left alone — without mph/kmh after them
+    they never become speeds.
+    """
+    if not line:
+        return line
+    s = line
+    for pat, repl in _SPEED_UNIT_NORMALIZE:
+        s = pat.sub(repl, s)
+    # 46°MPH / 46|MPH / 46.MPH → "46 MPH"
+    s = _SPEED_OCR_SEP_RE.sub(r"\1 ", s)
+    return s
+
+
 def _speed_match_to_mph(m: re.Match) -> Tuple[Optional[float], Optional[str]]:
     try:
         v = float(m.group(1))
     except ValueError:
         return None, None
-    unit = m.group(2).upper().replace("/", "")
-    if unit in ("MPH",):
+    unit_raw = m.group(2).upper().replace("/", "")
+    if unit_raw in ("MPH", "MIH"):
         return v, "mph"
-    if unit in ("KMH", "KPH"):
+    if unit_raw in ("KMH", "KPH"):
         return v * 0.621371, "kph"
     return None, None
 
@@ -273,6 +310,10 @@ def _latlon_span(line: str) -> Optional[Tuple[int, int]]:
 def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     """Return (mph, unit_string). KPH is converted to MPH for caller.
 
+    **Unit required:** only tokens with mph / kmh / kph / km/h / mi/h
+    immediately after the digits are accepted. Bare numbers after GPS
+    (exits, lon fragments, house numbers) never count as speed.
+
     Prefers the HUD speed token that follows a lat/lon pair (Escort/M8 order:
     date → time → GPS → speed → driver). Rejects roadside speed-limit copy and
     values outside a plausible dashcam range so OCR of signs / noise cannot
@@ -281,6 +322,7 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     if not line or _SPEED_LIMIT_CONTEXT_RE.search(line):
         return None, None
 
+    line = _normalize_speed_unit_text(line)
     matches = list(_SPEED_RE.finditer(line))
     if not matches:
         return None, None

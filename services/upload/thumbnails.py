@@ -176,11 +176,19 @@ def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str,
         )
     )
     if skip_reason == "pikzels_insufficient_credits" or credits_failed:
-        msg = (
-            "Pikzels API returned insufficient credits (HTTP 402). "
-            "Top up the Pikzels account linked to PIKZELS_API_KEY, then re-upload "
-            "(UploadM8 Settings were already fine for this job)."
-        )
+        if method == "ai_edit":
+            msg = (
+                "Pikzels API returned insufficient credits (HTTP 402); "
+                "this upload used the OpenAI image-edit fallback on the real frame "
+                "(pikzels_insufficient_credits → ai_edit). Top up PIKZELS_API_KEY "
+                "to restore Studio covers."
+            )
+        else:
+            msg = (
+                "Pikzels API returned insufficient credits (HTTP 402). "
+                "Top up the Pikzels account linked to PIKZELS_API_KEY, then re-upload "
+                "(UploadM8 Settings were already fine for this job)."
+            )
         skip_reason = "pikzels_insufficient_credits"
     elif skip_reason == "tier_lacks_ai_thumbnail_styling":
         msg = (

@@ -195,6 +195,18 @@ def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
         "thumbnail_audience_niche": _cat("thumbnail_audience_niche"),
         "thumbnail_engine_mode": _cat("thumbnail_engine_mode"),
         "thumbnail_layout_pattern": _cat("thumbnail_layout_pattern"),
+        "identity_domain_tag": _cat("identity_domain_tag"),
+        "identity_domain_confidence": float(snap["identity_domain_confidence"])
+        if snap.get("identity_domain_confidence") is not None
+        else None,
+        "identity_hero_fact_class": _cat("identity_hero_fact_class"),
+        "identity_headline_class": _cat("identity_headline_class"),
+        "identity_confidence": _cat("identity_confidence"),
+        "identity_novel_content": (
+            _bool_int(snap.get("identity_novel_content"))
+            if snap.get("identity_novel_content") is not None
+            else None
+        ),
         "m8_engine": _bool_int(snap.get("m8_engine")),
         "ai_hashtags_enabled": _bool_int(snap.get("ai_hashtags_enabled")),
         "ai_hashtag_count": int(snap.get("ai_hashtag_count") or 0),

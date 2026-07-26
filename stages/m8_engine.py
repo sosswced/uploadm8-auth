@@ -2273,14 +2273,18 @@ async def _call_openai_m8_json(
     model: str,
     max_completion_tokens: int = 3500,
     http_timeout_sec: float = 120.0,
-) -> Tuple[Dict[str, Any], Dict[str, int]]:
-    """Vision + JSON response."""
+) -> Tuple[Dict[str, Any], Dict[str, int], str]:
+    """Vision + JSON response.
+
+    Returns ``(parsed, tokens, error_class)`` where ``error_class`` is empty on
+    success, or e.g. ``openai_quota`` / ``http_400`` / ``parse_failed``.
+    """
     if not OPENAI_API_KEY:
         logger.warning(
             "M8 Engine: OPENAI_API_KEY unset — skipping multimodal caption call "
             "(set key on workers; captions fall back to legacy path if enabled)."
         )
-        return {}, {"prompt": 0, "completion": 0}
+        return {}, {"prompt": 0, "completion": 0}, "no_api_key"
 
     safe_prompt = prompt.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
     content: List[Dict[str, Any]] = [{"type": "text", "text": safe_prompt}]
@@ -2331,16 +2335,22 @@ async def _call_openai_m8_json(
                 continue
             break
         if resp is None:
-            return {}, tokens
+            return {}, tokens, "no_response"
         if resp.status_code != 200:
             body_snip = (resp.text or "")[:400]
-            # Quota/rate-limit is ops signal — warning avoids Sentry ERROR spam (UPLOADM8-8K).
-            # Caption stage still falls through to fusion / hydration anchors.
-            if resp.status_code == 429 or "insufficient_quota" in body_snip.lower():
-                logger.warning("M8 Engine HTTP %s (quota/rate-limit): %s", resp.status_code, body_snip)
-            else:
-                logger.error("M8 Engine HTTP %s: %s", resp.status_code, body_snip)
-            return {}, tokens
+            # Billing quota vs transient 429 — caption stage skips legacy only on quota.
+            # Warning-level avoids Sentry ERROR spam (UPLOADM8-8K).
+            body_l = body_snip.lower()
+            if "insufficient_quota" in body_l or (
+                resp.status_code == 429 and "quota" in body_l
+            ):
+                logger.warning("M8 Engine HTTP %s (quota): %s", resp.status_code, body_snip)
+                return {}, tokens, "openai_quota"
+            if resp.status_code == 429:
+                logger.warning("M8 Engine HTTP 429 (rate-limit): %s", body_snip)
+                return {}, tokens, "openai_rate_limit"
+            logger.error("M8 Engine HTTP %s: %s", resp.status_code, body_snip)
+            return {}, tokens, f"http_{resp.status_code}"
 
         data = resp.json()
         usage = data.get("usage") or {}
@@ -2355,13 +2365,13 @@ async def _call_openai_m8_json(
             parsed = json.loads(raw.strip())
         except json.JSONDecodeError as e:
             logger.warning("M8 Engine JSON parse failed: %s", e)
-            return {}, tokens
-        return parsed, tokens
+            return {}, tokens, "parse_failed"
+        return parsed, tokens, ""
     except asyncio.CancelledError:
         raise
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as e:
         logger.warning("M8 Engine OpenAI request failed: %s", e)
-        return {}, tokens
+        return {}, tokens, "transport_error"
 
 
 def apply_selection_to_context(
@@ -2627,23 +2637,106 @@ async def run_m8_caption_engine(
     n_matrix = len(_evidence_matrix_cell_specs(caption_style, caption_tone, caption_voice))
     max_compl = 7800 if include_mat else 3500
     http_to = 200.0 if include_mat else 120.0
-    parsed, tokens = await _call_openai_m8_json(
-        frames=frames,
-        prompt=prompt,
-        model=model,
-        max_completion_tokens=max_compl,
-        http_timeout_sec=http_to,
-    )
-    if not parsed:
-        _trace_m8(ctx, str(ctx.upload_id), "result", {
-            "ok": False,
-            "error": "empty_or_failed",
+
+    # Compact prompt (no evidence matrix) for retry ladder after full fails.
+    compact_prompt = prompt
+    if include_mat:
+        compact_prompt = _build_m8_prompt(
+            ctx,
+            scene,
+            category,
+            caption_style,
+            caption_tone,
+            hashtag_style,
+            hashtag_count,
+            generate_title,
+            generate_caption,
+            generate_hashtags,
+            historical=historical,
+            strategy=strategy,
+            include_evidence_matrix=False,
+            caption_voice_ui=str(caption_voice or "default").lower(),
+            extra_strategy_block=extra_strategy_block,
+        )
+    # Soft cap oversized prompts (Vision + huge fusion dumps → 400/timeouts).
+    if len(compact_prompt) > 28_000:
+        compact_prompt = compact_prompt[:28_000].rstrip() + "\n…[prompt trimmed]"
+
+    ladder = [
+        {
+            "tier": "full",
+            "frames": list(frames[:6]),
+            "prompt": prompt if len(prompt) <= 48_000 else prompt[:48_000].rstrip() + "\n…[prompt trimmed]",
+            "max_compl": max_compl,
+            "http_to": http_to,
+        },
+        {
+            "tier": "compact",
+            "frames": list(frames[:2]),
+            "prompt": compact_prompt,
+            "max_compl": 2500,
+            "http_to": 90.0,
+        },
+        {
+            "tier": "text_only",
+            "frames": [],
+            "prompt": compact_prompt,
+            "max_compl": 2000,
+            "http_to": 60.0,
+        },
+    ]
+
+    parsed: Dict[str, Any] = {}
+    tokens: Dict[str, int] = {"prompt": 0, "completion": 0}
+    err_class = ""
+    used_tier = "none"
+    # Terminal — do not burn more OpenAI calls after billing/key failures.
+    _no_retry = frozenset({"openai_quota", "no_api_key"})
+    for i, step in enumerate(ladder):
+        if i > 0 and err_class in _no_retry:
+            break
+        if i > 0 and err_class == "openai_rate_limit":
+            await asyncio.sleep(1.2)
+        parsed, tokens, err_class = await _call_openai_m8_json(
+            frames=list(step["frames"]),
+            prompt=str(step["prompt"]),
+            model=model,
+            max_completion_tokens=int(step["max_compl"]),
+            http_timeout_sec=float(step["http_to"]),
+        )
+        used_tier = str(step["tier"])
+        _trace_m8(ctx, str(ctx.upload_id), "llm_tier", {
+            "tier": used_tier,
+            "ok": bool(parsed),
+            "error_class": err_class or "",
+            "frame_count": len(step["frames"]),
+            "prompt_chars": len(str(step["prompt"])),
             "tokens": tokens,
         })
-        return {"ok": False, "tokens": tokens, "error": "empty_or_failed"}
+        if parsed:
+            break
+        if err_class in _no_retry:
+            break
+
+    if not parsed:
+        err = "openai_quota" if err_class == "openai_quota" else (err_class or "empty_or_failed")
+        _trace_m8(ctx, str(ctx.upload_id), "result", {
+            "ok": False,
+            "error": err,
+            "error_class": err_class or "empty_or_failed",
+            "tokens": tokens,
+            "llm_tier": used_tier,
+        })
+        return {
+            "ok": False,
+            "tokens": tokens,
+            "error": err,
+            "error_class": err_class or "empty_or_failed",
+            "llm_tier": used_tier,
+        }
 
     matrix_san: Optional[Dict[str, Any]] = None
-    if include_mat:
+    if include_mat and used_tier == "full":
         matrix_san = _sanitize_evidence_matrix(
             parsed.get("caption_evidence_matrix") if isinstance(parsed, dict) else None,
             n_matrix,
@@ -2699,6 +2792,7 @@ async def run_m8_caption_engine(
         "mlai_display": M8_ENGINE_AI_DISPLAY,
         "model": model,
         "tokens": tokens,
+        "llm_tier": used_tier,
         "strategy_version": ((strategy or {}).get("version") or ""),
         "ml_strategy_priors": (historical or {}).get("__strategy_priors__", {}),
         "caption_evidence_matrix": bool(matrix_san),
@@ -2725,10 +2819,11 @@ async def run_m8_caption_engine(
     _trace_m8(ctx, str(ctx.upload_id), "result", {
         "ok": True,
         "tokens": tokens,
+        "llm_tier": used_tier,
         "ranked_platforms": list((ranked.get("platforms") or {}).keys()) if isinstance(ranked, dict) else [],
         "must_use_count": len(ranked.get("must_use") or []) if isinstance(ranked, dict) else 0,
     })
-    return {"ok": True, "tokens": tokens, "selection": ranked}
+    return {"ok": True, "tokens": tokens, "selection": ranked, "llm_tier": used_tier}
 
 
 async def fetch_historical_signals(

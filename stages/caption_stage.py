@@ -1320,9 +1320,13 @@ def _finalise_hashtags(
     seen: set = set()
     merged: List[str] = []
 
+    from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
+
     for tag in list(base_tags or []) + list(ai_tags or []):
-        body = sanitize_hashtag_body(tag)
+        body = sanitize_hashtag_body(tag, max_len=HASHTAG_BODY_MAX_LEN)
         if not body or body in seen or body in blocked_set:
+            continue
+        if is_junk_hashtag_body(body):
             continue
         seen.add(body)
         merged.append(f"#{body}")
@@ -1667,25 +1671,48 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                             "target_platforms": [str(p).lower() for p in (ctx.platforms or [])],
                         })
                 else:
+                    err_cls = str(
+                        meta.get("error_class") or meta.get("error") or "empty_or_failed"
+                    )
+                    # OpenAI quota/429: legacy multimodal will fail the same way —
+                    # skip a second billed call and let hydration evidence stubs win.
+                    skip_legacy = err_cls in (
+                        "openai_quota",
+                        "no_api_key",
+                        "http_429",
+                    )
                     logger.warning(
-                        "M8 caption engine failed (%s); falling back to legacy narrative prompt",
+                        "M8 caption engine failed (%s); %s",
                         meta.get("error"),
+                        (
+                            "skipping legacy OpenAI (quota/key) — evidence hydration next"
+                            if skip_legacy
+                            else "falling back to legacy narrative prompt"
+                        ),
                     )
                     try:
                         ctx.output_artifacts["m8_degraded_reason"] = json.dumps(
                             {
                                 "ok": False,
                                 "error": meta.get("error"),
-                                "legacy_fallback": True,
+                                "error_class": err_cls,
+                                "legacy_fallback": (not skip_legacy),
+                                "evidence_only": skip_legacy,
                             },
                             default=str,
                         )[:4000]
                     except Exception:
                         pass
                     _trace_caption(ctx, str(ctx.upload_id), "m8_engine_failed", {
-                        "legacy_fallback": True,
+                        "legacy_fallback": (not skip_legacy),
+                        "evidence_only": skip_legacy,
                         "error": str(meta.get("error") or "")[:800],
+                        "error_class": err_cls[:80],
                     })
+                    if skip_legacy:
+                        used_m8 = False
+                        # Mark so the legacy block below is skipped.
+                        ctx.output_artifacts["m8_skip_legacy_openai"] = "1"
             except Exception as m8_err:
                 logger.warning(
                     "M8 caption path error: %s; falling back to legacy narrative prompt",
@@ -1703,6 +1730,14 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                     "error": str(m8_err)[:800],
                 })
 
+        skip_legacy_openai = False
+        try:
+            skip_legacy_openai = str(
+                (ctx.output_artifacts or {}).get("m8_skip_legacy_openai") or ""
+            ).strip() in ("1", "true", "yes")
+        except Exception:
+            skip_legacy_openai = False
+
         if not used_m8 and _USE_M8_CAPTION_ENGINE:
             raw_deg = ""
             try:
@@ -1712,11 +1747,24 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
             except Exception:
                 raw_deg = ""
             _trace_caption(ctx, str(ctx.upload_id), "m8_legacy_fallback", {
-                "legacy_fallback": True,
+                "legacy_fallback": (not skip_legacy_openai),
+                "evidence_only": skip_legacy_openai,
                 "m8_degraded_reason": raw_deg[:2000],
             })
 
-        if not used_m8:
+        if not used_m8 and skip_legacy_openai:
+            # Quota/key outage: do not burn a second OpenAI call. Hydration
+            # enforcer (post-caption) writes evidence titles/captions/hashtags.
+            logger.info(
+                "Caption stage: evidence-only path (M8 OpenAI unavailable); "
+                "hydration will fill title/caption/hashtags"
+            )
+            _trace_caption(ctx, str(ctx.upload_id), "evidence_only_skip_legacy", {
+                "generate_title": generate_title,
+                "generate_caption": generate_caption,
+                "generate_hashtags": generate_hashtags,
+            })
+        elif not used_m8:
             # ── Legacy: single category-aware narrative prompt ───────────────
             prompt = _build_narrative_prompt(
                 ctx=ctx,

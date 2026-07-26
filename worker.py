@@ -6477,6 +6477,16 @@ async def main() -> None:
     except Exception as _sentry_e:
         logger.warning("Sentry worker init skipped: %s", _sentry_e)
 
+    # After topping up Pikzels, a prior 402 latch must not block thumbnails for hours.
+    # Restart clears process memory; also honor PIKZELS_CLEAR_CREDITS_LATCH=1.
+    try:
+        from stages.pikzels_api import clear_pikzels_credits_exhausted_latch
+
+        clear_pikzels_credits_exhausted_latch()
+        logger.info("Pikzels credits latch cleared at worker boot")
+    except Exception as _pkz_latch_e:
+        logger.debug("Pikzels latch clear skipped: %s", _pkz_latch_e)
+
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")
         sys.exit(1)

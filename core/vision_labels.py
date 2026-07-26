@@ -265,9 +265,22 @@ _JUNK_HASHTAG_RE = re.compile(
     r"|\d{2,3}\.\d{3,}"                 # coordinate fragments
     # Overrun geo mashups: memorial / veterans / purpleheart trails smashed into one tag
     r"|koreanwar|purpleheart|veteransmemo|memorialhighway|warveteran"
+    # Truncated mashups after max_len clamp (still not discovery tags)
+    r"|highway\d+korean|countypacific|pacific.*veteran|memorialhwy"
     # Broadcast false-positive logos (Czech Radio) — not automotive brands
     r"|^[a-z]{2,12}radio$"
     r")"
+)
+
+# Memorial / honorary highway aliases are not searchable discovery tags.
+_ROAD_FLUFF_RE = re.compile(
+    r"(?i)\b(?:memorial|veterans?|purple\s*heart|honor(?:ary)?|scenic\s*byway|"
+    r"korean\s*war|world\s*war|trail)\b"
+)
+# Prefer compact route designators when present in a road segment.
+_ROUTE_TOKEN_RE = re.compile(
+    r"(?i)\b(?:(?:I|US|UH|SR|SH|Hwy|Highway|Route|FM|CR)[\s\-#]*\d{1,4}[A-Z]?)"
+    r"|(?:(?:Interstate|State\s+Route|County\s+Road)[\s\-#]*\d{1,4})"
 )
 
 # Discoverable hashtags stay short. Anything longer is almost always a
@@ -728,6 +741,80 @@ def is_junk_hashtag_body(raw: Any) -> bool:
     if slug.isdigit() and len(slug) >= 6:
         return True
     return False
+
+
+def road_hashtag_tokens(road: Any) -> List[str]:
+    """Split multi-name road strings into short discovery tokens.
+
+    Telemetry often returns semicolon-joined aliases like
+    ``Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail``.
+    Smashing that into one slug yields overrun junk; instead emit only compact
+    route/highway names (``pacifichighway1``, ``i5``) and drop memorial fluff.
+    """
+    from core.helpers import sanitize_hashtag_body
+
+    raw = str(road or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in re.split(r"[;|/]+", raw) if p and p.strip()]
+    if not parts:
+        parts = [raw]
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _emit(cand: str) -> None:
+        body = sanitize_hashtag_body(cand, max_len=HASHTAG_BODY_MAX_LEN)
+        if not body or body in seen:
+            return
+        if len(body) > HASHTAG_BODY_MAX_LEN or is_junk_hashtag_body(body):
+            return
+        seen.add(body)
+        out.append(body)
+
+    for part in parts:
+        is_fluff = bool(_ROAD_FLUFF_RE.search(part))
+        routes = _ROUTE_TOKEN_RE.findall(part)
+        if is_fluff:
+            for r in routes:
+                _emit(r)
+            continue
+        whole = sanitize_hashtag_body(part, max_len=HASHTAG_BODY_MAX_LEN)
+        if whole and len(whole) <= HASHTAG_BODY_MAX_LEN and not is_junk_hashtag_body(whole):
+            _emit(part)
+        elif routes:
+            for r in routes:
+                _emit(r)
+        else:
+            _emit(part)
+    return out
+
+
+def primary_road_display(road: Any, *, max_chars: int = 40) -> str:
+    """Human-readable primary road name (first non-memorial alias)."""
+    raw = str(road or "").strip()
+    if not raw:
+        return ""
+    parts = [p.strip() for p in re.split(r"[;|/]+", raw) if p and p.strip()]
+    if not parts:
+        parts = [raw]
+    chosen = ""
+    for part in parts:
+        if _ROAD_FLUFF_RE.search(part):
+            routes = _ROUTE_TOKEN_RE.findall(part)
+            if routes:
+                chosen = str(routes[0]).strip()
+                break
+            continue
+        chosen = part
+        break
+    if not chosen:
+        chosen = parts[0]
+    # Normalize "Pacific Highway #1" → "Pacific Highway 1"
+    chosen = re.sub(r"[#]+", " ", chosen)
+    chosen = re.sub(r"\s+", " ", chosen).strip()
+    if len(chosen) > max_chars:
+        chosen = chosen[: max_chars - 1].rstrip() + "…"
+    return chosen
 
 
 def is_vague_taxonomy_copy(raw: Any) -> bool:

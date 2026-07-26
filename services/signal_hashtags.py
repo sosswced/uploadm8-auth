@@ -54,7 +54,13 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from core.helpers import sanitize_hashtag_body
-from core.vision_labels import is_generic_vision_label, is_junk_hashtag_body, vision_label_slug
+from core.vision_labels import (
+    HASHTAG_BODY_MAX_LEN,
+    is_generic_vision_label,
+    is_junk_hashtag_body,
+    road_hashtag_tokens,
+    vision_label_slug,
+)
 from stages.context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
@@ -135,12 +141,12 @@ _SPEED_BUCKETS: List[tuple] = [
 # --------------------------------------------------------------------------- #
 
 
-def _slug(raw: Any, *, max_len: int = 36) -> str:
+def _slug(raw: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> str:
     """Sanitize-then-clamp; ``sanitize_hashtag_body`` already strips noise."""
     return sanitize_hashtag_body(str(raw or ""), max_len=max_len)
 
 
-def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = 36) -> None:
+def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> None:
     """Append candidate slug if non-empty, not duplicate, not blocklisted."""
     body = _slug(candidate, max_len=max_len)
     if not body or body in seen or body in _BLOCKED_META:
@@ -193,7 +199,7 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     seen: set = set()
 
     # Cap individual buckets so one signal can't crowd out the others.
-    def _take(items: Iterable[Any], n: int, *, max_len: int = 36) -> None:
+    def _take(items: Iterable[Any], n: int, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> None:
         added = 0
         for item in items:
             if added >= n:
@@ -235,7 +241,8 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
         state = getattr(tel, "location_state", None)
         country = getattr(tel, "location_country", None)
         gaz_place = getattr(tel, "gazetteer_place_name", None)
-        _push(tags, seen, road)
+        for tok in road_hashtag_tokens(road):
+            _push(tags, seen, tok)
         if gaz_place:
             gz_body = _slug(gaz_place)
             city_body = _slug(city or "")

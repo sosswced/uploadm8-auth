@@ -688,6 +688,158 @@ def test_hashtags_split_long_roads_and_drop_false_logos():
     assert "salem" in scrubbed
 
 
+def test_signal_hashtags_split_multi_name_roads():
+    """signal_hashtags must not smash semicolon road aliases into one slug."""
+    from core.vision_labels import HASHTAG_BODY_MAX_LEN
+    from services.signal_hashtags import build_signal_hashtags
+    from stages.context import JobContext, TelemetryData
+
+    road = (
+        "Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail"
+    )
+    ctx = JobContext(
+        job_id="j-sig-road",
+        upload_id="sig-road",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        telemetry=TelemetryData(
+            max_speed_mph=108.0,
+            location_city="Clackamas County",
+            location_state="Oregon",
+            location_country="US",
+            location_road=road,
+        ),
+    )
+    tags = {t.lower() for t in build_signal_hashtags(ctx)}
+    assert "pacifichighway1" in tags
+    assert "pacifichighway1koreanwarveteransmemo" not in tags
+    assert not any("korean" in t for t in tags)
+    assert not any(len(t) > HASHTAG_BODY_MAX_LEN for t in tags)
+
+
+def test_get_effective_hashtags_drops_overrun_and_junk():
+    """Publish path must junk-gate even if ai_hashtags still carries mashups."""
+    from stages.context import JobContext
+
+    ctx = JobContext(
+        job_id="j-eff-ht",
+        upload_id="eff-ht",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        ai_hashtags=[
+            "#pacifichighway1koreanwarveteransmemo",
+            "#clackamascountypacifichighway1korean",
+            "#oregon",
+            "#sendit",
+        ],
+        user_settings={"maxHashtags": 20},
+    )
+    final = {t.lower().lstrip("#") for t in ctx.get_effective_hashtags("youtube")}
+    assert "oregon" in final
+    assert "sendit" in final
+    assert "pacifichighway1koreanwarveteransmemo" not in final
+    assert "clackamascountypacifichighway1korean" not in final
+
+
+def test_anchor_skips_redundant_fast_run_closing_and_prefers_road_title():
+    from services.hydration_enforcer import (
+        build_anchor_phrase,
+        build_title_anchor_phrase,
+        collect_evidence,
+    )
+
+    road = (
+        "Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail"
+    )
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=108.0,
+            avg_speed_mph=90.0,
+            location_city="Clackamas County",
+            location_state="Oregon",
+            location_country="US",
+            location_road=road,
+            gazetteer_place_name=None,
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Clackamas County, Oregon",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={"scene_description": "Fast run near Clackamas County, Oregon"},
+        audio_context={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title="",
+        ai_caption="",
+        ai_hashtags=[],
+        m8_platform_captions={},
+        m8_platform_titles={},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="clack-anchor",
+        user_settings={},
+        platforms=["youtube"],
+        duration_seconds=45.0,
+    )
+    pool = collect_evidence(ctx)
+    cap = build_anchor_phrase(pool, ctx)
+    assert "108" in cap
+    assert "Pacific Highway" in cap or "pacific" in cap.lower()
+    # Must not double-state place via Fast-run scene hook.
+    assert cap.lower().count("clackamas") <= 1
+    assert "fast run" not in cap.lower()
+
+    title = build_title_anchor_phrase(pool, ctx)
+    assert "108" in title
+    assert "Pacific Highway" in title or "Highway" in title
+    assert "Captured at" not in title
+    assert ";" not in title
+
+
+def test_telemetry_only_timeline_has_spread_beats():
+    from stages.context import JobContext, TelemetryData, build_video_story_timeline
+
+    road = (
+        "Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail"
+    )
+    ctx = JobContext(
+        job_id="j-tl-dense",
+        upload_id="tl-dense",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        video_info={"duration": 40.0},
+        telemetry=TelemetryData(
+            max_speed_mph=108.0,
+            avg_speed_mph=88.0,
+            location_city="Clackamas County",
+            location_state="Oregon",
+            location_country="US",
+            location_road=road,
+            location_display="Clackamas County, Oregon",
+        ),
+    )
+    beats = build_video_story_timeline(ctx, max_events=40)
+    assert len(beats) >= 5
+    kinds = {b["kind"] for b in beats}
+    assert "geo_place" in kinds
+    assert "geo_road" in kinds
+    assert "telemetry_speed" in kinds
+    times = sorted(float(b["t_seconds"]) for b in beats)
+    assert max(times) > 0.0
+    speed = next(b for b in beats if b["kind"] == "telemetry_speed")
+    assert float(speed["t_seconds"]) > 0.0
+    road_texts = " ".join(b["text"] for b in beats if b["kind"] == "geo_road")
+    assert "Korean War" not in road_texts
+    assert "Pacific Highway" in road_texts or "pacifichighway" in road_texts.lower()
+
+
 def test_no_color_nature_or_vague_category_copy():
     from core.vision_labels import is_junk_hashtag_body, is_vague_taxonomy_copy
     from services.hydration_enforcer import _is_generic_caption, _scrub_leaked_junk_hashtags

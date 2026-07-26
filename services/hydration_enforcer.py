@@ -53,10 +53,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from core.helpers import sanitize_hashtag_body
 from core.vision_labels import (
+    HASHTAG_BODY_MAX_LEN,
     evidence_pool_has_strong_hashtag_signals,
     filter_vision_labels_for_hashtags,
     is_generic_vision_label,
     is_junk_hashtag_body,
+    primary_road_display,
+    road_hashtag_tokens,
     is_redundant_vision_label,
     is_vague_taxonomy_copy,
     resolve_ambient_profiles,
@@ -1029,6 +1032,15 @@ def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) ->
     if not place and pool.vision_landmarks:
         bits.append(f"near {pool.vision_landmarks[0]}")
 
+    # Prefer a concrete road name after speed/place when it adds signal.
+    road_disp = primary_road_display(pool.road)
+    if road_disp and place and road_disp.lower() not in place.lower():
+        # Insert as "on Pacific Highway 1" rather than dumping semicolon aliases.
+        if bits and bits[0].startswith("Captured at"):
+            bits.insert(1, f"on {road_disp}")
+        elif not bits:
+            bits.append(f"On {road_disp}")
+
     # Closing sound or transcript phrase.
     # Never append Video Intelligence label dumps / generic detector lists —
     # those belong in admin traces, not publishable titles/captions.
@@ -1039,6 +1051,9 @@ def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) ->
         closing = _publishable_closing(pool.transcript_phrase) or _publishable_closing(
             pool.video_understanding_phrase
         )
+        # Drop scene-hook closings that only restate place/speed ("Fast run near X").
+        if closing and _closing_restates_anchor(closing, bits, place):
+            closing = _publishable_closing(pool.transcript_phrase)
     else:
         closing = (
             _publishable_closing(pool.transcript_phrase)
@@ -1094,41 +1109,74 @@ def _title_suggestion_matches_trusted_peak(sug: str, pool: EvidencePool) -> bool
     return abs(sug_mph - peak) <= speed_tolerance_mph(peak)
 
 
+def _closing_restates_anchor(closing: str, bits: List[str], place: str) -> bool:
+    """True when a scene-hook closing adds no new facts beyond speed/place bits."""
+    c = re.sub(r"\s+", " ", str(closing or "").strip().lower())
+    if not c:
+        return True
+    # Generic motion + near-place hooks are redundant with Captured-at anchors.
+    if re.match(r"^(fast run|cruise)\b", c) and ("near" in c or (place and place.lower() in c)):
+        return True
+    head = " ".join(bits).lower()
+    if place and place.lower() in c and place.lower() in head:
+        # Closing only repeats place already in the head.
+        c_wo_place = c.replace(place.lower(), " ").strip()
+        if len(re.findall(r"[a-z]{3,}", c_wo_place)) <= 2:
+            return True
+    return False
+
+
 def _compact_timeline_title(pool: EvidencePool) -> str:
-    """Canonical speed · place · music headline from EvidencePool (trusted peak)."""
+    """Canonical speed · road/place · music headline from EvidencePool (trusted peak)."""
     parts: List[str] = []
     if pool.max_speed_mph and pool.max_speed_mph >= 5:
         parts.append(f"{int(round(pool.max_speed_mph))} MPH")
 
+    road_disp = primary_road_display(pool.road)
     place = _format_place(pool)
-    if place:
-        parts.append(place)
-    elif pool.place_sign:
-        parts.append(str(pool.place_sign).strip())
-    elif pool.location_start_display:
-        parts.append(str(pool.location_start_display).strip())
-    elif pool.road:
-        parts.append(str(pool.road).strip())
-    elif pool.vision_highways:
-        parts.append(str(pool.vision_highways[0]).strip())
-    elif pool.vision_landmarks:
+    geo_bits: List[str] = []
+    if road_disp:
+        geo_bits.append(road_disp)
+    if place and (not road_disp or place.lower() not in road_disp.lower()):
+        geo_bits.append(place)
+    elif not road_disp and pool.place_sign:
+        geo_bits.append(str(pool.place_sign).strip())
+    elif not road_disp and pool.location_start_display:
+        geo_bits.append(str(pool.location_start_display).strip())
+    elif not road_disp and pool.vision_highways:
+        hwy = primary_road_display(pool.vision_highways[0]) or str(pool.vision_highways[0]).strip()
+        if hwy:
+            geo_bits.append(hwy)
+    elif not road_disp and pool.vision_landmarks:
         lm = str(pool.vision_landmarks[0]).strip()
         if lm and not is_generic_vision_label(lm):
-            parts.append(lm)
+            geo_bits.append(lm)
 
     music_bit = ""
     if pool.music_artist:
         music_bit = str(pool.music_artist).strip()
     elif pool.music_title:
         music_bit = str(pool.music_title).strip()
+
+    # Keep room for music: speed + place (prefer city over road) + music.
+    # Without music: speed + road + place (both geos are useful).
     if music_bit:
+        preferred_geo = ""
+        if place:
+            preferred_geo = place
+        elif geo_bits:
+            preferred_geo = geo_bits[0]
+        if preferred_geo:
+            parts.append(preferred_geo)
         parts.append(music_bit)
+    else:
+        parts.extend(geo_bits[:2])
 
     if len(parts) >= 2:
         return _sanitize_anchor_fragment(" · ".join(parts[:3]), max_chars=90)
     if len(parts) == 1:
-        if place and pool.road and pool.road.lower() not in place.lower():
-            return _sanitize_anchor_fragment(f"{place} · {pool.road}", max_chars=90)
+        if place and road_disp and road_disp.lower() not in place.lower():
+            return _sanitize_anchor_fragment(f"{place} · {road_disp}", max_chars=90)
         return _sanitize_anchor_fragment(parts[0], max_chars=90)
     return ""
 
@@ -1267,67 +1315,17 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
 
 
 # Short discoverable hashtag bodies only (see core.vision_labels.HASHTAG_BODY_MAX_LEN).
-_HASHTAG_MAX_LEN = 24
+_HASHTAG_MAX_LEN = HASHTAG_BODY_MAX_LEN
 # VI logo false positives (billboards / radio watermarks) need a high bar.
 _VI_LOGO_MIN_CONF = 0.90
 _FALSE_LOGO_RE = re.compile(
     r"(?i)\b(?:radio|broadcast|fm\b|am\b|podcast|tv\b|network)\b|\bradio$"
 )
-# Memorial / honorary highway aliases are not searchable discovery tags.
-_ROAD_FLUFF_RE = re.compile(
-    r"(?i)\b(?:memorial|veterans?|purple\s*heart|honor(?:ary)?|scenic\s*byway|"
-    r"korean\s*war|world\s*war|trail)\b"
-)
-# Prefer compact route designators when present in a road segment.
-_ROUTE_TOKEN_RE = re.compile(
-    r"(?i)\b(?:(?:I|US|UH|SR|SH|Hwy|Highway|Route|FM|CR)[\s\-#]*\d{1,4}[A-Z]?)"
-    r"|(?:(?:Interstate|State\s+Route|County\s+Road)[\s\-#]*\d{1,4})"
-)
 
 
 def _road_hashtag_tokens(road: Any) -> List[str]:
-    """Split multi-name road strings into short discovery tokens.
-
-    Telemetry often returns semicolon-joined aliases like
-    ``Pacific Highway #1;Korean War Veterans Memorial Highway;Purple Heart Trail``.
-    Smashing that into one slug yields overrun junk; instead emit only compact
-    route/highway names (``pacifichighway1``, ``i5``) and drop memorial fluff.
-    """
-    raw = str(road or "").strip()
-    if not raw:
-        return []
-    parts = [p.strip() for p in re.split(r"[;|/]+", raw) if p and p.strip()]
-    if not parts:
-        parts = [raw]
-    out: List[str] = []
-    seen: set = set()
-
-    def _emit(cand: str) -> None:
-        body = sanitize_hashtag_body(cand, max_len=_HASHTAG_MAX_LEN)
-        if not body or body in seen:
-            return
-        if len(body) > _HASHTAG_MAX_LEN or is_junk_hashtag_body(body):
-            return
-        seen.add(body)
-        out.append(body)
-
-    for part in parts:
-        is_fluff = bool(_ROAD_FLUFF_RE.search(part))
-        routes = _ROUTE_TOKEN_RE.findall(part)
-        if is_fluff:
-            # Memorial / honorary aliases: keep only compact route designators.
-            for r in routes:
-                _emit(r)
-            continue
-        whole = sanitize_hashtag_body(part, max_len=_HASHTAG_MAX_LEN)
-        if whole and len(whole) <= _HASHTAG_MAX_LEN and not is_junk_hashtag_body(whole):
-            _emit(part)
-        elif routes:
-            for r in routes:
-                _emit(r)
-        else:
-            _emit(part)
-    return out
+    """Compat wrapper — prefer ``core.vision_labels.road_hashtag_tokens``."""
+    return road_hashtag_tokens(road)
 
 
 def _logo_ok_for_hashtag(desc: Any, *, confidence: Optional[float] = None) -> bool:
@@ -1662,8 +1660,8 @@ def _merge_hashtag_lists(*lists: Iterable[str], cap: Optional[int] = None) -> Li
     seen: set = set()
     for lst in lists:
         for raw in lst or []:
-            body = sanitize_hashtag_body(str(raw))
-            if not body or body in seen:
+            body = sanitize_hashtag_body(str(raw), max_len=_HASHTAG_MAX_LEN)
+            if not body or body in seen or is_junk_hashtag_body(body):
                 continue
             seen.add(body)
             out.append(body)

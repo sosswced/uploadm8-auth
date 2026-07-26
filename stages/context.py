@@ -531,9 +531,13 @@ class JobContext:
         seen: set = set()
         merged: List[str] = []
 
+        from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
+
         for tag in always_tags + platform_tags + base + m8_tags + ai:
-            body = sanitize_hashtag_body(tag)
+            body = sanitize_hashtag_body(tag, max_len=HASHTAG_BODY_MAX_LEN)
             if not body or body in seen or body in blocked_set:
+                continue
+            if is_junk_hashtag_body(body):
                 continue
             seen.add(body)
             merged.append(f"#{body}")
@@ -1819,6 +1823,21 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                         continue
 
     # ── Telemetry highlights ─────────────────────────────────────────────
+    # Spread beats across clip duration when VI/Vision/OSD left the timeline thin.
+    clip_dur = 0.0
+    for src in (
+        (getattr(ctx, "video_info", None) or {}).get("duration")
+        if isinstance(getattr(ctx, "video_info", None), dict)
+        else None,
+        (vc.get("video_duration_s") if isinstance(vc, dict) else None),
+        getattr(tel, "duration_seconds", None) if tel is not None else None,
+    ):
+        try:
+            clip_dur = float(src or 0)
+        except (TypeError, ValueError):
+            clip_dur = 0.0
+        if clip_dur > 0:
+            break
     if tel is not None:
         place = _first_nonempty(
             getattr(tel, "location_display", None),
@@ -1828,18 +1847,54 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
         )
         if place:
             _add(0.0, "geo_place", f"Location: {place}")
+        city = _first_nonempty(getattr(tel, "location_city", None))
+        state = _first_nonempty(getattr(tel, "location_state", None))
+        if city and (not place or str(city).lower() not in str(place).lower()):
+            _add(min(2.0, clip_dur * 0.08) if clip_dur > 0 else 0.0, "geo_city", f"City: {city}")
+        if state:
+            _add(min(4.0, clip_dur * 0.12) if clip_dur > 0 else 0.0, "geo_state", f"State: {state}")
         road = _first_nonempty(getattr(tel, "location_road", None))
         if road:
-            _add(0.0, "geo_road", f"Road: {road}")
+            from core.vision_labels import primary_road_display, road_hashtag_tokens
+
+            primary = primary_road_display(road)
+            road_slots = [0.18, 0.35, 0.52]
+            if primary:
+                t_road = (clip_dur * road_slots[0]) if clip_dur > 0 else 0.0
+                _add(t_road, "geo_road", f"Road: {primary}")
+            # Extra short tokens as discovery beats (already fluff-filtered).
+            for i, tok in enumerate(road_hashtag_tokens(road)[:2]):
+                if primary and tok.lower() in primary.lower().replace(" ", ""):
+                    continue
+                frac = road_slots[min(i + 1, len(road_slots) - 1)]
+                t_road = (clip_dur * frac) if clip_dur > 0 else 0.0
+                _add(t_road, "geo_road", f"Route tag: #{tok}")
         start_disp = _first_nonempty(getattr(tel, "location_start_display", None))
         if start_disp and (not place or start_disp.lower() not in str(place).lower()):
-            _add(0.0, "geo_start", f"Run starts near {start_disp}")
+            t_start = (clip_dur * 0.05) if clip_dur > 0 else 0.0
+            _add(t_start, "geo_start", f"Run starts near {start_disp}")
         try:
             max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
         except (TypeError, ValueError):
             max_mph_tel = 0.0
         if max_mph_tel >= 5:
-            _add(0.0, "telemetry_speed", f"Telemetry peak {int(round(max_mph_tel))} MPH")
+            # Prefer OSD peak time; else mid-clip so the beat isn't stuck at 0:00.
+            peak_t = None
+            if isinstance(osd, dict):
+                peak_t = _t(osd.get("max_speed_at_s"))
+            if peak_t is None or peak_t <= 0:
+                peak_t = (clip_dur * 0.45) if clip_dur > 0 else 0.0
+            _add(peak_t, "telemetry_speed", f"Telemetry peak {int(round(max_mph_tel))} MPH")
+        try:
+            avg_mph_tel = float(getattr(tel, "avg_speed_mph", 0) or 0)
+        except (TypeError, ValueError):
+            avg_mph_tel = 0.0
+        if avg_mph_tel >= 5 and abs(avg_mph_tel - max_mph_tel) >= 8:
+            t_avg = (clip_dur * 0.7) if clip_dur > 0 else 0.0
+            _add(t_avg, "telemetry_avg", f"Telemetry avg ~{int(round(avg_mph_tel))} MPH")
+        # End-of-run place beat when we know duration (gives the UI a second geo pin).
+        if place and clip_dur >= 8:
+            _add(clip_dur * 0.92, "geo_place", f"Still near {place}")
 
     # ── Welcome to / Entering roadside signs (Vision OCR + VI text) ──────
     try:

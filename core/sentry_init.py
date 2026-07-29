@@ -180,6 +180,11 @@ _DROPPED_EXC_VALUES: tuple[str, ...] = (
     "'NoneType' object has no attribute 'fetchval'",
     "'NoneType' object has no attribute 'execute'",
     "unexpected connection_lost() call",
+    # Client-abort cancellation race on polling routes (UPLOADM8-43): the
+    # request task group tears down, acquire_db releases the conn, and a
+    # dependency's in-flight query hits the released proxy. Already a 503
+    # to a client that disconnected — not actionable.
+    "connection has been released back to the pool",
 )
 
 

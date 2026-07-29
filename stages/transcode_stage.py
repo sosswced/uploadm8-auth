@@ -370,7 +370,13 @@ async def get_video_info(video_path: Path) -> VideoInfo:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            # Callers sit under stage wait_for budgets — don't orphan ffprobe.
+            from stages.ffmpeg_progress import kill_process_quietly
+            await kill_process_quietly(proc)
+            raise
 
         if proc.returncode != 0:
             raise StageError(ErrorCode.TRANSCODE_FAILED, f"ffprobe failed: {stderr.decode()}")
@@ -724,52 +730,64 @@ async def transcode_video(
         PROGRESS_INTERVAL = 2.0  # Write to DB at most once per 2 seconds
 
         if db_pool and upload_id and total_duration:
-            # Stream stderr line-by-line so we can parse FFmpeg progress in real time
-            # FFmpeg writes lines like: frame=  120 fps= 30 ... time=00:00:04.00 ...
-            import re, time as _time
-            time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+            # Stream stderr in chunks (split on \\r/\\n). FFmpeg progress uses \\r;
+            # line-buffered StreamReader reads raise LimitOverrunError and freeze UI heartbeats.
+            import time as _time
+
+            from stages.ffmpeg_progress import (
+                iter_ffmpeg_stderr_text,
+                kill_process_quietly,
+                parse_ffmpeg_time_seconds,
+                trim_stderr_buffer,
+            )
 
             async def _stream_stderr():
                 nonlocal last_progress_write
-                while True:
-                    line_bytes = await proc.stderr.readline()
-                    if not line_bytes:
-                        break
-                    line = line_bytes.decode("utf-8", errors="replace")
+                async for line in iter_ffmpeg_stderr_text(proc.stderr):
                     stderr_lines.append(line)
-                    m = time_pattern.search(line)
-                    if m:
-                        h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
-                        encoded_secs = h * 3600 + mn * 60 + s
-                        pct = int(min(99, (encoded_secs / total_duration) * 100))
-                        now = _time.monotonic()
-                        if now - last_progress_write >= PROGRESS_INTERVAL:
-                            last_progress_write = now
-                            try:
-                                # Map FFmpeg 0–99% into worker STAGE_PROGRESS
-                                # transcode→audio band (48..61). Do not import
-                                # worker here (circular). Best-effort only.
-                                from stages import db as _db
+                    trim_stderr_buffer(stderr_lines)
+                    encoded_secs = parse_ffmpeg_time_seconds(line)
+                    if encoded_secs is None:
+                        continue
+                    pct = int(min(99, (encoded_secs / total_duration) * 100))
+                    now = _time.monotonic()
+                    if now - last_progress_write >= PROGRESS_INTERVAL:
+                        last_progress_write = now
+                        try:
+                            # Map FFmpeg 0–99% into worker STAGE_PROGRESS
+                            # transcode→audio band (48..61). Do not import
+                            # worker here (circular). Best-effort only.
+                            from stages import db as _db
 
-                                band_lo, band_hi = 48, 61
-                                mapped = band_lo + int(
-                                    (max(0, min(99, pct)) / 99.0)
-                                    * (band_hi - band_lo)
-                                )
-                                await _db.update_stage_progress(
-                                    db_pool,
-                                    upload_id,
-                                    "transcode",
-                                    mapped,
-                                )
-                            except Exception:
-                                pass
+                            band_lo, band_hi = 48, 61
+                            mapped = band_lo + int(
+                                (max(0, min(99, pct)) / 99.0)
+                                * (band_hi - band_lo)
+                            )
+                            await _db.update_stage_progress(
+                                db_pool,
+                                upload_id,
+                                "transcode",
+                                mapped,
+                            )
+                        except Exception:
+                            pass
 
-            await asyncio.gather(proc.wait(), _stream_stderr())
+            try:
+                await asyncio.gather(proc.wait(), _stream_stderr())
+            except asyncio.CancelledError:
+                await kill_process_quietly(proc)
+                raise
             stderr_output = "".join(stderr_lines)
         else:
             # No db_pool — fall back to original blocking communicate()
-            stdout_data, stderr_data = await proc.communicate()
+            try:
+                stdout_data, stderr_data = await proc.communicate()
+            except asyncio.CancelledError:
+                from stages.ffmpeg_progress import kill_process_quietly as _kpq
+
+                await _kpq(proc)
+                raise
             stderr_output = stderr_data.decode("utf-8", errors="replace")
 
         if proc.returncode != 0:
@@ -991,7 +1009,14 @@ async def check_ffmpeg_available() -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await proc.communicate()
+        try:
+            await proc.communicate()
+        except asyncio.CancelledError:
+            from stages.ffmpeg_progress import kill_process_quietly
+            await kill_process_quietly(proc)
+            raise
         return proc.returncode == 0
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return False

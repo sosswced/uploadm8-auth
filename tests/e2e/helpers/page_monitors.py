@@ -11,6 +11,9 @@ def reset_page_monitors(page) -> None:
     fails = getattr(page, "_e2e_failed_requests", None)
     if isinstance(fails, list):
         fails.clear()
+    degraded = getattr(page, "_e2e_degraded_503_counts", None)
+    if isinstance(degraded, dict):
+        degraded.clear()
 
 
 def settle_page_monitors(page, *, wait_ms: int = 2000) -> None:

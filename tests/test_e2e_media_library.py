@@ -36,6 +36,54 @@ def test_pick_random_respects_seed(tmp_path: Path, monkeypatch):
     assert a[0].name == b[0].name
 
 
+def test_resolve_explicit_pair_fills_sibling_map(tmp_path: Path, monkeypatch):
+    """Passing only --video must pair the same-stem .map, never a random clip."""
+    (tmp_path / "clip_a.mp4").write_bytes(b"v")
+    (tmp_path / "clip_a.map").write_text("m")
+    (tmp_path / "clip_b.mp4").write_bytes(b"v")
+    (tmp_path / "clip_b.map").write_text("m")
+    monkeypatch.setenv("E2E_MEDIA_LIBRARY", str(tmp_path))
+    video = tmp_path / "clip_a.mp4"
+    v, t, note = ml.resolve_explicit_media_pair(video, None)
+    assert v == video
+    assert t == tmp_path / "clip_a.map"
+    assert "sibling" in note
+
+
+def test_resolve_explicit_pair_fills_sibling_video(tmp_path: Path):
+    (tmp_path / "clip_a.mp4").write_bytes(b"v")
+    (tmp_path / "clip_a.map").write_text("m")
+    tmap = tmp_path / "clip_a.map"
+    v, t, note = ml.resolve_explicit_media_pair(None, tmap)
+    assert t == tmap
+    assert v == tmp_path / "clip_a.mp4"
+    assert "sibling" in note
+
+
+def test_resolve_explicit_pair_missing_sibling(tmp_path: Path):
+    video = tmp_path / "orphan.mp4"
+    video.write_bytes(b"v")
+    v, t, note = ml.resolve_explicit_media_pair(video, None)
+    assert v == video
+    assert t is None
+    assert "missing" in note
+
+
+def test_e2e_test_telemetry_map_uses_video_sibling(tmp_path: Path, monkeypatch):
+    (tmp_path / "solo.mp4").write_bytes(b"v")
+    (tmp_path / "solo.map").write_text("m")
+    (tmp_path / "other.mp4").write_bytes(b"v")
+    (tmp_path / "other.map").write_text("m")
+    monkeypatch.setenv("E2E_TEST_VIDEO", str(tmp_path / "solo.mp4"))
+    monkeypatch.delenv("E2E_TEST_TELEMETRY_MAP", raising=False)
+    monkeypatch.setenv("E2E_MEDIA_LIBRARY", str(tmp_path))
+    from tests.e2e.helpers.config import e2e_test_telemetry_map
+
+    m = e2e_test_telemetry_map()
+    assert m is not None
+    assert m.name == "solo.map"
+
+
 def test_cached_pair_stable(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("E2E_MEDIA_PAIR_SEED", raising=False)
     (tmp_path / "x.mp4").write_bytes(b"v")
@@ -52,11 +100,28 @@ def test_cached_pair_stable(tmp_path: Path, monkeypatch):
 
 
 def test_journey_script_has_no_hardcoded_fixture_default():
-    """Hard-coded --video default bypassed the library and re-posted the same
+    """Hard-coded single-file defaults bypassed the library and re-posted the same
     clip live on every TUP run (root cause of duplicate posts on all platforms)."""
-    src = (ROOT / "scripts" / "run_live_demo_journey.py").read_text(encoding="utf-8")
-    assert "20250301_0058_CAM_EVNT" not in src
-    assert "20250224_0073_CAM_EVNT" not in src
+    banned = ("20250301_0058_CAM_EVNT", "20250224_0073_CAM_EVNT")
+    for rel in (
+        "scripts/run_live_demo_journey.py",
+        "tests/e2e/helpers/live_demo.py",
+        "tests/e2e/helpers/config.py",
+        "scripts/agent/tup.py",
+    ):
+        src = (ROOT / rel).read_text(encoding="utf-8")
+        for token in banned:
+            assert token not in src, f"{rel} still hardcodes {token}"
+
+
+def test_config_has_no_default_e2e_video_constants():
+    import tests.e2e.helpers.config as cfg
+    import tests.e2e.helpers.live_demo as ld
+
+    assert not hasattr(cfg, "DEFAULT_E2E_VIDEO")
+    assert not hasattr(cfg, "DEFAULT_E2E_TELEMETRY_MAP")
+    assert not hasattr(ld, "DEFAULT_VIDEO")
+    assert not hasattr(ld, "DEFAULT_MAP")
 
 
 def test_resolve_demo_paths_uses_library_pick(tmp_path: Path, monkeypatch):
@@ -114,12 +179,11 @@ def test_human_guards_accept_duplicate_upload_confirm():
     assert 'kind == "confirm"' in src or 'type == "confirm"' in src or '== "confirm"' in src
 
 
-def test_tup_mode_refuses_fixed_fixture_fallback(tmp_path: Path, monkeypatch):
-    """Under E2E_TUP=1, missing library/explicit must not return DEFAULT_E2E_VIDEO."""
-    monkeypatch.setenv("E2E_TUP", "1")
+def test_missing_library_never_returns_hardcoded_fixture(tmp_path: Path, monkeypatch):
+    """No library / explicit pair → None (never a baked-in Videos\\… path)."""
+    monkeypatch.delenv("E2E_TUP", raising=False)
     monkeypatch.delenv("E2E_TEST_VIDEO", raising=False)
     monkeypatch.delenv("E2E_TEST_TELEMETRY_MAP", raising=False)
-    # Point library at empty dir so pick returns None.
     monkeypatch.setenv("E2E_MEDIA_LIBRARY", str(tmp_path))
     ml.clear_media_pair_cache()
     from tests.e2e.helpers import config as cfg

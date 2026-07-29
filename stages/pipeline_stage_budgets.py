@@ -63,6 +63,12 @@ def stage_timeout_caption() -> float:
     return _sec("CAPTION", 360)
 
 
+def stage_timeout_dashcam_osd() -> float:
+    # Frame sampling (ffmpeg) + Vision OCR across sampled frames; long HD
+    # clips need headroom but the stage must never run unbounded.
+    return _sec("DASHCAM_OSD", 600)
+
+
 def get_all_budgets() -> Dict[str, float]:
     return {
         "watermark": stage_timeout_watermark(),
@@ -74,4 +80,5 @@ def get_all_budgets() -> Dict[str, float]:
         "twelvelabs": stage_timeout_twelvelabs(),
         "video_intelligence": stage_timeout_video_intelligence(),
         "caption": stage_timeout_caption(),
+        "dashcam_osd": stage_timeout_dashcam_osd(),
     }

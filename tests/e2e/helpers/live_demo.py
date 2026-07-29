@@ -72,10 +72,6 @@ PROCESSING_STATUSES = frozenset(
     {"pending", "processing", "uploading", "queued", "transcoding", "publishing", "staging"}
 )
 
-DEFAULT_VIDEO = Path(r"C:\Users\Earl\Videos\20250301_0058_CAM_EVNT.MP4")
-DEFAULT_MAP = Path(r"C:\Users\Earl\Videos\20250301_0058_CAM_EVNT.map")
-
-
 @dataclass
 class LiveDemoLog:
     steps: list[str] = field(default_factory=list)
@@ -107,20 +103,18 @@ def resolve_demo_paths(
         if describe_cached_pair().get("selected"):
             source = "library"
         else:
-            # No random pair came back. If a library IS configured, fail loudly:
-            # a fixed-fixture fallback re-posts the SAME clip to live platforms
-            # every run (duplicate posts on every connected account).
+            # No random pair — fail loudly (never fall back to a hardcoded clip).
             lib = e2e_media_library()
             if lib is not None:
                 raise FileNotFoundError(
                     f"E2E media library '{lib}' is configured but produced no "
-                    "matching .mp4+.map pair; refusing fixed-fixture fallback. "
-                    "Fix the library folder or set E2E_TEST_VIDEO explicitly."
+                    "matching .mp4+.map pair. Fix the library folder or pass "
+                    "--video / E2E_TEST_VIDEO explicitly."
                 )
-            source = "fixed-fallback"
-    if v is None and DEFAULT_VIDEO.is_file():
-        v = DEFAULT_VIDEO
-        source = "fixed-fallback"
+            raise FileNotFoundError(
+                "Set E2E_MEDIA_LIBRARY (folder of matching .mp4+.map) or "
+                f"E2E_TEST_VIDEO. Library tried: {lib}"
+            )
     if v is None or not v.is_file():
         raise FileNotFoundError(
             "Set E2E_MEDIA_LIBRARY (folder of matching .mp4+.map) or E2E_TEST_VIDEO. "
@@ -129,15 +123,26 @@ def resolve_demo_paths(
     t = telemetry
     if t is None:
         t = e2e_test_telemetry_map()
-    if t is None and DEFAULT_MAP.is_file():
-        t = DEFAULT_MAP
+    # Explicit video without map (or CLI-only path): same-stem sibling, never random.
+    if t is None and source == "explicit":
+        from tests.e2e.helpers.media_library import find_sibling_media_path
+
+        t = find_sibling_media_path(v)
     if t is not None and not t.is_file():
         t = None
+    # Explicit map-only path may have filled video via e2e_test_video sibling.
+    if source != "library" and telemetry is not None and video is None:
+        source = "explicit"
     pair_info = describe_cached_pair()
     if source == "library" and pair_info.get("selected"):
         print(
             f"[live-demo] Media library pair: {pair_info.get('stem')} "
             f"({pair_info.get('video')})",
+            flush=True,
+        )
+    elif source == "explicit" and t is not None:
+        print(
+            f"[live-demo] Explicit media pair: {v.name} + {t.name}",
             flush=True,
         )
     else:
@@ -591,6 +596,29 @@ def find_upload_via_api(
     return None, active
 
 
+def _upload_row_visible(page: Page, container: str, *, filename_hint: str, upload_ids: list[str]) -> bool:
+    """Match by data-id (preferred), then visible title/filename text.
+
+    Dashboard/queue rows show AI titles, not the source CAM filename, and the
+    upload UUID lives on ``data-id`` / href — not in ``inner_text``.
+    """
+    hint = filename_hint.lower()
+    for uid in upload_ids:
+        uid = str(uid or "").strip()
+        if not uid:
+            continue
+        row = page.locator(f'{container} .upload-row[data-id="{uid}"]')
+        if row.count() > 0:
+            return True
+    try:
+        text = page.locator(container).inner_text(timeout=10_000).lower()
+    except Exception:
+        return False
+    if hint in text or hint.replace("_", "") in text.replace("_", ""):
+        return True
+    return any(str(uid).lower() in text for uid in upload_ids if uid)
+
+
 def verify_upload_on_dashboard_and_queue(
     page: Page,
     base_url: str,
@@ -600,37 +628,38 @@ def verify_upload_on_dashboard_and_queue(
     log: LiveDemoLog | None = None,
 ) -> None:
     """Open dashboard + queue and confirm the demo upload is visible."""
-    hint = filename_hint.lower()
-    id_set = set(upload_ids or [])
+    ids = [str(u) for u in (upload_ids or []) if u]
+    last_err: Exception | None = None
 
-    navigate_to_page_human(page, base_url, "dashboard.html")
-    wait_for_authenticated_shell(page)
-    human_scroll(page)
-    page.locator("#recentUploads .upload-row").first.wait_for(state="attached", timeout=60_000)
-    dash_text = page.locator("#recentUploads").inner_text(timeout=10_000).lower()
-    dash_ok = hint in dash_text or hint.replace("_", "") in dash_text.replace("_", "")
-    if not dash_ok and id_set:
-        dash_ok = any(uid in dash_text for uid in id_set)
-    if not dash_ok:
-        raise AssertionError(f"Demo upload not visible on dashboard (expected {filename_hint})")
-    if log:
-        log.note("Dashboard shows recent upload")
+    for attempt in range(1, 4):
+        try:
+            navigate_to_page_human(page, base_url, "dashboard.html")
+            wait_for_authenticated_shell(page)
+            human_scroll(page)
+            page.locator("#recentUploads .upload-row").first.wait_for(state="attached", timeout=60_000)
+            if not _upload_row_visible(page, "#recentUploads", filename_hint=filename_hint, upload_ids=ids):
+                raise AssertionError(f"Demo upload not visible on dashboard (expected {filename_hint})")
+            if log:
+                log.note("Dashboard shows recent upload")
 
-    navigate_to_page_human(page, base_url, "queue.html")
-    wait_for_authenticated_shell(page)
-    human_scroll(page)
-    page.locator("#queueList .upload-row").first.wait_for(state="visible", timeout=60_000)
-    queue_text = page.locator("#queueList").inner_text(timeout=10_000).lower()
-    queue_ok = hint in queue_text or hint.replace("_", "") in queue_text.replace("_", "")
-    if not queue_ok and id_set:
-        queue_ok = any(uid in queue_text for uid in id_set)
-    if not queue_ok:
-        raise AssertionError(f"Demo upload not visible on queue (expected {filename_hint})")
-    if log:
-        log.note("Queue lists the upload")
+            navigate_to_page_human(page, base_url, "queue.html")
+            wait_for_authenticated_shell(page)
+            human_scroll(page)
+            page.locator("#queueList .upload-row").first.wait_for(state="visible", timeout=60_000)
+            if not _upload_row_visible(page, "#queueList", filename_hint=filename_hint, upload_ids=ids):
+                raise AssertionError(f"Demo upload not visible on queue (expected {filename_hint})")
+            if log:
+                log.note("Queue lists the upload")
 
-    page.locator("#queueList .upload-row").first.hover()
-    page.wait_for_timeout(click_delay_ms())
+            page.locator("#queueList .upload-row").first.hover()
+            page.wait_for_timeout(click_delay_ms())
+            return
+        except Exception as exc:
+            last_err = exc
+            if log:
+                log.note(f"Dashboard/queue confirm retry {attempt}/3: {str(exc)[:160]}")
+            page.wait_for_timeout(1500 * attempt)
+    raise AssertionError(str(last_err) if last_err else f"Demo upload not visible (expected {filename_hint})")
 
 
 def _upload_tour_order(browse_pages: tuple[str, ...] | None = None) -> tuple[str, ...]:

@@ -7,10 +7,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 
-# Legacy single-file fallbacks (prefer E2E_MEDIA_LIBRARY random pairs).
-DEFAULT_E2E_VIDEO = Path(r"C:\Users\Earl\Videos\20250224_0073_CAM_EVNT.MP4")
-DEFAULT_E2E_TELEMETRY_MAP = Path(r"C:\Users\Earl\Videos\20250224_0073_CAM_EVNT.map")
-
 
 def e2e_base_url() -> str:
     return (
@@ -43,10 +39,12 @@ def _resolve_e2e_path(raw: str) -> Path | None:
 
 
 def _library_pair() -> tuple[Path, Path] | None:
-    """Random matching .mp4+.map from E2E_MEDIA_LIBRARY (or default PNW folder)."""
-    # Skip library when ANY explicit path is set. If only one env is set,
-    # still calling the library for the other half can pair a fixed video
-    # with a random .map (or vice versa) and break TUP telemetry.
+    """Random matching .mp4+.map from E2E_MEDIA_LIBRARY (or default PNW folder).
+
+    Skips the library when any explicit path env is set. The missing half of a
+    one-sided explicit pair is resolved via same-stem sibling in
+    ``e2e_test_video`` / ``e2e_test_telemetry_map`` — never a random other clip.
+    """
     if (os.environ.get("E2E_TEST_VIDEO") or "").strip() or (
         os.environ.get("E2E_TEST_TELEMETRY_MAP") or ""
     ).strip():
@@ -64,28 +62,49 @@ def _tup_mode() -> bool:
 
 
 def e2e_test_video() -> Path | None:
+    """Explicit ``E2E_TEST_VIDEO``, else sibling of explicit map, else library pair."""
     resolved = _resolve_e2e_path(os.environ.get("E2E_TEST_VIDEO", ""))
     if resolved is not None:
         return resolved
+    # Only map set → prefer same-stem video (never a random library clip).
+    map_only = _resolve_e2e_path(os.environ.get("E2E_TEST_TELEMETRY_MAP", ""))
+    if map_only is not None:
+        try:
+            from tests.e2e.helpers.media_library import find_sibling_media_path
+
+            sib = find_sibling_media_path(map_only)
+            if sib is not None:
+                return sib
+        except Exception:
+            pass
+        return None
     pair = _library_pair()
     if pair is not None:
         return pair[0]
-    # /TUP must never silently re-post the same fixed fixture to live accounts.
-    if _tup_mode():
-        return None
-    return DEFAULT_E2E_VIDEO if DEFAULT_E2E_VIDEO.is_file() else None
+    return None
 
 
 def e2e_test_telemetry_map() -> Path | None:
+    """Explicit ``E2E_TEST_TELEMETRY_MAP``, else sibling of explicit video, else library."""
     resolved = _resolve_e2e_path(os.environ.get("E2E_TEST_TELEMETRY_MAP", ""))
     if resolved is not None:
         return resolved
+    # Only video set → prefer same-stem .map (never a random library map).
+    video_only = _resolve_e2e_path(os.environ.get("E2E_TEST_VIDEO", ""))
+    if video_only is not None:
+        try:
+            from tests.e2e.helpers.media_library import find_sibling_media_path
+
+            sib = find_sibling_media_path(video_only)
+            if sib is not None:
+                return sib
+        except Exception:
+            pass
+        return None
     pair = _library_pair()
     if pair is not None:
         return pair[1]
-    if _tup_mode():
-        return None
-    return DEFAULT_E2E_TELEMETRY_MAP if DEFAULT_E2E_TELEMETRY_MAP.is_file() else None
+    return None
 
 
 def e2e_youtube_copyright_trim() -> bool:

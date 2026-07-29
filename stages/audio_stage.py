@@ -140,9 +140,15 @@ async def _extract_audio_wav(video_path: Path, out_path: Path) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=FFMPEG_AUDIO_TIMEOUT
-        )
+        try:
+            _, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=FFMPEG_AUDIO_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            # Stage-budget cancellation must not orphan the FFmpeg child.
+            from stages.ffmpeg_progress import kill_process_quietly
+            await kill_process_quietly(proc)
+            raise
 
         if proc.returncode != 0:
             err_tail = stderr_bytes.decode(errors="replace")[-600:]
@@ -196,9 +202,14 @@ async def _ffmpeg_slice_wav_head(src: Path, dst: Path, seconds: float) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=FFMPEG_AUDIO_TIMEOUT
-        )
+        try:
+            _, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=FFMPEG_AUDIO_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            from stages.ffmpeg_progress import kill_process_quietly
+            await kill_process_quietly(proc)
+            raise
         if proc.returncode != 0:
             logger.warning(
                 "FFmpeg head slice failed rc=%s: %s",

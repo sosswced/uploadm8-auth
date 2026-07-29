@@ -235,6 +235,7 @@ STAGE_TIMEOUT_VISION = int(stage_budgets.stage_timeout_vision())
 STAGE_TIMEOUT_VI = int(stage_budgets.stage_timeout_video_intelligence())
 STAGE_TIMEOUT_TWELVELABS = int(stage_budgets.stage_timeout_twelvelabs())
 STAGE_TIMEOUT_CAPTION = int(stage_budgets.stage_timeout_caption())
+STAGE_TIMEOUT_DASHCAM_OSD = int(stage_budgets.stage_timeout_dashcam_osd())
 
 from core.pipeline_env_defaults import env_bool, env_int
 
@@ -868,6 +869,69 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
     except (TypeError, ValueError):
         encode_duration = 0.0
 
+    from stages.pipeline_checkpoint import merge_output_artifacts_patch
+    from stages.transcode_stage import get_platform_spec, source_hd_tier
+    from stages.transcode_status import (
+        build_transcode_status_plan,
+        group_split_why,
+        patch_group_status,
+    )
+    from stages.ffmpeg_progress import (
+        iter_ffmpeg_stderr_text,
+        kill_process_quietly,
+        parse_ffmpeg_time_seconds,
+        trim_stderr_buffer,
+    )
+
+    plan_groups = []
+    for gp in group_lists:
+        canonical = str(gp[0]).lower()
+        spec = get_platform_spec(canonical, info)
+        reframe_action = resolve_reframe_action(info, reframe_mode, canonical)
+        _needs, reasons = needs_transcode(info, canonical, reframe_action)
+        plan_groups.append(
+            {
+                "platforms": [str(p).lower() for p in gp],
+                "canonical": canonical,
+                "status": "pending" if _needs else "copy",
+                "target": f"{spec.get('target_width')}x{spec.get('target_height')}",
+                "max_fps": spec.get("max_fps"),
+                "why": group_split_why(gp, total_groups=total_groups),
+                "reasons": list(reasons or []),
+            }
+        )
+    tc_status = build_transcode_status_plan(
+        source={
+            "width": info.width,
+            "height": info.height,
+            "duration_sec": round(float(info.duration or 0), 1),
+            "fps": round(float(info.fps or 0), 2),
+            "tier": source_hd_tier(info),
+        },
+        groups=plan_groups,
+    )
+
+    async def _persist_tc_status(status: dict) -> None:
+        nonlocal tc_status
+        tc_status = status
+        try:
+            await merge_output_artifacts_patch(
+                db_pool, str(ctx.upload_id), {"transcode_status": status}
+            )
+            arts = getattr(ctx, "output_artifacts", None)
+            if isinstance(arts, dict):
+                arts["transcode_status"] = status
+        except Exception as e:
+            logger.debug("[%s] transcode_status persist skipped: %s", ctx.upload_id, e)
+
+    await _persist_tc_status(tc_status)
+    logger.info(
+        "[%s] Transcode plan: %s groups — %s",
+        ctx.upload_id,
+        total_groups,
+        tc_status.get("summary"),
+    )
+
     async def _write_transcode_pct(pct: int, *, note: str) -> None:
         pct = min(next_pct - 1, max(base_pct, int(pct)))
         try:
@@ -886,11 +950,16 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 f"[{ctx.upload_id}] Transcode progress bump skipped: {bump_e}"
             )
 
-    async def _bump_transcode_progress(finished_canonical: str) -> None:
+    async def _bump_transcode_progress(finished_canonical: str, *, outcome: str = "done") -> None:
         """Advance % when a platform group finishes (keeps UI + updated_at alive)."""
         nonlocal done_groups
         done_groups += 1
         pct = base_pct + max(1, int(span * done_groups / total_groups))
+        await _persist_tc_status(
+            patch_group_status(
+                tc_status, canonical=finished_canonical, group_status=outcome, encode_pct=100
+            )
+        )
         await _write_transcode_pct(
             pct,
             note=f"{done_groups}/{total_groups} groups, last={finished_canonical}",
@@ -903,7 +972,6 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         transcode band; falls back to 45s micro-nudges. All DB writes are
         best-effort — never raise into the encode path.
         """
-        import re
         import time as _time
 
         floor = base_pct + max(0, int(span * done_groups / total_groups))
@@ -911,7 +979,6 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         # One group's slice of the band (leave last point for completion bump).
         group_span = max(1, int(span / total_groups))
         ceil = min(next_pct - 1, floor + group_span)
-        time_re = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
         last_write = 0.0
         stderr_chunks: list[bytes] = []
         saw_time = False
@@ -933,25 +1000,18 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
             nonlocal last_write, saw_time
             if not proc.stderr:
                 return
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                stderr_chunks.append(line)
+            # Chunk + split on \\r/\\n — avoid StreamReader line reads (LimitOverrunError on FFmpeg \\r progress).
+            async for text in iter_ffmpeg_stderr_text(proc.stderr):
+                stderr_chunks.append(text.encode("utf-8", errors="replace"))
+                trim_stderr_buffer(stderr_chunks)
                 if encode_duration < 1:
                     continue
-                try:
-                    text = line.decode("utf-8", errors="replace")
-                except Exception:
-                    continue
-                m = time_re.search(text)
-                if not m:
+                encoded = parse_ffmpeg_time_seconds(text)
+                if encoded is None:
                     continue
                 try:
-                    h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
-                    encoded = h * 3600 + mn * 60 + s
                     frac = min(1.0, max(0.0, encoded / encode_duration))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, ZeroDivisionError):
                     continue
                 now = _time.monotonic()
                 if now - last_write < 2.0:
@@ -959,6 +1019,15 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 last_write = now
                 saw_time = True
                 pct = floor + int(frac * max(1, ceil - floor))
+                encode_pct = int(frac * 100)
+                await _persist_tc_status(
+                    patch_group_status(
+                        tc_status,
+                        canonical=canonical,
+                        group_status="encoding",
+                        encode_pct=encode_pct,
+                    )
+                )
                 await _write_transcode_pct(
                     pct, note=f"ffmpeg {canonical} {frac:.0%} encode"
                 )
@@ -975,12 +1044,15 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                     pass
             return b"", b"".join(stderr_chunks)
         finally:
+            # Stage-budget wait_for cancels this coroutine, not FFmpeg —
+            # kill any still-running encode so it can't orphan CPU/disk.
+            await kill_process_quietly(proc)
             hb.cancel()
             stream.cancel()
             for t in (hb, stream):
                 try:
                     await t
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
 
     async def _transcode_one_group(group_platforms: List[str]) -> Dict[str, Path]:
@@ -992,6 +1064,11 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         if needs_tc:
             logger.info(
                 f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}"
+            )
+            await _persist_tc_status(
+                patch_group_status(
+                    tc_status, canonical=canonical, group_status="encoding", encode_pct=0
+                )
             )
             output_path = ctx.temp_dir / f"transcoded_{canonical}.mp4"
             try:
@@ -1010,7 +1087,9 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 )
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
-                    stdout=asyncio.subprocess.PIPE,
+                    # stdout unused (encode goes to file) — DEVNULL avoids a
+                    # pipe-fill deadlock if FFmpeg ever writes to stdout.
+                    stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 _, stderr = await _wait_ffmpeg_with_heartbeat(proc, canonical)
@@ -1021,7 +1100,7 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                     )
                     for p in group_platforms:
                         out[p] = source_video
-                    await _bump_transcode_progress(canonical)
+                    await _bump_transcode_progress(canonical, outcome="fallback")
                     return out
 
                 sz_mb = output_path.stat().st_size / 1024 / 1024
@@ -1043,11 +1122,15 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 logger.error(f"[{ctx.upload_id}] Transcode error [{canonical}]: {e}")
                 for p in group_platforms:
                     out[p] = source_video
+                await _bump_transcode_progress(canonical, outcome="fallback")
+                return out
         else:
             logger.info(f"[{ctx.upload_id}] Platforms {group_platforms} already compatible")
             for p in group_platforms:
                 out[p] = source_video
-        await _bump_transcode_progress(canonical)
+            await _bump_transcode_progress(canonical, outcome="copy")
+            return out
+        await _bump_transcode_progress(canonical, outcome="done")
         return out
 
     if len(group_lists) > 1:
@@ -1060,12 +1143,20 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 logger.error(f"[{ctx.upload_id}] Transcode group failed: {gr}")
                 for p in gp:
                     ctx.platform_videos[p] = source_video
-                await _bump_transcode_progress(gp[0] if gp else "?")
+                await _bump_transcode_progress(gp[0] if gp else "?", outcome="fallback")
             else:
                 ctx.platform_videos.update(gr)
     else:
         for group_platforms in group_lists:
             ctx.platform_videos.update(await _transcode_one_group(group_platforms))
+
+    from stages.transcode_status import summarize_transcode_status
+
+    final_status = dict(tc_status)
+    final_status["phase"] = "done"
+    final_status["groups_done"] = total_groups
+    final_status["summary"] = summarize_transcode_status(final_status)
+    await _persist_tc_status(final_status)
 
     if ctx.platform_videos:
         first = ctx.platform_videos.get(platforms[0])
@@ -1619,6 +1710,38 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             os.environ.get("MULTIMODAL_PARALLEL", "true").lower() not in ("0", "false", "no", "off")
         )
 
+        async def _mark_mm_stage(stage: str, *, detail: str | None = None) -> None:
+            """Leave the transcode label as soon as multimodal work starts.
+
+            Parallel audio/vision/VI/TL can run for many minutes; without this the
+            UI stays on \"Building platform formats\" at mid-transcode %.
+            """
+            try:
+                await db_stage.update_stage_progress(
+                    db_pool,
+                    ctx.upload_id,
+                    stage,
+                    int(STAGE_PROGRESS.get(stage, STAGE_PROGRESS.get("audio", 62))),
+                )
+            except Exception:
+                pass
+            if detail:
+                try:
+                    from stages.pipeline_checkpoint import merge_output_artifacts_patch
+
+                    await merge_output_artifacts_patch(
+                        db_pool,
+                        str(ctx.upload_id),
+                        {
+                            "stage_status": {
+                                "summary": detail,
+                                "stage": stage,
+                            }
+                        },
+                    )
+                except Exception:
+                    pass
+
         async def _run_audio_multimodal() -> None:
             nonlocal ctx
             diag_step(ctx, stage="audio", status="started", provider="openai/whisper")
@@ -1632,6 +1755,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "yamnet_events": len(ac.get("yamnet_events") or []),
                 })
                 return
+            await _mark_mm_stage(
+                "audio",
+                detail="Analyzing audio (transcript + music) — runs with scene scan",
+            )
             try:
                 ctx = await asyncio.wait_for(
                     run_audio_context_stage(ctx),
@@ -1644,6 +1771,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "music_detected": bool(ac.get("music_detected")),
                     "yamnet_events": len(ac.get("yamnet_events") or []),
                 })
+            except asyncio.TimeoutError:
+                logger.warning(f"[{upload_id}] Audio context timed out after {STAGE_TIMEOUT_AUDIO}s")
+                _ai_trace(ctx, upload_id, "audio", {"status": "error", "reason": "timeout"})
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
                 _ai_trace(ctx, upload_id, "audio", {"status": "skipped", "reason": e.reason})
@@ -1654,6 +1784,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         async def _run_vision_multimodal() -> None:
             nonlocal ctx
             diag_step(ctx, stage="vision", status="started", provider="google_vision")
+            await _mark_mm_stage(
+                "vision",
+                detail="AI scene scan — labeling frames (vision)",
+            )
             try:
                 ctx = await asyncio.wait_for(
                     run_vision_stage(ctx),
@@ -1666,6 +1800,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "ocr_chars": len((vis.get("ocr_text") or "").strip()) if isinstance(vis, dict) else 0,
                     "landmarks": len(vis.get("landmark_names") or []) if isinstance(vis, dict) else 0,
                 })
+            except asyncio.TimeoutError:
+                logger.warning(f"[{upload_id}] Vision timed out after {STAGE_TIMEOUT_VISION}s")
+                _ai_trace(ctx, upload_id, "vision", {"status": "error", "reason": "timeout"})
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
                 _ai_trace(ctx, upload_id, "vision", {"status": "skipped", "reason": e.reason})
@@ -1682,6 +1819,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         async def _run_vi_multimodal() -> None:
             nonlocal ctx
             _ensure_worker_semaphores()
+            await _mark_mm_stage(
+                "video_intelligence",
+                detail=(
+                    "AI scene scan — deep video analysis (proxy + tracks); "
+                    "long clips can take 10–30 minutes"
+                ),
+            )
             try:
                 async with _heavy_semaphore:
                     ctx = await asyncio.wait_for(
@@ -1717,6 +1861,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     except Exception:
                         pass
                 await _persist_diag_artifacts_now("video_intelligence_status")
+            except asyncio.TimeoutError:
+                logger.warning(f"[{upload_id}] Video intelligence timed out after {STAGE_TIMEOUT_VI}s")
+                _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": "timeout"})
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
                 _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
@@ -1782,6 +1929,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         async def _run_twelvelabs_multimodal() -> None:
             nonlocal ctx
             diag_step(ctx, stage="twelvelabs", status="started", provider="twelve_labs")
+            await _mark_mm_stage(
+                "twelvelabs",
+                detail="AI scene scan — Twelve Labs indexing (optional scene understanding)",
+            )
             try:
                 ctx = await asyncio.wait_for(
                     run_twelvelabs_stage(ctx),
@@ -1807,14 +1958,37 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 diag_step(ctx, stage="twelvelabs", status="failed", provider="twelve_labs", reason=e.message)
                 _ai_trace(ctx, upload_id, "twelvelabs", {"status": "error", "reason": e.message})
 
+        # Leave "Building platform formats" immediately — multimodal can dominate wall clock.
+        await _mark_mm_stage(
+            "audio",
+            detail="Analyzing audio + AI scene scan (may run several minutes in parallel)",
+        )
+
         _mm_tasks = [_run_audio_multimodal(), _run_vision_multimodal(), _run_vi_multimodal()]
         if _multimodal_parallel and TWELVE_LABS_PARALLEL and resume_stage != "post_audio":
             _mm_tasks.append(_run_twelvelabs_multimodal())
+        # Providers are best-effort: one crashing/timing out must never cancel
+        # siblings or fail the upload (runners catch Skip/StageError/Timeout;
+        # return_exceptions guards anything unexpected).
         if _multimodal_parallel:
-            await asyncio.gather(*_mm_tasks)
+            _mm_results = await asyncio.gather(*_mm_tasks, return_exceptions=True)
         else:
+            _mm_results = []
             for _t in _mm_tasks:
-                await _t
+                try:
+                    _mm_results.append(await _t)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _mm_e:
+                    _mm_results.append(_mm_e)
+        for _mm_r in _mm_results:
+            if isinstance(_mm_r, asyncio.CancelledError):
+                raise _mm_r
+            if isinstance(_mm_r, BaseException):
+                logger.warning(
+                    f"[{upload_id}] Multimodal provider soft-failed: "
+                    f"{type(_mm_r).__name__}: {_mm_r}"
+                )
 
         await maybe_cancel(ctx, "audio")
         await maybe_cancel(ctx, "vision")
@@ -1883,7 +2057,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         _log_multimodal_pipeline_survey(upload_id, ctx)
 
         try:
-            ctx = await run_dashcam_osd_stage(ctx)
+            ctx = await asyncio.wait_for(
+                run_dashcam_osd_stage(ctx),
+                timeout=STAGE_TIMEOUT_DASHCAM_OSD or None,
+            )
             osd = ctx.dashcam_osd_context or {}
             _ai_trace(ctx, upload_id, "dashcam_osd", {
                 "status": "ok",
@@ -1891,6 +2068,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 "gps_fix_count": len(osd.get("gps_path") or []) if isinstance(osd, dict) else 0,
                 "telemetry_backfilled": bool(osd.get("telemetry_backfilled")) if isinstance(osd, dict) else False,
             })
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{upload_id}] Dashcam OSD timed out after {STAGE_TIMEOUT_DASHCAM_OSD}s"
+            )
+            _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "error", "reason": "timeout"})
         except SkipStage as e:
             logger.info(f"[{upload_id}] Dashcam OSD skipped: {e.reason}")
             _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "skipped", "reason": e.reason})
@@ -5102,6 +5284,8 @@ async def run_stream_reclaim_loop() -> None:
         UPLOAD_JOB_QUEUE,
     )
     publish_set = set(publish_streams)
+    # Strong refs for in-flight reclaim jobs (create_task alone can be GC'd).
+    _reclaim_tasks: set = set()
 
     logger.info(
         "Stream reclaim loop started | interval=%ss min_idle_ms=%s streams=%s",
@@ -5130,13 +5314,20 @@ async def run_stream_reclaim_loop() -> None:
                                 await _publish_one_job(payload)
                             else:
                                 await _process_one_job(payload)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as job_e:
+                            logger.exception("reclaimed job failed: %s", job_e)
                         finally:
                             try:
                                 await xack_message(redis_client, ack_sk, DEFAULT_GROUP, ack_mid)
                             except Exception as ack_e:
                                 logger.warning("reclaim xack failed: %s", ack_e)
 
-                    asyncio.create_task(_reclaim_one(job_json, sk, mid, is_publish))
+                    # Keep a strong reference so the task can't be GC'd mid-run.
+                    _rt = asyncio.create_task(_reclaim_one(job_json, sk, mid, is_publish))
+                    _reclaim_tasks.add(_rt)
+                    _rt.add_done_callback(_reclaim_tasks.discard)
             await asyncio.sleep(interval)
         except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
             logger.warning("stream reclaim redis error: %s", e)
@@ -6142,7 +6333,12 @@ async def process_jobs() -> None:
             await asyncio.sleep(wait)
             if consecutive_redis_errors >= REDIS_MAX_RETRIES:
                 try:
-                    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+                    redis_client = redis.from_url(
+                        REDIS_URL,
+                        decode_responses=True,
+                        socket_connect_timeout=10.0,
+                        socket_keepalive=True,
+                    )
                     await redis_client.ping()
                     logger.info("Redis reconnected")
                     consecutive_redis_errors = 0
@@ -6504,6 +6700,8 @@ async def main() -> None:
         min_size=db_min,
         max_size=db_max,
         init=_init_asyncpg_codecs,
+        # A stuck server-side query must not hold a pool connection forever.
+        command_timeout=float(os.environ.get("DB_COMMAND_TIMEOUT_SEC") or 300),
     )
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
@@ -6525,7 +6723,14 @@ async def main() -> None:
     except Exception:
         pass
 
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        # Bound only the connect: a socket_timeout would kill long blocking
+        # xreadgroup reads. Keepalive surfaces dead peers between commands.
+        socket_connect_timeout=10.0,
+        socket_keepalive=True,
+    )
     await redis_client.ping()
     logger.info("Redis connected")
 

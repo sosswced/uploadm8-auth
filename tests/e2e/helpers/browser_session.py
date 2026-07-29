@@ -85,16 +85,28 @@ def assert_not_on_login(page: Page, *, context: str = "") -> None:
 
 
 def human_login_via_form(page: Page, base_url: str) -> None:
-    """Fill login.html and submit — same path a user takes (HttpOnly cookies, no bearer)."""
+    """Fill login.html and submit — same path a user takes (HttpOnly cookies, no bearer).
+
+    Retries once: when the shared session's access token expires mid-suite, the
+    first post-login dashboard navigation can race a stale-token 401 refresh
+    bounce back to login.html, so a single strict wait flakes long suites.
+    """
     email, password = require_master_credentials()
-    page.goto(page_url(base_url, "login.html"), wait_until="domcontentloaded")
-    pause_between_requests()
-    page.locator("#email").fill(email)
-    page.locator("#password").fill(password)
-    page.locator("#loginForm button[type=submit]").click()
-    page.wait_for_url("**/dashboard.html**", timeout=90_000)
-    wait_for_authenticated_shell(page)
-    page.wait_for_timeout(click_delay_ms())
+    last_err: Exception | None = None
+    for attempt in range(2):
+        page.goto(page_url(base_url, "login.html"), wait_until="domcontentloaded")
+        pause_between_requests()
+        page.locator("#email").fill(email)
+        page.locator("#password").fill(password)
+        page.locator("#loginForm button[type=submit]").click()
+        try:
+            page.wait_for_url("**/dashboard.html**", timeout=45_000)
+            wait_for_authenticated_shell(page)
+            page.wait_for_timeout(click_delay_ms())
+            return
+        except Exception as e:
+            last_err = e
+    raise last_err  # type: ignore[misc]
 
 
 def bootstrap_human_session(page: Page, base_url: str, *, force_form_login: bool = False) -> None:

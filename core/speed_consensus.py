@@ -23,7 +23,9 @@ SPEED_CONSENSUS_ARTIFACT = "speed_consensus_v1"
 
 _MPH_CLAIM_RE = re.compile(
     r"(?:\b(?:at|around|about|over|hitting|hit|reaching|reached|up\s+to|near(?:ly)?|~)\s+)?"
-    r"\b(\d{1,3})(?:\.\d+)?\s*(mph|kph|km/?h|kmh)\b\.?",
+    r"\b(\d{1,3})(?:\.\d+)?"
+    r"(?:\s*(?:[-–—]|to)\s*(\d{1,3})(?:\.\d+)?)?"  # optional range: "90-100 mph"
+    r"\s*(mph|kph|km/?h|kmh|miles\s+per\s+hour|kilomet(?:er|re)s?\s+per\s+hour)\b\.?",
     re.IGNORECASE,
 )
 # Legit road-sign context — "45 mph speed limit sign" is not a vehicle-speed claim.
@@ -160,14 +162,22 @@ def scrub_untrusted_speed_claims(
     tol = float(tolerance_mph) if tolerance_mph is not None else speed_tolerance_mph(peak)
 
     def _replace(m: "re.Match[str]") -> str:
-        try:
-            val = float(m.group(1))
-        except (TypeError, ValueError):
+        vals: list = []
+        for g in (m.group(1), m.group(2)):
+            if g is None:
+                continue
+            try:
+                vals.append(float(g))
+            except (TypeError, ValueError):
+                continue
+        if not vals:
             return ""
-        unit = m.group(2).lower().replace("/", "")
-        val_mph = val * 0.621371 if unit.startswith("k") else val
-        if peak >= 5 and abs(val_mph - peak) <= tol:
-            return m.group(0)
+        unit = m.group(3).lower().replace("/", "")
+        # Keep a claim (or range) if any endpoint agrees with the trusted peak.
+        for val in vals:
+            val_mph = val * 0.621371 if unit.startswith("k") else val
+            if peak >= 5 and abs(val_mph - peak) <= tol:
+                return m.group(0)
         window = text[max(0, m.start() - 30): m.end() + 30]
         if _SIGN_CONTEXT_RE.search(window):
             return m.group(0)
@@ -180,11 +190,56 @@ def scrub_untrusted_speed_claims(
     return out.strip()
 
 
+def ensure_video_understanding_speed_scrubbed(ctx: Any, *, finalize: bool = True) -> float:
+    """Scrub MPH claims in ``ctx.video_understanding`` against consensus peak.
+
+    Twelve Labs (and any fused prose) invents speeds that must never reach
+    caption prompts, timelines, or titles unless they match the consensus.
+    Mutates ``scene_description`` / ``description`` / ``title_suggestion`` /
+    ``custom_queries`` in place. Idempotent. Returns the consensus peak used.
+
+    Builds the consensus **fresh** (never reads or writes the cached
+    ``speed_consensus_v1`` artifact): the Twelve Labs stage runs before the
+    dashcam OSD stage in the worker, and caching a premature peak=0 there
+    would poison every later consumer on HUD-only uploads.
+
+    ``finalize=False`` (write-time callers running before all speed sources
+    are extracted): only scrub when the consensus source is telemetry — the
+    telemetry stage runs before Twelve Labs and outranks every later source,
+    so that peak is already final. Weaker pre-OSD peaks (e.g. vision OCR) or
+    no peak at all defer the scrub, so a claim that later agrees with the
+    OSD consensus isn't irreversibly dropped. Consumers keep the default and
+    fail closed (no peak → drop all claims).
+    """
+    consensus = build_speed_consensus(ctx)
+    peak = _f(consensus.get("peak_mph"))
+    if not finalize and str(consensus.get("source") or "") != "telemetry":
+        return peak
+    vu = getattr(ctx, "video_understanding", None)
+    if not isinstance(vu, dict) or not vu:
+        return peak
+    for key in ("scene_description", "description", "title_suggestion"):
+        raw = vu.get(key)
+        if isinstance(raw, str) and raw.strip():
+            scrubbed = scrub_untrusted_speed_claims(raw, peak)
+            if scrubbed != raw:
+                vu[key] = scrubbed
+    cq = vu.get("custom_queries")
+    if isinstance(cq, dict):
+        for label, ans in list(cq.items()):
+            if isinstance(ans, str) and ans.strip():
+                scrubbed = scrub_untrusted_speed_claims(ans, peak)
+                if scrubbed != ans:
+                    cq[label] = scrubbed
+    return peak
+
+
 __all__ = [
     "SPEED_CONSENSUS_ARTIFACT",
     "build_speed_consensus",
     "get_speed_consensus",
     "consensus_peak_mph",
     "scrub_untrusted_speed_claims",
+    "ensure_video_understanding_speed_scrubbed",
     "speed_tolerance_mph",
 ]

@@ -303,7 +303,9 @@ async def _run_ffprobe_keyframes(video_path: Path) -> Tuple[List[float], float, 
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    from stages.ffmpeg_progress import communicate_or_kill
+
+    stdout, stderr = await communicate_or_kill(proc)
     if proc.returncode != 0:
         raise RuntimeError((stderr.decode(errors="replace") or "ffprobe failed")[-400:])
 
@@ -479,12 +481,14 @@ def build_mux_video_with_source_audio_command(
 
 
 async def _exec_ffmpeg(cmd: list) -> Tuple[bool, str]:
+    from stages.ffmpeg_progress import communicate_or_kill
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    _, stderr = await communicate_or_kill(proc)
     err = (stderr.decode(errors="replace") or "")[-600:]
     return proc.returncode == 0, err
 

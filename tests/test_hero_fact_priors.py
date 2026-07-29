@@ -10,7 +10,13 @@ from core.hero_fact_priors import (
 
 
 def test_bootstrap_rank_puts_landmark_before_speed():
-    order = class_rank_for_cluster("gardening")
+    from core.hero_fact_priors import _BOOTSTRAP_GLOBAL
+
+    # Force bootstrap priors — local data/ml/hero_fact_priors_v1.json may be learned.
+    order = class_rank_for_cluster(
+        "gardening",
+        priors={"version": 1, "global": list(_BOOTSTRAP_GLOBAL), "clusters": {}},
+    )
     assert order.index("landmark") < order.index("speed")
 
 

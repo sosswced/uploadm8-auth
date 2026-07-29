@@ -605,9 +605,16 @@ class JobContext:
         """
         trill = self.trill or self.trill_score
         telemetry = self.telemetry or self.telemetry_data
+        # Consensus only — raw telemetry/OSD peaks must never reach the
+        # thumbnail brief prompt (they can disagree with the published speed).
         max_mph = 0.0
-        if telemetry:
-            max_mph = getattr(telemetry, "max_speed_mph", 0) or 0
+        try:
+            from core.speed_consensus import consensus_peak_mph
+
+            max_mph = consensus_peak_mph(self)
+        except Exception:
+            if telemetry:
+                max_mph = getattr(telemetry, "max_speed_mph", 0) or 0
         platforms = [str(p).lower() for p in (self.platforms or [])]
         platforms_csv = ",".join(platforms) if platforms else "youtube,instagram,facebook,tiktok"
         fusion_summary = build_fusion_summary_text(self)
@@ -661,9 +668,10 @@ class JobContext:
                 osd_bits.append(f"HUD start: {fs.get('date') or '?'} {fs.get('time') or ''}".strip())
             if ls.get("date") or ls.get("time"):
                 osd_bits.append(f"HUD end: {ls.get('date') or '?'} {ls.get('time') or ''}".strip())
-            if osd.get("max_speed_mph"):
-                geo_bits.append(f"HUD peak speed: {osd.get('max_speed_mph')} mph")
-                osd_bits.append(f"peak speed: {osd.get('max_speed_mph')} mph")
+            if osd.get("max_speed_mph") and max_mph and max_mph >= 5:
+                # HUD detected a peak, but publish the consensus value.
+                geo_bits.append(f"HUD peak speed: {max_mph:.0f} mph")
+                osd_bits.append(f"peak speed: {max_mph:.0f} mph")
             if osd.get("avg_speed_mph"):
                 osd_bits.append(f"avg speed: {osd.get('avg_speed_mph')} mph")
             if osd.get("driver_name"):
@@ -1439,32 +1447,17 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if place_bits:
         clauses.append("Location context: " + " near ".join(place_bits[:2]) + (f" ({place_bits[-1]})" if len(place_bits) > 2 else "") + ".")
 
-    # Motion/vehicle/person facts — peak uses same resolver as hydration enforcer.
+    # Motion/vehicle/person facts — peak uses canonical speed consensus.
     motion_bits: List[str] = []
-    tel_max = 0.0
-    osd_max = 0.0
-    if tel:
-        try:
-            tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
-        except (TypeError, ValueError):
-            tel_max = 0.0
-    if isinstance(osd, dict):
-        try:
-            osd_max = float(osd.get("max_speed_mph") or 0)
-        except (TypeError, ValueError):
-            osd_max = 0.0
-    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+    from core.speed_consensus import consensus_peak_mph
 
-    series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
-    max_speed, _speed_src = trusted_peak_speed_mph(
-        telemetry_max=tel_max,
-        osd_max=osd_max,
-        series_peak=series_peak,
-    )
+    max_speed = consensus_peak_mph(ctx)
     if max_speed >= 5:
         motion_bits.append(f"peak speed about {int(round(max_speed))} MPH")
-    # Surface trusted HUD sample speeds so captions don't only see a single peak.
-    if isinstance(osd, dict):
+    # Surface trusted HUD sample speeds so captions don't only see a single
+    # peak — but never a sample above the consensus peak (a mis-OCR'd HUD
+    # frame must not out-claim the published speed). No consensus → no samples.
+    if isinstance(osd, dict) and max_speed >= 5:
         series = osd.get("speed_series") if isinstance(osd.get("speed_series"), list) else []
         sample_mph: List[int] = []
         for entry in series[:8]:
@@ -1474,7 +1467,7 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
                 v = float(entry.get("mph") or entry.get("speed_mph") or 0)
             except (TypeError, ValueError):
                 continue
-            if v >= 5:
+            if 5 <= v <= max_speed + 2:
                 sample_mph.append(int(round(v)))
         # Dedupe while preserving order.
         seen_mph: set = set()
@@ -1636,16 +1629,84 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             ts = 0.0
         events.append({"t_seconds": ts, "kind": str(kind)[:24], "text": text_clean[:240]})
 
+    # Clip duration early so music / vision / welcome can spread off t=0.
+    # Primary: video_info → vision → telemetry (first credible wins).
+    # Fallback: MAX of end-of-clip stamps (OSD last_seen / series end / transcript).
+    # Never use max_speed_at_s — that is a peak moment, not duration.
+    clip_dur = 0.0
+
+    def _as_dur(v: Any) -> float:
+        try:
+            d = float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return d if d > 1.0 else 0.0
+
+    for src in (
+        (getattr(ctx, "video_info", None) or {}).get("duration")
+        if isinstance(getattr(ctx, "video_info", None), dict)
+        else None,
+        (vc.get("video_duration_s") if isinstance(vc, dict) else None),
+        getattr(tel, "duration_seconds", None) if tel is not None else None,
+    ):
+        clip_dur = _as_dur(src)
+        if clip_dur > 0:
+            break
+    if clip_dur <= 0:
+        end_stamps: List[float] = []
+        if isinstance(osd, dict):
+            ls = osd.get("last_seen") or {}
+            if isinstance(ls, dict):
+                d = _as_dur(ls.get("t_s"))
+                if d:
+                    end_stamps.append(d)
+            for series_key in ("speed_series", "gps_path"):
+                series = osd.get(series_key)
+                if not isinstance(series, list) or not series:
+                    continue
+                last = series[-1]
+                if isinstance(last, dict):
+                    d = _as_dur(last.get("t_s") or last.get("ts_s"))
+                elif isinstance(last, (list, tuple)) and len(last) >= 4:
+                    d = _as_dur(last[3])
+                else:
+                    d = 0.0
+                if d:
+                    end_stamps.append(d)
+        if isinstance(ac, dict):
+            segs = ac.get("transcript_segments") or []
+            if isinstance(segs, list) and segs:
+                last_seg = segs[-1]
+                if isinstance(last_seg, dict):
+                    try:
+                        start = float(last_seg.get("start") or 0)
+                        end = float(last_seg.get("end") or 0)
+                        d = _as_dur(end if end > start else start + 2.0)
+                        if d:
+                            end_stamps.append(d)
+                    except (TypeError, ValueError):
+                        pass
+        if end_stamps:
+            clip_dur = max(end_stamps)
+
     # ── Scene understanding (Twelve Labs or fusion) — one anchor beat ────
+    # Scrub TL-invented MPH against consensus before any beat reaches the timeline.
     vu = getattr(ctx, "video_understanding", None) or {}
     if isinstance(vu, dict):
+        try:
+            from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+            ensure_video_understanding_speed_scrubbed(ctx)
+            vu = getattr(ctx, "video_understanding", None) or vu
+        except Exception:
+            pass
         scene_txt = str(vu.get("scene_description") or vu.get("description") or "").strip()
         if scene_txt:
             first = re.split(r"(?<=[.!?])\s+", scene_txt, maxsplit=1)[0].strip()
             if first:
                 _add(0.0, "scene", first)
 
-    # ── VI segment labels (whole-clip context, one beat each, cap 4) ─────
+    # ── VI segment labels (prefer segment start_s when present) ──────────
     seg_labels = []
     if isinstance(vic, dict):
         seg_labels = list(vic.get("segment_labels") or [])
@@ -1657,7 +1718,10 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
         if not desc or desc.lower() in seen_seg:
             continue
         seen_seg.add(desc.lower())
-        _add(0.0, "vi_label", desc)
+        t_seg = row.get("start_s") if isinstance(row, dict) else None
+        if t_seg is None and clip_dur > 0:
+            t_seg = clip_dur * (0.08 * len(seen_seg))
+        _add(t_seg if t_seg is not None else 0.0, "vi_label", desc)
         if len(seen_seg) >= 4:
             break
 
@@ -1731,6 +1795,9 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             duration_for_fracs = float(vc.get("video_duration_s") or 0.0) or 0.0
         except (TypeError, ValueError):
             duration_for_fracs = 0.0
+        if duration_for_fracs <= 0:
+            duration_for_fracs = clip_dur
+        sample_times: List[float] = []
         # Use fraction-based timing when we know the duration; otherwise
         # treat the whole clip as a single t=0 frame.
         if isinstance(fracs, list) and fracs and duration_for_fracs > 0:
@@ -1739,19 +1806,37 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                     t = float(frac) * duration_for_fracs
                 except (TypeError, ValueError):
                     continue
+                sample_times.append(t)
                 _add(t, "vision_frame", f"Vision sample {idx + 1}/{len(fracs)} @ {t:.1f}s")
         elif labels or landmarks or ocr:
             _add(0.0, "vision_frame", "Vision sampled frame")
-        for lbl in (labels or [])[:6]:
+        for i, lbl in enumerate((labels or [])[:6]):
             txt = str(lbl).strip()
-            if txt:
-                _add(0.0, "vision_label", txt)
-        for lm in (landmarks or [])[:3]:
+            if not txt:
+                continue
+            if sample_times:
+                t_lbl = sample_times[i % len(sample_times)]
+            elif duration_for_fracs > 0:
+                t_lbl = duration_for_fracs * (0.12 + 0.1 * i)
+            else:
+                t_lbl = 0.0
+            _add(t_lbl, "vision_label", txt)
+        for i, lm in enumerate((landmarks or [])[:3]):
             txt = str(lm).strip()
-            if txt:
-                _add(0.0, "landmark", txt)
+            if not txt:
+                continue
+            if sample_times:
+                t_lm = sample_times[min(i, len(sample_times) - 1)]
+            elif duration_for_fracs > 0:
+                t_lm = duration_for_fracs * (0.2 + 0.15 * i)
+            else:
+                t_lm = 0.0
+            _add(t_lm, "landmark", txt)
         if ocr:
-            _add(0.0, "vision_ocr", ocr.replace("\n", " ")[:200])
+            t_ocr = sample_times[0] if sample_times else (
+                duration_for_fracs * 0.05 if duration_for_fracs > 0 else 0.0
+            )
+            _add(t_ocr, "vision_ocr", ocr.replace("\n", " ")[:200])
 
     # ── Dashcam OSD (start/end stamps, per-frame speed, GPS path beats) ──
     if isinstance(osd, dict):
@@ -1770,22 +1855,30 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                 f"HUD end {str(ls.get('date') or '').strip()} {str(ls.get('time') or '').strip()}".strip(),
             )
         try:
-            raw_osd_peak = float(osd.get("max_speed_mph") or 0)
-        except (TypeError, ValueError):
-            raw_osd_peak = 0.0
-        from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+            from core.speed_consensus import consensus_peak_mph
 
-        max_mph_osd, _ = trusted_peak_speed_mph(
-            osd_max=raw_osd_peak,
-            series_peak=osd_series_peak_mph(osd),
-        )
+            max_mph_osd = consensus_peak_mph(ctx)
+        except Exception:
+            max_mph_osd = 0.0
+            try:
+                raw_osd_peak = float(osd.get("max_speed_mph") or 0)
+            except (TypeError, ValueError):
+                raw_osd_peak = 0.0
+            from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+
+            max_mph_osd, _ = trusted_peak_speed_mph(
+                osd_max=raw_osd_peak,
+                series_peak=osd_series_peak_mph(osd),
+            )
         peak_t = osd.get("max_speed_at_s")
         if peak_t is None:
             peak_t = osd.get("max_speed_t_s")
         if max_mph_osd >= 5:
             _add(peak_t or 0.0, "osd_speed", f"OSD peak {int(round(max_mph_osd))} MPH")
         speed_series = osd.get("speed_series") if isinstance(osd, dict) else None
-        if isinstance(speed_series, list) and speed_series:
+        # Beats are capped at the consensus peak: a mis-OCR'd HUD frame must
+        # never put a bigger number on the timeline than the published speed.
+        if isinstance(speed_series, list) and speed_series and max_mph_osd >= 5:
             step = max(1, len(speed_series) // 6)
             for entry in speed_series[::step][:6]:
                 if not isinstance(entry, dict):
@@ -1794,7 +1887,7 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                     s_mph = float(entry.get("mph") or entry.get("speed_mph") or 0)
                 except (TypeError, ValueError):
                     s_mph = 0.0
-                if s_mph <= 0:
+                if s_mph <= 0 or s_mph > max_mph_osd + 2:
                     continue
                 _add(
                     entry.get("t_s") or entry.get("ts_s") or 0.0,
@@ -1823,21 +1916,7 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                         continue
 
     # ── Telemetry highlights ─────────────────────────────────────────────
-    # Spread beats across clip duration when VI/Vision/OSD left the timeline thin.
-    clip_dur = 0.0
-    for src in (
-        (getattr(ctx, "video_info", None) or {}).get("duration")
-        if isinstance(getattr(ctx, "video_info", None), dict)
-        else None,
-        (vc.get("video_duration_s") if isinstance(vc, dict) else None),
-        getattr(tel, "duration_seconds", None) if tel is not None else None,
-    ):
-        try:
-            clip_dur = float(src or 0)
-        except (TypeError, ValueError):
-            clip_dur = 0.0
-        if clip_dur > 0:
-            break
+    # clip_dur computed above; spread geo/speed beats across the clip.
     if tel is not None:
         place = _first_nonempty(
             getattr(tel, "location_display", None),
@@ -1874,9 +1953,14 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             t_start = (clip_dur * 0.05) if clip_dur > 0 else 0.0
             _add(t_start, "geo_start", f"Run starts near {start_disp}")
         try:
-            max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
-        except (TypeError, ValueError):
-            max_mph_tel = 0.0
+            from core.speed_consensus import consensus_peak_mph
+
+            max_mph_tel = consensus_peak_mph(ctx)
+        except Exception:
+            try:
+                max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
+            except (TypeError, ValueError):
+                max_mph_tel = 0.0
         if max_mph_tel >= 5:
             # Prefer OSD peak time; else mid-clip so the beat isn't stuck at 0:00.
             peak_t = None
@@ -1889,7 +1973,12 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             avg_mph_tel = float(getattr(tel, "avg_speed_mph", 0) or 0)
         except (TypeError, ValueError):
             avg_mph_tel = 0.0
-        if avg_mph_tel >= 5 and abs(avg_mph_tel - max_mph_tel) >= 8:
+        tel_raw_max = 0.0
+        try:
+            tel_raw_max = float(getattr(tel, "max_speed_mph", 0) or 0)
+        except (TypeError, ValueError):
+            tel_raw_max = 0.0
+        if avg_mph_tel >= 5 and abs(avg_mph_tel - (tel_raw_max or max_mph_tel)) >= 8:
             t_avg = (clip_dur * 0.7) if clip_dur > 0 else 0.0
             _add(t_avg, "telemetry_avg", f"Telemetry avg ~{int(round(avg_mph_tel))} MPH")
         # End-of-run place beat when we know duration (gives the UI a second geo pin).
@@ -1900,8 +1989,9 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
     try:
         from services.scene_fusion import collect_place_signs
 
-        for sign in collect_place_signs(ctx)[:3]:
-            _add(0.0, "welcome_sign", f"Welcome to {sign}")
+        for i, sign in enumerate(collect_place_signs(ctx)[:3]):
+            t_sign = min(3.0, clip_dur * (0.08 + 0.04 * i)) if clip_dur > 0 else 0.0
+            _add(t_sign, "welcome_sign", f"Welcome to {sign}")
     except Exception:
         pass
 
@@ -1917,7 +2007,14 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
         track = str(ac.get("music_title") or "").strip()
         if artist or track:
             label = f"{artist} — {track}" if (artist and track) else (artist or track)
-            _add(0.0, "music", f"Music detected: {label}")
+            music_t = None
+            for key in ("music_offset_s", "music_start_s", "detected_at_s", "t_s"):
+                music_t = _t(ac.get(key))
+                if music_t is not None and music_t > 0:
+                    break
+            if music_t is None or music_t <= 0:
+                music_t = (clip_dur * 0.15) if clip_dur > 0 else 0.0
+            _add(music_t, "music", f"Music detected: {label}")
         yn = ac.get("yamnet_events") or []
         if isinstance(yn, list):
             seen_y: set[str] = set()
@@ -1929,7 +2026,8 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                 _add(0.0 if not isinstance(ev, dict) else (ev.get("t_s") or 0.0), "yamnet", txt)
         top_sound = str(ac.get("top_sound_class") or "").strip()
         if top_sound:
-            _add(0.0, "ambient_sound", f"Ambient: {top_sound}")
+            t_amb = (clip_dur * 0.22) if clip_dur > 0 else 0.0
+            _add(t_amb, "ambient_sound", f"Ambient: {top_sound}")
 
     # Sort by time, deduplicate exact same (kind, text) within 0.5s windows,
     # cap to ``max_events``.
@@ -1997,6 +2095,13 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
         push("=== HYDRATION STORY (short factual scene picture) ===", hydration_story, 0.10)
 
     if isinstance(vu, dict):
+        try:
+            from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+            ensure_video_understanding_speed_scrubbed(ctx)
+            vu = getattr(ctx, "video_understanding", None) or vu
+        except Exception:
+            pass
         scene = str(vu.get("scene_description") or vu.get("description") or "").strip()
         tsug = str(vu.get("title_suggestion") or "").strip()
         body = scene
@@ -2185,11 +2290,17 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
                 osd_lines.append(f"GPS at clip end (HUD): {float(ls['lat']):.5f}, {float(ls['lon']):.5f}")
             except (TypeError, ValueError):
                 pass
-        peak = osd.get("max_speed_mph")
+        peak = None
+        try:
+            from core.speed_consensus import consensus_peak_mph
+
+            peak = consensus_peak_mph(ctx) or None
+        except Exception:
+            peak = osd.get("max_speed_mph")
         if peak:
             at_s = osd.get("max_speed_at_s")
             tail = f" at ~{float(at_s):.0f}s into clip" if at_s is not None else ""
-            osd_lines.append(f"Peak speed (HUD): {peak} mph{tail}")
+            osd_lines.append(f"Peak speed (HUD): {int(round(float(peak)))} mph{tail}")
         avg = osd.get("avg_speed_mph")
         if avg:
             osd_lines.append(f"Average speed (HUD): {avg} mph")
@@ -2267,9 +2378,15 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
             if isinstance(th, list) and th:
                 loc_bits.append("Trill hashtag ideas: " + ", ".join(str(x).lstrip("#") for x in th[:14]))
         if tel:
-            mph = getattr(tel, "max_speed_mph", None)
-            if mph:
-                loc_bits.append(f"Peak speed: {mph} mph")
+            # Consensus only — raw telemetry peak may be outranked (or absent).
+            try:
+                from core.speed_consensus import consensus_peak_mph
+
+                mph = consensus_peak_mph(ctx)
+            except Exception:
+                mph = float(getattr(tel, "max_speed_mph", 0) or 0)
+            if mph and mph >= 5:
+                loc_bits.append(f"Peak speed: {mph:.0f} mph")
             dist = getattr(tel, "total_distance_miles", None)
             if dist:
                 loc_bits.append(f"Distance: {dist} mi")

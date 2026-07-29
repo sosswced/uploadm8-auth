@@ -359,6 +359,13 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
 
 def _scrubbed_scene_text(ctx: JobContext, vu: Dict[str, Any]) -> str:
     """TL/fusion scene prose with wrong-MPH claims removed before it reaches prompts."""
+    try:
+        from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+        ensure_video_understanding_speed_scrubbed(ctx)
+        vu = getattr(ctx, "video_understanding", None) or vu
+    except Exception:
+        pass
     scene = str(vu.get("scene_description") or vu.get("description") or "")
     if not scene:
         return ""
@@ -553,6 +560,19 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     except Exception:
         content_identity_sg = {}
 
+    # Canonical publishable speed — anchor/title builders must read this,
+    # never raw geo/OSD peaks (telemetry outranks OSD; OSD can mis-OCR).
+    try:
+        from core.speed_consensus import build_speed_consensus
+
+        _cons = build_speed_consensus(ctx)
+        speed_consensus_sg = {
+            "peak_mph": round(float(_cons.get("peak_mph") or 0.0), 1),
+            "source": str(_cons.get("source") or ""),
+        }
+    except Exception:
+        speed_consensus_sg = {}
+
     out_graph: Dict[str, Any] = {
         "engine_version": M8_ENGINE_VERSION,
         "m8_engine": {
@@ -629,6 +649,7 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         "geo": geo,
         "trill": trill_d,
         "dashcam_osd": osd_d,
+        "speed_consensus": speed_consensus_sg,
         "place_evidence": (
             getattr(ctx, "place_evidence", None)
             if isinstance(getattr(ctx, "place_evidence", None), dict)
@@ -1569,11 +1590,16 @@ def _best_hydration_anchor(scene_graph: Dict[str, Any]) -> str:
     geo = scene_graph.get("geo") or {}
     osd = scene_graph.get("dashcam_osd") or {}
     parts: List[str] = []
-    if osd.get("max_speed_mph"):
-        try:
-            parts.append(f"{int(round(float(osd.get('max_speed_mph'))))} MPH")
-        except (TypeError, ValueError):
-            pass
+    # Consensus peak first (telemetry outranks OSD); trusted OSD only as a
+    # fallback for older scene-graph snapshots without the consensus block.
+    _peak_val = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
+    if _peak_val is None and "speed_consensus" not in scene_graph:
+        _peak_val = osd.get("max_speed_mph")
+    try:
+        if _peak_val is not None and float(_peak_val) >= 5:
+            parts.append(f"{int(round(float(_peak_val)))} MPH")
+    except (TypeError, ValueError):
+        pass
     if geo.get("road"):
         parts.append(str(geo.get("road")))
     if geo.get("gazetteer_place"):
@@ -2108,9 +2134,13 @@ def _deterministic_evidence_title(
 
     speed_token = ""
     try:
-        mph_val = geo.get("max_speed_mph")
-        if mph_val is None:
-            mph_val = osd.get("max_speed_mph")
+        # Consensus peak only — raw geo/OSD peaks can disagree with the
+        # published speed. Legacy graphs without the block fall back.
+        mph_val = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
+        if mph_val is None and "speed_consensus" not in scene_graph:
+            mph_val = geo.get("max_speed_mph")
+            if mph_val is None:
+                mph_val = osd.get("max_speed_mph")
         if mph_val is not None:
             mph = int(round(float(mph_val)))
             if mph >= 5:

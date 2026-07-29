@@ -37,8 +37,8 @@ arrays, and they still land if M8 was disabled / empty for any platform.
 The helper is deliberately conservative:
 
 * All tags pass through ``sanitize_hashtag_body`` so they're publish-safe.
-* Geo tags include both human-readable city/state ("losangeles", "california")
-  and combined forms ("losangelesCA") — small and unambiguous.
+* Geo tags are separate city + full state name (``losangeles``, ``california``) —
+  never city+abbr run-ons like ``losangelesCA``.
 * We never emit a leading '#'; ``get_effective_hashtags`` adds it.
 * Each call is bounded (default 12 extras) so we don't blow the per-platform
   ``hashtag_count`` cap when the LLM already returned a full array.
@@ -53,7 +53,12 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
-from core.helpers import sanitize_hashtag_body
+from core.helpers import (
+    expand_geo_runon_hashtag,
+    normalize_hashtag_bodies,
+    sanitize_hashtag_body,
+    split_hashtag_source_phrases,
+)
 from core.vision_labels import (
     HASHTAG_BODY_MAX_LEN,
     is_generic_vision_label,
@@ -85,9 +90,8 @@ _BLOCKED_META = {
     "facebook",
 }
 
-# Common state-name → 2-letter abbreviation so we can offer compact composite
-# tags like ``losangelesCA``. Covers US 50 states + DC. Other countries fall
-# back to country code (e.g. "AU") via ``location_country``.
+# Common state-name → 2-letter abbreviation (used only for display/mapping,
+# never glued onto city slugs — discovery wants #lasvegas #nevada).
 _US_STATE_ABBR: Dict[str, str] = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
     "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
@@ -147,14 +151,20 @@ def _slug(raw: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> str:
 
 
 def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> None:
-    """Append candidate slug if non-empty, not duplicate, not blocklisted."""
-    body = _slug(candidate, max_len=max_len)
-    if not body or body in seen or body in _BLOCKED_META:
-        return
-    if is_junk_hashtag_body(body):
-        return
-    seen.add(body)
-    tags.append(body)
+    """Append candidate slug(s) if non-empty, not duplicate, not blocklisted.
+
+    Multi-entity sources (``Artist|Artist``, ``City, ST``) and geo run-ons are
+    expanded into separate tags before sanitize.
+    """
+    for phrase in split_hashtag_source_phrases(str(candidate or "")):
+        for body in expand_geo_runon_hashtag(phrase, max_len=max_len):
+            body = _slug(body, max_len=max_len)
+            if not body or body in seen or body in _BLOCKED_META:
+                continue
+            if is_junk_hashtag_body(body):
+                continue
+            seen.add(body)
+            tags.append(body)
 
 
 def _state_abbr(state: Optional[str], country: Optional[str]) -> Optional[str]:
@@ -186,14 +196,13 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
       2. ACR music artist/track          (when ACRCloud matched)
       3. Geo road/highway name           (also very specific)
       4. Gazetteer place (Census)        (when it differs from Nominatim city)
-      5. Geo city + state combined       (e.g. ``losangelesCA``)
-      6. Geo city                        (e.g. ``losangeles``)
-      7. Geo state                       (e.g. ``california``)
-      8. PADUS unit / public-lands hint  (protected area name or ``publiclands``)
-      9. Highway hits parsed from OCR    (e.g. ``i15``)
-     10. Vision logos / brands           (when prominent on screen)
-     11. Trill bucket tags               (driving energy from telemetry)
-     12. Speed-bucket tags               (max_speed_mph thresholds)
+      5. Geo city                        (e.g. ``losangeles``)
+      6. Geo state                       (e.g. ``california``) — never city+abbr
+      7. PADUS unit / public-lands hint  (protected area name or ``publiclands``)
+      8. Highway hits parsed from OCR    (e.g. ``i15``)
+      9. Vision logos / brands           (when prominent on screen)
+     10. Trill bucket tags               (driving energy from telemetry)
+     11. Speed-bucket tags               (max_speed_mph thresholds)
     """
     tags: List[str] = []
     seen: set = set()
@@ -248,14 +257,12 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
             city_body = _slug(city or "")
             if not city_body or gz_body != city_body:
                 _push(tags, seen, gaz_place)
-        abbr = _state_abbr(state, country)
-        if city and abbr:
-            # Compose without a separator so sanitize_hashtag_body keeps it.
-            _push(tags, seen, f"{city}{abbr}")
+        # Separate discovery tags only — never city+CA / city+NV run-ons.
         _push(tags, seen, city)
         _push(tags, seen, state)
         start_disp = getattr(tel, "location_start_display", None)
         if start_disp:
+            # "Las Vegas, NV" → #lasvegas #nevada via split_hashtag_source_phrases.
             _push(tags, seen, start_disp)
         pun = getattr(tel, "padus_unit_name", None)
         if pun:
@@ -338,6 +345,46 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     return tags
 
 
+def _unsquash_delimited_sources(tags: List[str], sources: Iterable[Any]) -> List[str]:
+    """Replace smashed multi-entity slugs with their split forms.
+
+    ``Destroy Lonely|Lil Uzi Vert`` slugifies to ``destroylonelyliluzivert``;
+    when we still have the delimited source, expand back to separate tags.
+    """
+    drop: set = set()
+    inject: List[str] = []
+    tag_set = {t.lower() for t in tags}
+    for src in sources:
+        text = str(src or "").strip()
+        if not text:
+            continue
+        phrases = split_hashtag_source_phrases(text)
+        if len(phrases) < 2:
+            continue
+        smashed = sanitize_hashtag_body(text)
+        parts = [sanitize_hashtag_body(p) for p in phrases]
+        parts = [p for p in parts if p]
+        if not smashed or not parts:
+            continue
+        if smashed in tag_set:
+            drop.add(smashed)
+            for p in parts:
+                if p not in tag_set:
+                    inject.append(p)
+                    tag_set.add(p)
+    if not drop and not inject:
+        return tags
+    out: List[str] = []
+    seen: set = set()
+    for t in list(inject) + list(tags):
+        b = sanitize_hashtag_body(str(t))
+        if not b or b in seen or b in drop:
+            continue
+        seen.add(b)
+        out.append(b)
+    return out
+
+
 def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     """Inject ``build_signal_hashtags(ctx)`` into legacy + per-platform lists.
 
@@ -357,17 +404,27 @@ def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> L
         return []
 
     extras_lower = {t.lower() for t in extras}
+    ac = (ctx.audio_context or {}) if isinstance(ctx.audio_context, dict) else {}
+    unsquash_sources = [
+        ac.get("music_artist"),
+        ac.get("music_title"),
+        getattr(ctx.telemetry or ctx.telemetry_data, "location_start_display", None)
+        if (ctx.telemetry or ctx.telemetry_data) is not None
+        else None,
+    ]
 
     # ── Legacy ai_hashtags (general fallback list) ───────────────────────
     existing_ai: List[str] = []
     seen_ai: set = set()
     for raw in (ctx.ai_hashtags or []):
-        b = sanitize_hashtag_body(str(raw))
-        if not b or b in seen_ai or b in extras_lower:
-            continue
-        seen_ai.add(b)
-        existing_ai.append(b)
-    ctx.ai_hashtags = list(extras) + existing_ai
+        for b in normalize_hashtag_bodies([str(raw)]):
+            if not b or b in seen_ai or b in extras_lower:
+                continue
+            seen_ai.add(b)
+            existing_ai.append(b)
+    ctx.ai_hashtags = _unsquash_delimited_sources(
+        list(extras) + existing_ai, unsquash_sources
+    )
 
     # ── Per-platform M8 hashtags ─────────────────────────────────────────
     m8_map = getattr(ctx, "m8_platform_hashtags", None) or {}
@@ -378,12 +435,16 @@ def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> L
             cur_seen: set = set()
             cur: List[str] = []
             for raw in raw_list:
-                b = sanitize_hashtag_body(str(raw))
-                if not b or b in cur_seen or b in extras_lower:
-                    continue
-                cur_seen.add(b)
-                cur.append(b)
-            m8_map[pl] = list(extras) + cur
+                for b in normalize_hashtag_bodies([str(raw)]):
+                    if not b or b in cur_seen or b in extras_lower:
+                        continue
+                    cur_seen.add(b)
+                    cur.append(b)
+            m8_map[pl] = _unsquash_delimited_sources(list(extras) + cur, unsquash_sources)
+
+    # Normalize legacy list too (split any LLM geo run-ons that survived).
+    ctx.ai_hashtags = normalize_hashtag_bodies(list(ctx.ai_hashtags or []))
+    ctx.ai_hashtags = _unsquash_delimited_sources(ctx.ai_hashtags, unsquash_sources)
 
     logger.info(
         "[signal_hashtags] injected %d signal tags: %s",

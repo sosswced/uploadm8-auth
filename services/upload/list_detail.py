@@ -21,6 +21,7 @@ from stages.context import is_placeholder_upload_caption, is_placeholder_upload_
 from services.upload.hashtags import _normalize_hashtags_list
 from services.upload.schedule_guard import UPLOAD_ERROR_MESSAGES
 from services.upload.stage_labels import stage_label_for
+from stages.transcode_status import stage_detail_from_artifacts
 from services.retry_policy import (
     upload_is_overdue_ready_to_publish,
     upload_is_stale_processing,
@@ -80,6 +81,34 @@ def _dt_iso(v: Any) -> Optional[str]:
     return str(v)
 
 
+def _terminal_ok_status(status: Any) -> bool:
+    return str(status or "").strip().lower() in ("succeeded", "completed", "partial")
+
+
+def _progress_for_upload_row(d: dict) -> int:
+    if _terminal_ok_status(d.get("status")):
+        return 100
+    try:
+        return int(d.get("processing_progress") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stage_name_for_upload_row(d: dict) -> Optional[str]:
+    if _terminal_ok_status(d.get("status")):
+        return None
+    return d.get("processing_stage")
+
+
+def _stage_label_for_upload_row(d: dict) -> Optional[str]:
+    st = str(d.get("status") or "").strip().lower()
+    if st == "partial":
+        return "Partial"
+    if st in ("succeeded", "completed"):
+        return "Done"
+    return stage_label_for(d.get("processing_stage"))
+
+
 def _json_safe_for_api(v: Any) -> Any:
     """Normalize values for Starlette JSONResponse (json.dumps without default=)."""
     if v is None:
@@ -136,6 +165,8 @@ _ARTIFACT_UI_KEYS = (
     "coach_hints",
     "failure_phase",
     "failure_diag",
+    "transcode_status",
+    "stage_status",
 )
 
 
@@ -184,9 +215,25 @@ def slim_output_artifacts_for_ui(raw: Any) -> Dict[str, Any]:
                     out[key] = _json_safe_for_api(parsed) if isinstance(parsed, dict) else arts[key]
                 except Exception:
                     out[key] = _json_safe_for_api(arts[key])
+            elif key in ("transcode_status", "stage_status") and isinstance(arts[key], str):
+                try:
+                    parsed = json.loads(arts[key])
+                    out[key] = _json_safe_for_api(parsed) if isinstance(parsed, dict) else arts[key]
+                except Exception:
+                    out[key] = _json_safe_for_api(arts[key])
             else:
                 out[key] = _json_safe_for_api(arts[key])
     return out
+
+
+def _stage_detail_for_upload_row(d: dict) -> Optional[str]:
+    """Human subtitle under stage_label (live encode plan during transcode)."""
+    if _terminal_ok_status(d.get("status")):
+        return None
+    detail = stage_detail_from_artifacts(d.get("output_artifacts"))
+    if detail:
+        return detail
+    return None
 
 
 def failure_diag_from_upload_row(d: dict) -> Optional[Dict[str, Any]]:
@@ -407,6 +454,9 @@ def build_upload_list_item(
     )
 
     raw_status = str(d.get("status") or "")
+    prog = _progress_for_upload_row(d)
+    stage_name = _stage_name_for_upload_row(d)
+    stage_lbl = _stage_label_for_upload_row(d)
     trill_raw = d.get("trill_score")
     trill_score = None
     if trill_raw is not None:
@@ -450,9 +500,14 @@ def build_upload_list_item(
         "likes": int(d.get("likes") or 0),
         "comments": int(d.get("comments") or 0),
         "shares": int(d.get("shares") or 0),
-        "progress": int(d.get("processing_progress") or 0),
-        "current_stage": d.get("processing_stage"),
-        "stage_label": stage_label_for(d.get("processing_stage")),
+        "progress": prog,
+        "processing_progress": prog,
+        "processingProgress": prog,
+        "current_stage": stage_name,
+        "processing_stage": stage_name,
+        "stage_label": stage_lbl,
+        "stage_detail": _stage_detail_for_upload_row(d),
+        "stageDetail": _stage_detail_for_upload_row(d),
         "processing_started_at": _dt_iso(d.get("processing_started_at")),
         "processingStartedAt": _dt_iso(d.get("processing_started_at")),
         "updated_at": _dt_iso(d.get("updated_at")),
@@ -888,14 +943,16 @@ def build_upload_detail_payload(d: dict) -> dict:
         "file_size": d.get("file_size"),
         "views": int(d.get("views") or 0),
         "likes": int(d.get("likes") or 0),
-        "progress": int(d.get("processing_progress") or 0),
-        "current_stage": d.get("processing_stage"),
-        "stage_label": stage_label_for(d.get("processing_stage")),
+        "progress": _progress_for_upload_row(d),
+        "current_stage": _stage_name_for_upload_row(d),
+        "stage_label": _stage_label_for_upload_row(d),
+        "stage_detail": _stage_detail_for_upload_row(d),
+        "stageDetail": _stage_detail_for_upload_row(d),
         "duration_seconds": duration_seconds,
         "processingStartedAt": _dt_iso(d.get("processing_started_at")),
         "processingFinishedAt": _dt_iso(d.get("processing_finished_at")),
-        "processingProgress": int(d.get("processing_progress") or 0),
-        "processingStage": d.get("processing_stage"),
+        "processingProgress": _progress_for_upload_row(d),
+        "processingStage": _stage_name_for_upload_row(d),
         "trill_score": float(d["trill_score"]) if d.get("trill_score") is not None else None,
         "speed_bucket": d.get("speed_bucket"),
         "trill_metadata": _safe_json(d.get("trill_metadata"), None),

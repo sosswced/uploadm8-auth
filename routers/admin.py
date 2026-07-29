@@ -77,6 +77,7 @@ from services.ml_hub_config import (
 )
 from services.ml_engine import load_engine_state, run_ml_engine_cycle
 from services.ml_engine_config import get_ml_engine_config, ml_engine_public_dict
+from services.growth_intelligence import sanitize_coach_payload_for_json
 from services.ml_feature_registry import catalog as _ml_feature_registry_catalog
 from services.ml_observability import hf_write_token
 from services.wallet_disputes import admin_patch_wallet_dispute, list_admin_wallet_disputes
@@ -401,19 +402,21 @@ async def ml_engine_status(user: dict = Depends(require_admin)):
     state = load_engine_state()
     cfg = get_ml_engine_config()
     last_run = state.get("last_run") if isinstance(state.get("last_run"), dict) else {}
-    return {
-        "config": ml_engine_public_dict(cfg),
-        "state": {
-            "updated_at": state.get("updated_at"),
-            "last_run": last_run,
-        },
-        "cycle_status": last_run.get("cycle_status"),
-        "promo_status": last_run.get("status"),
-        "content_status": (last_run.get("content") or {}).get("status"),
-        "blocked_on_data": last_run.get("cycle_status") == "blocked_on_data"
-        or last_run.get("status") == "blocked_on_data"
-        or (last_run.get("content") or {}).get("status") == "blocked_on_data",
-    }
+    return sanitize_coach_payload_for_json(
+        {
+            "config": ml_engine_public_dict(cfg),
+            "state": {
+                "updated_at": state.get("updated_at"),
+                "last_run": last_run,
+            },
+            "cycle_status": last_run.get("cycle_status"),
+            "promo_status": last_run.get("status"),
+            "content_status": (last_run.get("content") or {}).get("status"),
+            "blocked_on_data": last_run.get("cycle_status") == "blocked_on_data"
+            or last_run.get("status") == "blocked_on_data"
+            or (last_run.get("content") or {}).get("status") == "blocked_on_data",
+        }
+    )
 
 
 @router.post("/ml/engine-run")

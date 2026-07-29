@@ -846,7 +846,9 @@ async def _extract_frames_at_offsets(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
+    from stages.ffmpeg_progress import communicate_or_kill
+
+    stdout, _ = await communicate_or_kill(proc)
     if proc.returncode == 0 and stdout:
         try:
             data = json.loads(stdout.decode("utf-8", errors="replace"))
@@ -883,7 +885,7 @@ async def _extract_frames_at_offsets(
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        await proc.communicate()
+        await communicate_or_kill(proc)
         if out_path.exists() and out_path.stat().st_size > 1000:
             out_pairs.append((f, out_path))
     return out_pairs
@@ -1057,7 +1059,9 @@ async def _extract_frame_for_vision(ctx: JobContext) -> Optional[Path]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        from stages.ffmpeg_progress import communicate_or_kill
+
+        stdout, _ = await communicate_or_kill(proc)
         duration = 1.0
         if proc.returncode == 0 and stdout:
             try:
@@ -1071,7 +1075,7 @@ async def _extract_frame_for_vision(ctx: JobContext) -> Optional[Path]:
         cmd = [FFMPEG_PATH, "-y", "-ss", f"{offset:.2f}", "-i", str(video_path),
                "-vframes", "1", "-q:v", "2", "-vf", "scale=1280:-1", str(out_path)]
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc.communicate()
+        await communicate_or_kill(proc)
         return out_path if out_path.exists() and out_path.stat().st_size > 1000 else None
     except asyncio.CancelledError:
         raise

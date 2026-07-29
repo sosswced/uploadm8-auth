@@ -462,7 +462,13 @@ async def _ffprobe_duration(video_path: Path) -> float:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        from stages.ffmpeg_progress import kill_process_quietly
+
+        await kill_process_quietly(proc)
+        raise
     if proc.returncode != 0 or not stdout:
         return 0.0
     try:
@@ -505,7 +511,13 @@ async def _sample_bottom_strips(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, stderr = await proc.communicate()
+    try:
+        _, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        from stages.ffmpeg_progress import kill_process_quietly
+
+        await kill_process_quietly(proc)
+        raise
     if proc.returncode != 0:
         logger.warning(
             "[dashcam_osd] ffmpeg sampling failed: %s",

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
-
-import pytest
 
 from stages.m8_engine import run_m8_caption_engine
 
@@ -65,8 +64,7 @@ def _ok_payload():
     }
 
 
-@pytest.mark.asyncio
-async def test_m8_ladder_falls_to_text_only_after_full_and_compact_fail():
+def test_m8_ladder_falls_to_text_only_after_full_and_compact_fail():
     ctx = _ctx()
     calls = []
 
@@ -81,41 +79,65 @@ async def test_m8_ladder_falls_to_text_only_after_full_and_compact_fail():
             return {}, {"prompt": 0, "completion": 0}, "parse_failed"
         return _ok_payload(), {"prompt": 10, "completion": 20}, ""
 
-    with patch("stages.m8_engine._call_openai_m8_json", new=AsyncMock(side_effect=_fake)):
-        with patch("stages.m8_engine.build_scene_graph", return_value={"platforms": ["youtube", "tiktok"], "vision": {}, "transcript": {}, "video_intelligence": {}}):
-            with patch("stages.m8_engine.m8_evidence_matrix_enabled", return_value=False):
-                with patch("stages.m8_engine.rank_and_select", return_value={"platforms": _ok_payload()["platforms"], "must_use": []}):
-                    with patch("stages.m8_engine._ensure_platform_completeness", side_effect=lambda r, s: r):
-                        def _apply(ctx_in, *_a, **_k):
-                            ctx_in.m8_platform_captions = {
-                                "youtube": "Triple-digit energy on a clear stretch.",
-                                "tiktok": "88 MPH send it",
-                            }
-                            ctx_in.m8_platform_titles = {"youtube": "88 MPH on the freeway"}
-                            ctx_in.ai_caption = "88 MPH send it"
-                            ctx_in.ai_title = "88 MPH on the freeway"
+    async def _run():
+        with patch("stages.m8_engine._call_openai_m8_json", new=AsyncMock(side_effect=_fake)):
+            with patch(
+                "stages.m8_engine.build_scene_graph",
+                return_value={
+                    "platforms": ["youtube", "tiktok"],
+                    "vision": {},
+                    "transcript": {},
+                    "video_intelligence": {},
+                },
+            ):
+                with patch("stages.m8_engine.m8_evidence_matrix_enabled", return_value=False):
+                    with patch(
+                        "stages.m8_engine.rank_and_select",
+                        return_value={
+                            "platforms": _ok_payload()["platforms"],
+                            "must_use": [],
+                        },
+                    ):
+                        with patch(
+                            "stages.m8_engine._ensure_platform_completeness",
+                            side_effect=lambda r, s: r,
+                        ):
+                            def _apply(ctx_in, *_a, **_k):
+                                ctx_in.m8_platform_captions = {
+                                    "youtube": "Triple-digit energy on a clear stretch.",
+                                    "tiktok": "88 MPH send it",
+                                }
+                                ctx_in.m8_platform_titles = {
+                                    "youtube": "88 MPH on the freeway"
+                                }
+                                ctx_in.ai_caption = "88 MPH send it"
+                                ctx_in.ai_title = "88 MPH on the freeway"
 
-                        with patch("stages.m8_engine.apply_selection_to_context", side_effect=_apply):
-                            meta = await run_m8_caption_engine(
-                                ctx,
-                                frames=["a.jpg", "b.jpg", "c.jpg"],
-                                category="automotive",
-                                caption_style="punchy",
-                                caption_tone="cinematic",
-                                caption_voice="teacher",
-                                hashtag_style="mixed",
-                                hashtag_count=5,
-                                generate_title=True,
-                                generate_caption=True,
-                                generate_hashtags=True,
-                                model="gpt-4o-mini",
-                                blocked_tags=[],
-                                always_tags=[],
-                                base_tags=[],
-                                db_pool=None,
-                                strategy=None,
-                            )
+                            with patch(
+                                "stages.m8_engine.apply_selection_to_context",
+                                side_effect=_apply,
+                            ):
+                                return await run_m8_caption_engine(
+                                    ctx,
+                                    frames=["a.jpg", "b.jpg", "c.jpg"],
+                                    category="automotive",
+                                    caption_style="punchy",
+                                    caption_tone="cinematic",
+                                    caption_voice="teacher",
+                                    hashtag_style="mixed",
+                                    hashtag_count=5,
+                                    generate_title=True,
+                                    generate_caption=True,
+                                    generate_hashtags=True,
+                                    model="gpt-4o-mini",
+                                    blocked_tags=[],
+                                    always_tags=[],
+                                    base_tags=[],
+                                    db_pool=None,
+                                    strategy=None,
+                                )
 
+    meta = asyncio.run(_run())
     assert meta.get("ok") is True
     assert meta.get("llm_tier") == "text_only"
     assert len(calls) == 3
@@ -124,8 +146,7 @@ async def test_m8_ladder_falls_to_text_only_after_full_and_compact_fail():
     assert calls[2]["n_frames"] == 0
 
 
-@pytest.mark.asyncio
-async def test_m8_ladder_stops_on_quota_without_extra_calls():
+def test_m8_ladder_stops_on_quota_without_extra_calls():
     ctx = _ctx()
     calls = []
 
@@ -133,29 +154,39 @@ async def test_m8_ladder_stops_on_quota_without_extra_calls():
         calls.append(len(frames or []))
         return {}, {"prompt": 0, "completion": 0}, "openai_quota"
 
-    with patch("stages.m8_engine._call_openai_m8_json", new=AsyncMock(side_effect=_fake)):
-        with patch("stages.m8_engine.build_scene_graph", return_value={"platforms": ["youtube"], "vision": {}, "transcript": {}, "video_intelligence": {}}):
-            with patch("stages.m8_engine.m8_evidence_matrix_enabled", return_value=False):
-                meta = await run_m8_caption_engine(
-                    ctx,
-                    frames=["a.jpg"],
-                    category="automotive",
-                    caption_style="punchy",
-                    caption_tone="cinematic",
-                    caption_voice="teacher",
-                    hashtag_style="mixed",
-                    hashtag_count=5,
-                    generate_title=True,
-                    generate_caption=True,
-                    generate_hashtags=True,
-                    model="gpt-4o-mini",
-                    blocked_tags=[],
-                    always_tags=[],
-                    base_tags=[],
-                    db_pool=None,
-                    strategy=None,
-                )
+    async def _run():
+        with patch("stages.m8_engine._call_openai_m8_json", new=AsyncMock(side_effect=_fake)):
+            with patch(
+                "stages.m8_engine.build_scene_graph",
+                return_value={
+                    "platforms": ["youtube"],
+                    "vision": {},
+                    "transcript": {},
+                    "video_intelligence": {},
+                },
+            ):
+                with patch("stages.m8_engine.m8_evidence_matrix_enabled", return_value=False):
+                    return await run_m8_caption_engine(
+                        ctx,
+                        frames=["a.jpg"],
+                        category="automotive",
+                        caption_style="punchy",
+                        caption_tone="cinematic",
+                        caption_voice="teacher",
+                        hashtag_style="mixed",
+                        hashtag_count=5,
+                        generate_title=True,
+                        generate_caption=True,
+                        generate_hashtags=True,
+                        model="gpt-4o-mini",
+                        blocked_tags=[],
+                        always_tags=[],
+                        base_tags=[],
+                        db_pool=None,
+                        strategy=None,
+                    )
 
+    meta = asyncio.run(_run())
     assert meta.get("ok") is False
     assert meta.get("error_class") == "openai_quota"
     assert len(calls) == 1

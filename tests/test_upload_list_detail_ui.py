@@ -1,9 +1,44 @@
 """Unit tests for upload list/detail UI payload helpers."""
 
 from services.upload.list_detail import (
+    _progress_for_upload_row,
+    _stage_label_for_upload_row,
+    _stage_name_for_upload_row,
     failure_diag_from_upload_row,
     slim_output_artifacts_for_ui,
 )
+
+
+def test_terminal_upload_coerces_stale_mid_pipeline_progress():
+    """Succeeded rows must not surface stuck 50%/transcode to the upload UI."""
+    row = {
+        "status": "succeeded",
+        "processing_progress": 50,
+        "processing_stage": "transcode",
+    }
+    assert _progress_for_upload_row(row) == 100
+    assert _stage_name_for_upload_row(row) is None
+    assert _stage_label_for_upload_row(row) == "Done"
+
+
+def test_partial_upload_coerces_progress_and_label():
+    row = {
+        "status": "partial",
+        "processing_progress": 99,
+        "processing_stage": "notify",
+    }
+    assert _progress_for_upload_row(row) == 100
+    assert _stage_label_for_upload_row(row) == "Partial"
+
+
+def test_processing_upload_keeps_live_progress():
+    row = {
+        "status": "processing",
+        "processing_progress": 50,
+        "processing_stage": "transcode",
+    }
+    assert _progress_for_upload_row(row) == 50
+    assert _stage_name_for_upload_row(row) == "transcode"
 
 
 def test_slim_output_artifacts_for_ui_keeps_queue_fields_only():
@@ -12,6 +47,7 @@ def test_slim_output_artifacts_for_ui_keeps_queue_fields_only():
         "content_hotness": {"band": "warm", "score": 0.72},
         "coach_hints": ["Try shorter hook"],
         "failure_phase": "caption",
+        "transcode_status": {"summary": "2 separate encodes · encoding Youtube 40%"},
         "hydration_blob": {"frames": [1, 2, 3]},
         "scene_story": "Should not ship on list cards",
     }
@@ -20,6 +56,7 @@ def test_slim_output_artifacts_for_ui_keeps_queue_fields_only():
     assert slim["content_hotness"]["band"] == "warm"
     assert slim["coach_hints"] == ["Try shorter hook"]
     assert slim["failure_phase"] == "caption"
+    assert slim["transcode_status"]["summary"].startswith("2 separate encodes")
     assert "hydration_blob" not in slim
     assert "scene_story" not in slim
 

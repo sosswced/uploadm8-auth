@@ -31,6 +31,7 @@ from services.ml_eval_hub import (
     push_model_eval_results,
 )
 from services.ml_observability import OptionalTrackioRun, hf_write_token
+from services.growth_intelligence import sanitize_coach_payload_for_json
 
 logger = logging.getLogger("uploadm8.ml_engine")
 
@@ -46,14 +47,16 @@ def load_engine_state() -> Dict[str, Any]:
     if not _STATE_PATH.is_file():
         return {}
     try:
-        return json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return sanitize_coach_payload_for_json(raw) if isinstance(raw, dict) else {}
 
 
 def save_engine_state(state: Dict[str, Any]) -> None:
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    clean = sanitize_coach_payload_for_json(state if isinstance(state, dict) else {})
+    _STATE_PATH.write_text(json.dumps(clean, indent=2, allow_nan=False), encoding="utf-8")
 
 
 def _which_uv() -> Optional[str]:

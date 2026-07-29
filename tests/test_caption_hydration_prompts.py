@@ -533,15 +533,19 @@ def test_hashtags_drop_ocr_mashups_and_generic_taxonomy():
     for j in junk:
         assert is_junk_hashtag_body(j), j
     scrubbed = _scrub_leaked_junk_hashtags(
-        junk + ["i5", "tumwaterwa", "costco", "matsoninc", "cwalker", "tripledigits"]
+        junk + ["i5", "tumwaterwa", "tesla", "maersk", "costco", "cwalker", "tripledigits"]
     )
     low = {t.lower() for t in scrubbed}
     assert "i5" in low
-    assert "tumwaterwa" in low
-    assert "costco" in low
-    assert "matsoninc" in low
+    # city+abbr run-ons expand to separate discovery tags
+    assert "tumwater" in low
+    assert "washington" in low
+    assert "tumwaterwa" not in low
+    assert "tesla" in low
     assert "cwalker" in low
     assert "tripledigits" in low
+    assert "maersk" not in low
+    assert "costco" not in low
     for j in junk:
         assert j.lower() not in low
 
@@ -559,17 +563,24 @@ def test_hashtags_drop_ocr_mashups_and_generic_taxonomy():
         ),
         telemetry_data=None,
         dashcam_osd_context={"driver_name": "C Walker", "max_speed_mph": 92.0},
-        vision_context={"logo_names": ["Costco"], "landmark_names": [], "ocr_text": ""},
+        vision_context={"logo_names": ["Tesla"], "landmark_names": [], "ocr_text": ""},
         audio_context={},
         trill=SimpleNamespace(bucket="gloryBoy", score=100.0),
         trill_score=None,
         ai_transcript="",
         video_intelligence={
-            "logos": [{"description": "Matson Inc"}],
+            "logos": [
+                {
+                    "description": "Tesla",
+                    "confidence": 0.95,
+                    "start_s": 1.0,
+                    "end_s": 3.5,
+                }
+            ],
             "on_screen_text": [
                 {"text": "66MPH C Walker", "confidence": 0.9},
                 {"text": "2025/03/03 11:19:31 AM 46.950603", "confidence": 0.8},
-                {"text": "COSTCO", "confidence": 0.7},
+                {"text": "TESLA", "confidence": 0.7},
             ],
             "top_labels": ["nature", "Mode of transport", "horizon", "car"],
             "summary_text": "",
@@ -591,16 +602,17 @@ def test_hashtags_drop_ocr_mashups_and_generic_taxonomy():
     tags = [t.lower() for t in build_evidence_hashtags(pool, max_extra=16)]
     assert "i5" in tags or "i5tumwater" in tags or "tumwateri5" in tags
     assert "tumwaterwa" in tags or "tumwater" in tags
-    assert "costco" in tags
-    assert "matsoninc" in tags
-    for j in ("nature", "modeoftransport", "horizon", "car", "66mphcwalker"):
+    # At most one durable subject logo (Tesla — not ambient freight).
+    logo_hits = [t for t in tags if t == "tesla"]
+    assert len(logo_hits) == 1
+    for j in ("nature", "modeoftransport", "horizon", "car", "66mphcwalker", "costco", "matson"):
         assert j not in tags
 
     enforce_hydration(ctx)
     final = {t.lower() for t in (ctx.ai_hashtags or [])}
     for j in junk:
         assert j.lower() not in final
-    assert "costco" in final or "matsoninc" in final
+    assert "tesla" in final
     assert "tumwaterwa" in final or "tumwater" in final
 
 
@@ -884,8 +896,338 @@ def test_no_color_nature_or_vague_category_copy():
             "modeoftransport",
             "i5",
             "tumwaterwa",
-            "costco",
+            "tesla",
             "cwalker",
+            "maersk",
+            "costco",
         ]
     )
-    assert {t.lower() for t in kept} == {"i5", "tumwaterwa", "costco", "cwalker"}
+    assert {t.lower() for t in kept} == {"i5", "tumwater", "washington", "tesla", "cwalker"}
+
+
+def test_creative_title_missing_mph_soft_merges_peak():
+    """Voice with place/music but no MPH gets '133 MPH — …', not · formula."""
+    from services.hydration_enforcer import enforce_hydration
+
+    voice = "Kelso heat with Capo rattling the cabin"
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=133.0,
+            avg_speed_mph=70.0,
+            location_city="Kelso",
+            location_state="Washington",
+            location_country="US",
+            location_road="I 5",
+            gazetteer_place_name="Kelso",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Kelso, Washington",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Capo",
+            "music_title": "Sumthin You Not",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title=voice,
+        ai_caption="Kelso stretch with Capo on — long enough to stay non-generic.",
+        ai_hashtags=["kelso", "capo"],
+        m8_platform_captions={},
+        m8_platform_titles={"youtube": voice},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="salvage-voice",
+    )
+    enforce_hydration(ctx)
+    title = ctx.ai_title or ""
+    assert title.startswith("133 MPH")
+    assert "Kelso" in title or "Capo" in title
+    assert " · " not in title
+    assert "—" in title or "-" in title
+
+
+def test_wrong_mph_scrubbed_injects_trusted_peak_keeps_voice():
+    """46 MPH on a 154 run is scrubbed; voice+place kept with trusted peak injected."""
+    from services.hydration_enforcer import enforce_hydration
+
+    voice = "Cruising Logandale at 46 MPH with Fetty Wap"
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=154.0,
+            avg_speed_mph=120.0,
+            location_city="Logandale",
+            location_state="California",
+            location_country="US",
+            location_road="Westside Freeway",
+            gazetteer_place_name="Logandale",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Logandale, California",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Fetty Wap",
+            "music_title": "The Truth",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title=voice,
+        ai_caption="x" * 50,
+        ai_hashtags=["logandale"],
+        m8_platform_captions={},
+        m8_platform_titles={"youtube": voice},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="scrub-inject",
+    )
+    enforce_hydration(ctx)
+    title = ctx.ai_title or ""
+    assert "154" in title
+    assert "46" not in title
+    assert "Logandale" in title or "Fetty" in title
+    assert " · " not in title or "154 MPH —" in title
+
+
+def test_timeline_spreads_when_only_osd_last_seen_has_duration():
+    from stages.context import JobContext, build_video_story_timeline
+
+    ctx = JobContext(
+        job_id="j-osd-dur",
+        upload_id="osd-dur",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        # No video_info.duration — only OSD last_seen.t_s
+        dashcam_osd_context={
+            "last_seen": {"date": "2025-03-03", "time": "17:52:33", "t_s": 55.0},
+            "first_seen": {"date": "2025-03-03", "time": "17:49:34", "t_s": 0.0},
+            # Peak moment must NOT win over last_seen as clip duration.
+            "max_speed_at_s": 8.0,
+        },
+        audio_context={
+            "music_artist": "Capo",
+            "music_title": "Sumthin You Not",
+            "transcript_segments": [
+                {"start": 50.0, "end": 54.0, "text": "end of clip"},
+            ],
+        },
+        vision_context={
+            "label_names": ["Highway", "Car"],
+            "vision_sample_fractions": [0.2, 0.6],
+        },
+    )
+    beats = build_video_story_timeline(ctx, max_events=40)
+    music = [b for b in beats if b["kind"] == "music"]
+    assert music
+    # ~15% of ~55s, not ~15% of peak-at-8s
+    assert float(music[0]["t_seconds"]) >= 5.0
+
+
+def test_timeline_peak_speed_alone_is_not_clip_duration():
+    from stages.context import JobContext, build_video_story_timeline
+
+    ctx = JobContext(
+        job_id="j-peak-only",
+        upload_id="peak-only",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        dashcam_osd_context={"max_speed_at_s": 12.0},
+        audio_context={"music_artist": "Capo", "music_title": "X"},
+    )
+    beats = build_video_story_timeline(ctx, max_events=20)
+    music = [b for b in beats if b["kind"] == "music"]
+    assert music
+    assert float(music[0]["t_seconds"]) == 0.0
+
+
+def test_grounded_voice_title_survives_hydration():
+    """Creative M8 title with peak MPH + place/music must not become · formula."""
+    from services.hydration_enforcer import enforce_hydration
+
+    voice = "Kelso heat — 133 MPH with Capo on the speakers"
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=133.0,
+            avg_speed_mph=70.0,
+            location_city="Kelso",
+            location_state="Washington",
+            location_country="US",
+            location_road="I 5",
+            gazetteer_place_name="Kelso",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Kelso, Washington",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Capo",
+            "music_title": "Sumthin You Not",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title=voice,
+        ai_caption=(
+            "Kelso heat at 133 MPH with Capo rattling the cabin — "
+            "I-5 stretch, no formula needed."
+        ),
+        ai_hashtags=["kelso", "capo", "i5"],
+        m8_platform_captions={"youtube": (
+            "Kelso heat at 133 MPH with Capo rattling the cabin — "
+            "I-5 stretch, no formula needed."
+        )},
+        m8_platform_titles={"youtube": voice, "tiktok": voice},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="voice-title-kelso",
+    )
+    enforce_hydration(ctx)
+    assert ctx.ai_title == voice
+    assert " · " not in (ctx.ai_title or "")
+    assert ctx.m8_platform_titles.get("youtube") == voice
+    assert "Captured at" not in (ctx.ai_caption or "")
+    assert "133 MPH" in (ctx.ai_caption or "")
+
+
+def test_ambient_junk_regex_does_not_kill_meetups_lineups():
+    from core.vision_labels import is_junk_hashtag_body
+
+    assert is_junk_hashtag_body("ups")
+    assert is_junk_hashtag_body("maersk")
+    assert not is_junk_hashtag_body("meetups")
+    assert not is_junk_hashtag_body("lineups")
+    assert not is_junk_hashtag_body("groups")
+
+
+def test_ambient_freight_logos_excluded_from_hashtags():
+    """Maersk / Koh-i-Noor roadside logos must not beat music + road tags."""
+    from core.vision_labels import is_junk_hashtag_body
+    from services.hydration_enforcer import build_evidence_hashtags, collect_evidence
+
+    assert is_junk_hashtag_body("maersk")
+    assert is_junk_hashtag_body("kohinoorhardtmuth")
+
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=133.0,
+            avg_speed_mph=70.0,
+            location_city="Kelso",
+            location_state="Washington",
+            location_country="US",
+            location_road="I 5",
+            gazetteer_place_name="Kelso",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Kelso, Washington",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={"driver_name": "C Walker"},
+        vision_context={
+            "logo_names": ["Maersk", "Koh-i-Noor Hardtmuth", "Quiksilver"],
+        },
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Capo",
+            "music_title": "Sumthin You Not",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={
+            "logos": [
+                {
+                    "description": "Maersk",
+                    "confidence": 0.99,
+                    "start_s": 0.0,
+                    "end_s": 0.2,
+                }
+            ],
+        },
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title="x",
+        ai_caption="x",
+        ai_hashtags=[],
+        m8_platform_captions={},
+        m8_platform_titles={},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="ambient-logos",
+    )
+    pool = collect_evidence(ctx)
+    tags = [t.lower() for t in build_evidence_hashtags(pool, max_extra=16)]
+    assert "capo" in tags or "sumthinyounot" in tags
+    assert "i5" in tags or "kelso" in tags or "kelsowa" in tags
+    for bad in ("maersk", "kohinoorhardtmuth", "kohinoor", "quiksilver"):
+        assert bad not in tags
+
+
+def test_music_and_welcome_spread_off_timeline_zero():
+    from stages.context import JobContext, TelemetryData, build_video_story_timeline
+
+    ctx = JobContext(
+        job_id="j-spread",
+        upload_id="spread",
+        user_id="u",
+        filename="clip.mp4",
+        platforms=["youtube"],
+        video_info={"duration": 60.0},
+        telemetry=TelemetryData(
+            max_speed_mph=100.0,
+            location_city="Kelso",
+            location_state="Washington",
+            location_display="Kelso, Washington",
+            location_road="I 5",
+        ),
+        vision_context={
+            "video_duration_s": 60.0,
+            "vision_sample_fractions": [0.1, 0.4, 0.7],
+            "label_names": ["Highway", "Car", "Road"],
+            "ocr_text": "Welcome to Kelso",
+        },
+        audio_context={
+            "music_artist": "Capo",
+            "music_title": "Sumthin You Not",
+            "top_sound_class": "Engine",
+        },
+    )
+    beats = build_video_story_timeline(ctx, max_events=40)
+    music = [b for b in beats if b["kind"] == "music"]
+    assert music
+    assert float(music[0]["t_seconds"]) > 0.0
+    welcome = [b for b in beats if b["kind"] == "welcome_sign"]
+    if welcome:
+        assert float(welcome[0]["t_seconds"]) > 0.0
+    vision_labels = [b for b in beats if b["kind"] == "vision_label"]
+    assert vision_labels
+    assert any(float(b["t_seconds"]) > 0.0 for b in vision_labels)

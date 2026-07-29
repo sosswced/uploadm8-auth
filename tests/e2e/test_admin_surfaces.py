@@ -49,17 +49,31 @@ def test_admin_settings_surfaces(human_session_page, base_url: str, rel_path: st
     ],
 )
 def test_admin_primary_tabs(human_session_page, base_url: str, rel_path: str, tab_selector: str):
+    if rel_path == "account-management.html":
+        # Cold session: form login before admin gate (shell-ready ≠ adminContent shown).
+        human_login_via_form(human_session_page, base_url)
     navigate_to_page_human(human_session_page, base_url, rel_path)
     wait_for_authenticated_shell(human_session_page)
     if rel_path == "account-management.html":
         # Tabs live under #adminContent, hidden until async admin gate finishes.
         human_session_page.wait_for_function(
             """() => {
+                const gate = document.documentElement.getAttribute('data-admin-gate');
+                if (gate === 'denied') return 'denied';
+                if (gate === 'ready') return 'ready';
                 const el = document.getElementById('adminContent');
-                return el && getComputedStyle(el).display !== 'none';
+                if (el && getComputedStyle(el).display !== 'none') return 'ready';
+                const denied = document.getElementById('accessDenied');
+                if (denied && getComputedStyle(denied).display !== 'none') return 'denied';
+                return false;
             }""",
             timeout=90_000,
         )
+        gate = human_session_page.evaluate(
+            "() => document.documentElement.getAttribute('data-admin-gate') || ''"
+        )
+        assert gate != "denied", "account-management admin gate denied for master admin session"
+        human_session_page.locator("#adminContent").wait_for(state="visible", timeout=15_000)
     tabs = human_session_page.locator(tab_selector)
     assert tabs.count() > 0, f"No tabs matching {tab_selector} on {rel_path}"
     clicked = click_admin_settings_surfaces(human_session_page, max_clicks=12)

@@ -18,6 +18,7 @@ from services.growth_intelligence import (
     build_user_coach_payload,
     fetch_user_pikzels_studio_usage,
     parse_range_since_until,
+    sanitize_coach_payload_for_json,
 )
 from core.helpers import coerce_jsonb_dict
 from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
@@ -41,7 +42,7 @@ def fetch_content_success_rankings() -> Dict[str, Any]:
             rep = json.loads(p.read_text(encoding="utf-8"))
             rankings = rep.get("rankings") or {}
             if rankings:
-                return rankings
+                return sanitize_coach_payload_for_json(rankings)
         except Exception:
             continue
     return {}
@@ -468,29 +469,31 @@ def _unlock_progress(samples_30d: int, ranked_n: int, platforms_n: int, has_cata
 
 def ai_insights_hub_fallback(*, error: Optional[str] = None) -> Dict[str, Any]:
     """Degraded hub when DB is unavailable or a gather task fails."""
-    return {
-        "ok": False,
-        "error": error or "insights_unavailable",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "readiness": "building",
-        "winning_formula": None,
-        "m8_engine": None,
-        "tier": "free",
-        "engagement_snapshot": {"samples_30d": 0},
-        "baselines": {},
-        "platforms": [],
-        "platform_trends": {"weeks": [], "series": []},
-        "packaging_rollups": {},
-        "content_insights": None,
-        "channel_catalog": None,
-        "studio_usage": None,
-        "current_setup": {},
-        "persona_count": 0,
-        "coach_suggestions": [],
-        "smart_offer": None,
-        "unlock_progress": _unlock_progress(0, 0, 0, False),
-        "playbook": [],
-    }
+    return sanitize_coach_payload_for_json(
+        {
+            "ok": False,
+            "error": error or "insights_unavailable",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "readiness": "building",
+            "winning_formula": None,
+            "m8_engine": None,
+            "tier": "free",
+            "engagement_snapshot": {"samples_30d": 0},
+            "baselines": {},
+            "platforms": [],
+            "platform_trends": {"weeks": [], "series": []},
+            "packaging_rollups": {},
+            "content_insights": None,
+            "channel_catalog": None,
+            "studio_usage": None,
+            "current_setup": {},
+            "persona_count": 0,
+            "coach_suggestions": [],
+            "smart_offer": None,
+            "unlock_progress": _unlock_progress(0, 0, 0, False),
+            "playbook": [],
+        }
+    )
 
 
 async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -655,4 +658,4 @@ async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any
                 "evaluation": hf.get("evaluation_doc"),
             },
         }
-    return out
+    return sanitize_coach_payload_for_json(out)

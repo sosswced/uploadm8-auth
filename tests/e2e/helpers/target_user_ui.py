@@ -117,18 +117,39 @@ def exercise_account_management_target(page: Page, base_url: str) -> dict[str, A
 
 def _wait_wallet_page_ready(page: Page) -> None:
     page.wait_for_function(
-        "() => document.getElementById('mainContent') && getComputedStyle(document.getElementById('mainContent')).display !== 'none'",
+        """() => {
+            const main = document.getElementById('mainContent');
+            if (!main || getComputedStyle(main).display === 'none') return false;
+            return document.documentElement.getAttribute('data-wallet-search-ready') === '1'
+                || Boolean(document.getElementById('userSearchInput'));
+        }""",
         timeout=90_000,
     )
 
 
 def _wallet_search_and_select(page: Page) -> None:
     inp = page.locator("#userSearchInput")
-    inp.fill(_search_term())
     result = page.locator(".search-result-item").first
-    expect(result).to_be_visible(timeout=30_000)
-    result.click()
-    page.wait_for_timeout(click_delay_ms())
+    last_term = _search_term()
+    for term in e2e_target_user_search_terms():
+        last_term = term
+        inp.fill("")
+        page.wait_for_timeout(150)
+        inp.fill(term)
+        inp.dispatch_event("input")
+        page.wait_for_timeout(600)
+        try:
+            expect(result).to_be_visible(timeout=8_000)
+            result.click()
+            page.wait_for_timeout(click_delay_ms())
+            return
+        except Exception:
+            continue
+    results_text = (page.locator("#searchResults").inner_text(timeout=3_000) or "").strip()
+    raise AssertionError(
+        f"Wallet search found no .search-result-item for terms "
+        f"{list(e2e_target_user_search_terms())!r} (last={last_term!r}; ui={results_text[:160]!r})"
+    )
 
 
 def exercise_admin_wallet_target(page: Page, base_url: str) -> dict[str, Any]:
@@ -137,8 +158,21 @@ def exercise_admin_wallet_target(page: Page, base_url: str) -> dict[str, Any]:
     name = e2e_target_user_name()
     out: dict[str, Any] = {"user_id": uid, "steps": []}
 
+    # Master-admin gate needs a real form login; cold storage-state is flaky here.
+    from tests.e2e.helpers.browser_session import human_login_via_form
+
+    human_login_via_form(page, base_url)
     navigate_to_page_human(page, base_url, "admin-wallet.html")
     wait_for_authenticated_shell(page)
+    page.wait_for_function(
+        """() => {
+            const gate = document.documentElement.getAttribute('data-wallet-gate');
+            return gate === 'ready' || gate === 'denied';
+        }""",
+        timeout=90_000,
+    )
+    gate = page.evaluate("() => document.documentElement.getAttribute('data-wallet-gate') || ''")
+    assert gate != "denied", "admin-wallet master_admin gate denied for E2E master session"
     _wait_wallet_page_ready(page)
 
     _wallet_search_and_select(page)

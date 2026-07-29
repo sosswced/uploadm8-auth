@@ -92,6 +92,8 @@ def _attach_page_monitors(page):
 
     failed_requests: list[str] = []
 
+    degraded_503_counts: dict[str, int] = {}
+
 
 
     def on_console(msg):
@@ -112,6 +114,19 @@ def _attach_page_monitors(page):
 
         if resp.status >= 500 and "/api/" in resp.url:
 
+            if resp.status == 503:
+
+                # Fail-fast 503 (Neon wake / brief pool saturation) is by
+                # design and self-heals; only a REPEAT on the same endpoint
+                # within a monitored window is a real availability failure.
+                path = resp.url.split("?", 1)[0]
+
+                degraded_503_counts[path] = degraded_503_counts.get(path, 0) + 1
+
+                if degraded_503_counts[path] < 2:
+
+                    return
+
             failed_requests.append(f"{resp.status} {resp.url}")
 
 
@@ -123,6 +138,8 @@ def _attach_page_monitors(page):
     page._e2e_console_errors = console_errors  # type: ignore[attr-defined]
 
     page._e2e_failed_requests = failed_requests  # type: ignore[attr-defined]
+
+    page._e2e_degraded_503_counts = degraded_503_counts  # type: ignore[attr-defined]
 
     return page
 

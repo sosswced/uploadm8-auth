@@ -51,7 +51,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from core.helpers import sanitize_hashtag_body
+from core.helpers import (
+    expand_geo_runon_hashtag,
+    normalize_hashtag_bodies,
+    sanitize_hashtag_body,
+    split_hashtag_source_phrases,
+)
 from core.vision_labels import (
     HASHTAG_BODY_MAX_LEN,
     evidence_pool_has_strong_hashtag_signals,
@@ -554,9 +559,10 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
     """Build EvidencePool from every analyzed source on ctx. Cheap and pure."""
     pool = EvidencePool()
 
-    # Speed — canonical resolver: .map telemetry > OSD HUD > Vision OCR text.
+    # Speed — canonical consensus (telemetry > OSD > series > vision OCR).
+    # Never use Twelve Labs narrative MPH as a speed source.
     tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-    tel_max = tel_avg = 0.0
+    tel_avg = 0.0
     if tel is not None:
         pool.road = (getattr(tel, "location_road", None) or None)
         pool.city = (getattr(tel, "location_city", None) or None)
@@ -570,40 +576,30 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             pool.location_start_display = start_disp.strip()
         pool.state_abbr = _state_abbr(pool.state, pool.country)
         try:
-            tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
             tel_avg = float(getattr(tel, "avg_speed_mph", 0) or 0)
         except (TypeError, ValueError):
-            tel_max = tel_avg = 0.0
-
-    vc_early = getattr(ctx, "vision_context", None) or {}
-    ocr_blob = str(vc_early.get("ocr_text") or "") if isinstance(vc_early, dict) else ""
-    vision_peak = _vision_ocr_peak_mph(ocr_blob)
+            tel_avg = 0.0
 
     osd = getattr(ctx, "dashcam_osd_context", None) or {}
-    osd_max = osd_avg = 0.0
+    osd_avg = 0.0
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         try:
-            osd_max = float(osd.get("max_speed_mph") or 0)
             osd_avg = float(osd.get("avg_speed_mph") or 0)
         except (TypeError, ValueError):
-            osd_max = osd_avg = 0.0
+            osd_avg = 0.0
 
-    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
+    from core.speed_consensus import consensus_peak_mph, get_speed_consensus
 
-    series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
-    peak, src = trusted_peak_speed_mph(
-        telemetry_max=tel_max,
-        osd_max=osd_max,
-        series_peak=series_peak,
-        vision_peak=vision_peak,
-    )
+    peak = consensus_peak_mph(ctx)
+    cons = get_speed_consensus(ctx)
+    src = str((cons or {}).get("source") or "")
     if peak >= 5:
         pool.max_speed_mph = peak
         pool.avg_speed_mph = (
             tel_avg if src == "telemetry" and tel_avg > 0
             else (osd_avg if src.startswith("osd") and osd_avg > 0 else peak)
         )
-        pool.speed_source = src
+        pool.speed_source = src or "consensus"
 
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         drv = osd.get("driver_name")
@@ -1256,16 +1252,113 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
     return ""
 
 
+def _title_mentions_trusted_speed(title: str, pool: EvidencePool) -> bool:
+    """True when title cites the trusted peak MPH (within consensus tolerance)."""
+    if not (pool.max_speed_mph and pool.max_speed_mph >= 5):
+        return False
+    blob = scrub_machine_publish_dump(title or "").strip().lower()
+    if not blob:
+        return False
+    from core.speed_consensus import speed_tolerance_mph
+
+    tol = speed_tolerance_mph(pool.max_speed_mph)
+    matches = [
+        abs(float(n) - float(pool.max_speed_mph)) <= tol
+        for n in re.findall(r"\b(\d{2,3})\s*mph\b", blob)
+    ]
+    if matches and any(matches):
+        return True
+    mph_s = str(int(round(pool.max_speed_mph)))
+    return mph_s in blob and "mph" in blob
+
+
+def _title_mentions_place_or_music(title: str, pool: EvidencePool) -> bool:
+    blob = scrub_machine_publish_dump(title or "").strip().lower()
+    if not blob:
+        return False
+    place = _format_place(pool)
+    if place and place.lower() in blob:
+        return True
+    if pool.city and str(pool.city).lower() in blob:
+        return True
+    if pool.gazetteer_place and str(pool.gazetteer_place).lower() in blob:
+        return True
+    if pool.music_artist and str(pool.music_artist).lower() in blob:
+        return True
+    if pool.music_title and str(pool.music_title).lower() in blob:
+        return True
+    return False
+
+
+def _title_has_grounded_voice(title: str, pool: EvidencePool) -> bool:
+    """Creative M8 title that already cites peak MPH plus place or music."""
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t or len(t) < 12:
+        return False
+    # Place-only geo strings are never "voice" even if long.
+    place = _format_place(pool)
+    if place and t.lower() == place.lower():
+        return False
+    if not _title_mentions_trusted_speed(t, pool):
+        return False
+    return _title_mentions_place_or_music(t, pool)
+
+
+def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
+    """Creative copy with place/music but missing peak — soft-merge MPH, don't formula-wipe."""
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t or len(t) < 20:
+        return False
+    if " · " in t and re.search(r"\b\d{2,3}\s*mph\b", t, re.I):
+        # Already the compact formula — not salvage voice.
+        return False
+    place = _format_place(pool)
+    if place and t.lower() == place.lower():
+        return False
+    if _is_generic_caption(t) or _is_machine_label_dump(t):
+        return False
+    if not _title_mentions_place_or_music(t, pool):
+        return False
+    # Needs a trusted peak we can inject.
+    return bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
+
+
+def _inject_peak_mph_into_title(title: str, pool: EvidencePool, *, max_chars: int = 100) -> str:
+    """Prepend trusted peak MPH to salvageable voice without · formula replace."""
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t or not (pool.max_speed_mph and pool.max_speed_mph >= 5):
+        return t[:max_chars]
+    if _title_mentions_trusted_speed(t, pool):
+        return t[:max_chars]
+    mph = f"{int(round(pool.max_speed_mph))} MPH"
+    # Prefer "133 MPH — <voice>" over compact · formula.
+    out = f"{mph} — {t}"
+    return _sanitize_anchor_fragment(out, max_chars=max_chars) or out[:max_chars]
+
+
+def _caption_has_grounded_voice(caption: str, pool: EvidencePool) -> bool:
+    """Non-boilerplate caption that already cites peak MPH plus place or music."""
+    c = scrub_machine_publish_dump(caption or "").strip()
+    if not c or len(c) < 40:
+        return False
+    if not _title_mentions_trusted_speed(c, pool):
+        return False
+    return _title_mentions_place_or_music(c, pool)
+
+
 def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     """True when title ignores available timeline substance (speed/music/scene/sign).
 
     Place-only titles are always thin when richer beats exist — including titles
     longer than 36 chars that are still just geo prose without MPH/music.
-    Creative titles that already cite speed (or music+place) are left alone.
+    Creative titles that already cite trusted peak speed and place/music are kept.
     """
     t = scrub_machine_publish_dump(title or "").strip()
     if not t:
         return True
+    # Grounded voice wins over the compact speed·place·music template.
+    if _title_has_grounded_voice(t, pool):
+        return False
     has_speed = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
     has_music = bool(pool.music_artist or pool.music_title)
     has_scene = bool(
@@ -1277,20 +1370,7 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
         return False
 
     blob = t.lower()
-    mentions_speed = bool(re.search(r"\b\d{2,3}\s*mph\b", blob))
-    if has_speed and mentions_speed:
-        # An MPH substring only counts when it agrees with the trusted peak —
-        # "46 MPH" on a 154 MPH run is a wrong claim, not coverage.
-        from core.speed_consensus import speed_tolerance_mph
-
-        tol = speed_tolerance_mph(pool.max_speed_mph)
-        mentions_speed = any(
-            abs(float(n) - float(pool.max_speed_mph)) <= tol
-            for n in re.findall(r"\b(\d{2,3})\s*mph\b", blob)
-        )
-    if has_speed and not mentions_speed:
-        mph_s = str(int(round(pool.max_speed_mph)))
-        mentions_speed = mph_s in blob and "mph" in blob
+    mentions_speed = _title_mentions_trusted_speed(t, pool)
 
     mentions_music = False
     if pool.music_artist and str(pool.music_artist).lower() in blob:
@@ -1318,8 +1398,57 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
 _HASHTAG_MAX_LEN = HASHTAG_BODY_MAX_LEN
 # VI logo false positives (billboards / radio watermarks) need a high bar.
 _VI_LOGO_MIN_CONF = 0.90
+_VI_LOGO_MIN_DURATION_S = 1.0
 _FALSE_LOGO_RE = re.compile(
     r"(?i)\b(?:radio|broadcast|fm\b|am\b|podcast|tv\b|network)\b|\bradio$"
+)
+# Roadside / freight / stationery / fuel logos that pollute discovery tags.
+_AMBIENT_LOGO_SLUGS = frozenset(
+    {
+        "maersk",
+        "kohinoor",
+        "kohinoorhardtmuth",
+        "hardtmuth",
+        "quiksilver",
+        "fedex",
+        "ups",
+        "dhl",
+        "usps",
+        "amazon",
+        "matson",
+        "matsoninc",
+        "evergreen",
+        "cosco",
+        "msc",
+        "hapaglloyd",
+        "walmart",
+        "costco",
+        "target",
+        "shell",
+        "chevron",
+        "exxon",
+        "mobil",
+        "texaco",
+        "bp",
+        "arco",
+        "circlek",
+        "speedway",
+        "pilot",
+        "loves",
+        "starbucks",
+        "mcdonalds",
+        "subway",
+        "wendys",
+        "tacobell",
+        "burgerking",
+    }
+)
+# Structural ambient: logistics/freight/shipping corp names on the roadside.
+_AMBIENT_LOGO_STRUCT_RE = re.compile(
+    r"(?i)(?:^|[^a-z])(?:maersk|kohinoor|hardtmuth|quiksilver|fedex|ups|dhl|"
+    r"matson|evergreen|cosco|hapag)"
+    r"|(?:logistics|freight|shipping|transport|haulage|parcel)(?:$|[^a-z])"
+    r"|hardtmuth|kohinoor"
 )
 
 
@@ -1328,12 +1457,48 @@ def _road_hashtag_tokens(road: Any) -> List[str]:
     return road_hashtag_tokens(road)
 
 
+def _logo_slug(desc: Any) -> str:
+    return vision_label_slug(str(desc or "")) or sanitize_hashtag_body(
+        str(desc or ""), max_len=_HASHTAG_MAX_LEN
+    )
+
+
+def _is_ambient_logo(desc: Any) -> bool:
+    text = str(desc or "").strip()
+    if not text:
+        return False
+    slug = _logo_slug(text)
+    if slug and slug in _AMBIENT_LOGO_SLUGS:
+        return True
+    if slug and any(
+        slug.startswith(a) or a in slug
+        for a in ("maersk", "kohinoor", "hardtmuth", "fedex", "quiksilver")
+    ):
+        return True
+    if _AMBIENT_LOGO_STRUCT_RE.search(text.replace(" ", "")):
+        return True
+    if slug and _AMBIENT_LOGO_STRUCT_RE.search(slug):
+        return True
+    return False
+
+
+def _vi_logo_duration_ok(lg: dict) -> bool:
+    try:
+        start = float(lg.get("start_s") or 0.0)
+        end = float(lg.get("end_s") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return end > start and (end - start) >= _VI_LOGO_MIN_DURATION_S
+
+
 def _logo_ok_for_hashtag(desc: Any, *, confidence: Optional[float] = None) -> bool:
     """Gate brand logos before they become hashtags."""
     text = str(desc or "").strip()
     if not text or len(text) < 2:
         return False
     if _FALSE_LOGO_RE.search(text):
+        return False
+    if _is_ambient_logo(text):
         return False
     if confidence is not None:
         try:
@@ -1352,12 +1517,12 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     Priority encodes survival under maxHashtags truncation:
       1. landmark / place-entity names / welcome signs
-      2. logos / brands (Vision + VI)
-      3. music artist + title
-      4. road / highway / route (+ place composites)
-      5. gazetteer place + state composite
-      6. city / state / protected area / start display
-      7. driver name (HUD)
+      2. music artist + title
+      3. road / highway / route
+      4. gazetteer place / city / state (separate — never city+abbr run-ons)
+      5. protected area / start display
+      6. driver name (HUD)
+      7. at most one durable logo (after music/geo — never ambient freight)
       8. trill + speed bucket tags
       9. transcript entities (places/products/orgs)
      10. vision/VI labels ONLY when no stronger geo/brand signals
@@ -1366,14 +1531,18 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     seen: set = set()
 
     def _push(raw: Any) -> bool:
-        body = sanitize_hashtag_body(str(raw or ""), max_len=_HASHTAG_MAX_LEN)
-        if not body or body in seen:
-            return False
-        if is_junk_hashtag_body(body):
-            return False
-        seen.add(body)
-        out.append(body)
-        return True
+        added = False
+        for phrase in split_hashtag_source_phrases(str(raw or "")):
+            for body in expand_geo_runon_hashtag(phrase, max_len=_HASHTAG_MAX_LEN):
+                body = sanitize_hashtag_body(body, max_len=_HASHTAG_MAX_LEN)
+                if not body or body in seen:
+                    continue
+                if is_junk_hashtag_body(body):
+                    continue
+                seen.add(body)
+                out.append(body)
+                added = True
+        return added
 
     for lm in pool.vision_landmarks[:3]:
         _push(lm)
@@ -1390,21 +1559,6 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         _push(team)
     for stad in list(getattr(pool, "place_stadiums", None) or [])[:2]:
         _push(stad)
-
-    # Brands early — high discovery value, beat trill fluff.
-    for logo in pool.vision_logos[:3]:
-        if _logo_ok_for_hashtag(logo):
-            _push(logo)
-    for lg in pool.vi_logos[:4]:
-        if not isinstance(lg, dict) or not lg.get("description"):
-            continue
-        conf = lg.get("confidence")
-        try:
-            conf_f = float(conf) if conf is not None else None
-        except (TypeError, ValueError):
-            conf_f = None
-        if _logo_ok_for_hashtag(lg.get("description"), confidence=conf_f):
-            _push(str(lg["description"]))
 
     if pool.music_artist:
         _push(pool.music_artist)
@@ -1430,13 +1584,8 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         _push(f"{place_body}{road_body}")
 
     if pool.gazetteer_place:
-        if pool.state_abbr:
-            _push(f"{pool.gazetteer_place}{pool.state_abbr}")
-        else:
-            _push(pool.gazetteer_place)
+        _push(pool.gazetteer_place)
     if pool.city:
-        if pool.state_abbr:
-            _push(f"{pool.city}{pool.state_abbr}")
         _push(pool.city)
     if pool.state:
         _push(pool.state)
@@ -1449,6 +1598,44 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     if pool.driver_name:
         _push(pool.driver_name)
+
+    # At most one logo, after music/geo/driver — VI needs durable duration.
+    logo_pick: Optional[str] = None
+    for lg in pool.vi_logos[:6]:
+        if not isinstance(lg, dict) or not lg.get("description"):
+            continue
+        if not _vi_logo_duration_ok(lg):
+            continue
+        conf = lg.get("confidence")
+        try:
+            conf_f = float(conf) if conf is not None else None
+        except (TypeError, ValueError):
+            conf_f = None
+        desc = str(lg["description"])
+        if _logo_ok_for_hashtag(desc, confidence=conf_f):
+            logo_pick = desc
+            break
+    if logo_pick is None:
+        for logo in pool.vision_logos[:3]:
+            if _logo_ok_for_hashtag(logo):
+                logo_pick = str(logo)
+                break
+    logo_slugs_taken: set[str] = set()
+    if logo_pick:
+        _push(logo_pick)
+        slug = _logo_slug(logo_pick)
+        if slug:
+            logo_slugs_taken.add(slug)
+    # All Vision/VI logo slugs — block duplicate brand pushes via OCR text.
+    for raw_logo in list(pool.vision_logos or []):
+        s = _logo_slug(raw_logo)
+        if s:
+            logo_slugs_taken.add(s)
+    for lg in pool.vi_logos or []:
+        if isinstance(lg, dict):
+            s = _logo_slug(lg.get("description"))
+            if s:
+                logo_slugs_taken.add(s)
 
     if pool.trill_bucket:
         bucket_tags = {
@@ -1493,6 +1680,9 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         if is_junk_hashtag_body(txt) or is_generic_vision_label(txt):
             continue
         if re.search(r"(?i)\b(?:mph|escort|blackvue|viofo|gps|am|pm)\b", txt):
+            continue
+        # Do not re-add logos already considered (keeps the 1-logo cap honest).
+        if _logo_slug(txt) in logo_slugs_taken or _is_ambient_logo(txt):
             continue
         _push(txt)
 
@@ -1589,10 +1779,15 @@ def _is_generic_caption(caption: str) -> bool:
         return True
     if is_vague_taxonomy_copy(caption):
         return True
-    for pat in _GENERIC_CAPTION_PATTERNS:
-        if pat.search(caption):
-            return True
-    return False
+    hit = any(pat.search(caption) for pat in _GENERIC_CAPTION_PATTERNS)
+    if not hit:
+        return False
+    # Long grounded captions that merely contain a cliché phrase are not
+    # "generic" — do not replace them with Captured-at stubs.
+    c = caption.strip()
+    if len(c) >= 80 and re.search(r"\b\d{2,3}\s*mph\b", c, re.I):
+        return False
+    return True
 
 
 def _hashtags_are_seed_only(tags: Iterable[str]) -> Tuple[bool, int, int]:
@@ -1778,30 +1973,34 @@ def _fallback_anchor_from_ctx(ctx: JobContext, category: Optional[str] = None) -
 def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
     """Remove QA placeholders, HUD OCR mashups, and taxonomy filler tags.
 
+    Also expands geo run-ons (``lasvegasnv`` → ``lasvegas``, ``nevada``) and
+    multi-artist pipes before the junk gate.
+
     Returns kept tags. Dropped non-builtin weak tokens are recorded on the
     module-level learn buffer for the pipeline to persist into the dynamic
     hard-ban registry.
     """
-    from core.helpers import sanitize_hashtag_body
     from services.generic_hard_ban import builtin_ban_slugs, normalize_ban_slug
 
     banned = frozenset({"tester", "qwe", "asdf", "foobar", "lorem", "ipsum"})
     builtin = builtin_ban_slugs()
     out: List[str] = []
     learned_hits: List[str] = []
+    seen: set[str] = set()
     for raw in tags or []:
-        body = sanitize_hashtag_body(str(raw).strip().lstrip("#"), max_len=_HASHTAG_MAX_LEN)
-        if not body:
-            continue
-        if body.lower() in banned:
-            continue
-        if is_junk_hashtag_body(body):
-            slug = normalize_ban_slug(body)
-            # Learn novel weak tokens the model invented (not already in seed).
-            if slug and slug not in builtin:
-                learned_hits.append(slug)
-            continue
-        out.append(body)
+        for body in normalize_hashtag_bodies([str(raw)], max_len=_HASHTAG_MAX_LEN):
+            if not body or body in seen:
+                continue
+            if body.lower() in banned:
+                continue
+            if is_junk_hashtag_body(body):
+                slug = normalize_ban_slug(body)
+                # Learn novel weak tokens the model invented (not already in seed).
+                if slug and slug not in builtin:
+                    learned_hits.append(slug)
+                continue
+            seen.add(body)
+            out.append(body)
     if learned_hits:
         buf = getattr(_scrub_leaked_junk_hashtags, "_learn_buffer", None)
         if not isinstance(buf, list):
@@ -1972,9 +2171,9 @@ def enforce_hydration(
     def _maybe_rewrite_caption(cap_str: str) -> Optional[str]:
         """Return new caption when a rewrite is warranted, else None.
 
-        Evidence-rich anchor → APPEND when caption already non-generic, REPLACE when generic.
+        Grounded M8 voice (peak MPH + place/music) is kept — never append
+        Captured-at. Generic / dump captions still REPLACE with the anchor.
         Fallback (filename/category) anchor → only REPLACE when caption is generic.
-        Always scrub Video Intelligence / label-list dumps from publishable copy.
         """
         raw = cap_str or ""
         scrubbed = scrub_machine_publish_dump(raw)
@@ -1989,6 +2188,8 @@ def enforce_hydration(
         working = scrubbed
         if not anchor:
             return working if working != raw.strip() else None
+        if _caption_has_grounded_voice(working, pool):
+            return working if working != raw.strip() else None
         if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
             return working if working != raw.strip() else None
         if used_fallback:
@@ -1998,6 +2199,10 @@ def enforce_hydration(
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None
             )
+        # Non-generic longer copy: keep — do not append Captured-at for a
+        # missed evidence token alone.
+        if not _is_generic_caption(working) and len(working.strip()) >= 40:
+            return working if working != raw.strip() else None
         new = _hydrate_caption(working, anchor)
         return new if new and new != raw.strip() else (
             working if working != raw.strip() else None
@@ -2006,9 +2211,9 @@ def enforce_hydration(
     def _maybe_rewrite_title(ttl_str: str) -> Optional[str]:
         """Titles never get caption-style Captured-at / VI dump anchors.
 
-        Place-only titles (e.g. ``Logandale, CA``) are upgraded when the
-        timeline has speed/music the title ignored — even if the place token
-        already counts as "using evidence".
+        Place-only / empty / dump → compact evidence anchor.
+        Salvageable voice (place/music, missing or scrubbed peak) → inject MPH.
+        Grounded M8 voice is kept as-is.
         """
         raw = ttl_str or ""
         scrubbed = scrub_machine_publish_dump(raw)
@@ -2016,15 +2221,40 @@ def enforce_hydration(
             return title_anchor or scrubbed or None
         from core.speed_consensus import scrub_untrusted_speed_claims
 
+        pre_scrub = scrubbed
         scrubbed = scrub_untrusted_speed_claims(scrubbed, pool.max_speed_mph or 0.0) or scrubbed
         working = scrubbed
         if not title_anchor:
             return working if working != raw.strip() else None
+        # Wrong-MPH scrub removed the number but left creative place/music prose
+        # → inject trusted peak instead of · formula wipe.
+        if (
+            pre_scrub
+            and working != pre_scrub
+            and _title_is_salvageable_voice(working, pool)
+        ):
+            new = _inject_peak_mph_into_title(working, pool)
+            return new if new and new != raw.strip() else None
         if _title_is_timeline_thin(working, pool):
+            if _title_is_salvageable_voice(working, pool) or _title_is_salvageable_voice(
+                pre_scrub or working, pool
+            ):
+                base = working if _title_mentions_place_or_music(working, pool) else (
+                    pre_scrub or working
+                )
+                # Prefer post-scrub text; if scrub emptied place tokens, use pre.
+                if not _title_mentions_place_or_music(base, pool):
+                    base = pre_scrub or working
+                new = _inject_peak_mph_into_title(base, pool)
+                return new if new and new != raw.strip() else (
+                    working if working != raw.strip() else None
+                )
             new = title_anchor[:100]
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None
             )
+        if _title_has_grounded_voice(working, pool):
+            return working if working != raw.strip() else None
         if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
             return working if working != raw.strip() else None
         if used_fallback:

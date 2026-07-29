@@ -62,7 +62,15 @@ def _run_json(script: str, *args: str) -> dict[str, Any]:
     return data
 
 
-def _configure_tup_env(*, force_pikzels: bool, skip_pikzels: bool) -> None:
+_DEFAULT_MEDIA_LIBRARY = r"G:\My Drive\pnw 256\F\F\Normal"
+
+
+def _configure_tup_env(
+    *,
+    force_pikzels: bool,
+    skip_pikzels: bool,
+    use_library: bool = True,
+) -> None:
     os.environ["E2E_TUP"] = "1"
     os.environ.setdefault("E2E_UPLOAD_PLATFORMS", "all")
     os.environ.setdefault("E2E_USE_PERSONA", "1")
@@ -71,11 +79,20 @@ def _configure_tup_env(*, force_pikzels: bool, skip_pikzels: bool) -> None:
     os.environ.setdefault("E2E_INCLUDE_SLOW_API", "0")
     os.environ.setdefault("RATE_LIMIT_LOOPBACK_BYPASS", "1")
     # Long PNW library clips (>3min) — exercise YouTube Shorts copyright trim.
-    os.environ.setdefault(
-        "E2E_MEDIA_LIBRARY",
-        r"G:\My Drive\pnw 256\F\F\Normal",
-    )
+    # Pin the dev-machine default only when it actually exists so /TUP on
+    # other machines falls back to explicit env / .env config cleanly.
+    lib = (os.environ.get("E2E_MEDIA_LIBRARY") or "").strip()
+    if not lib and Path(_DEFAULT_MEDIA_LIBRARY).is_dir():
+        lib = _DEFAULT_MEDIA_LIBRARY
+    if lib:
+        os.environ["E2E_MEDIA_LIBRARY"] = lib
     os.environ.setdefault("E2E_YOUTUBE_COPYRIGHT_TRIM", "1")
+    # Random pair mode: clear fixed-file overrides left in the parent shell /
+    # Cursor env. Explicit --video / --telemetry keep those paths instead.
+    # Without a resolved library, keep the fixed-file fallback intact.
+    if use_library and lib:
+        for key in ("E2E_TEST_VIDEO", "E2E_TEST_TELEMETRY_MAP", "E2E_MEDIA_PAIR_SEED"):
+            os.environ.pop(key, None)
     # Single-origin local API only — never point E2E at production BASE_URL or :8080 static.
     base = (os.environ.get("E2E_BASE_URL") or "").strip().rstrip("/")
     if not (
@@ -92,6 +109,51 @@ def _configure_tup_env(*, force_pikzels: bool, skip_pikzels: bool) -> None:
         os.environ["E2E_FORCE_PIKZELS"] = "1"
     if skip_pikzels:
         os.environ["E2E_SKIP_PIKZELS"] = "1"
+
+
+def _preflight_media_library() -> dict[str, Any]:
+    """Resolve a random .mp4+.map pair and log it (also validates the folder)."""
+    from tests.e2e.helpers.media_library import (
+        clear_media_pair_cache,
+        describe_cached_pair,
+        e2e_media_library,
+        list_matching_pairs,
+        pick_random_media_pair,
+    )
+
+    clear_media_pair_cache()
+    lib = e2e_media_library()
+    out: dict[str, Any] = {
+        "library": str(lib) if lib else None,
+        "pair_count": 0,
+        "ok": False,
+    }
+    if lib is None:
+        out["error"] = "E2E_MEDIA_LIBRARY missing or not a directory"
+        return out
+    pairs = list_matching_pairs(lib)
+    out["pair_count"] = len(pairs)
+    if not pairs:
+        out["error"] = f"No matching .mp4+.map pairs in {lib}"
+        return out
+    picked = pick_random_media_pair(force_new=True)
+    clear_media_pair_cache()  # journey subprocess picks its own random pair
+    if not picked:
+        out["error"] = "pick_random_media_pair returned None"
+        return out
+    video, tmap = picked
+    out.update(
+        {
+            "ok": True,
+            "sample_video": video.name,
+            "sample_map": tmap.name,
+            "sample_stem": video.stem,
+            "note": "Journey process will pick another random pair independently",
+        }
+    )
+    # describe after clear is empty; keep sample_* for the report
+    out["cache_after_clear"] = describe_cached_pair()
+    return out
 
 
 def _run_live_journey(
@@ -175,8 +237,14 @@ def _run_overnight_pytest() -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="/TUP — Test Upload Pipeline")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--video", default=os.environ.get("E2E_TEST_VIDEO"))
-    parser.add_argument("--telemetry", default=os.environ.get("E2E_TEST_TELEMETRY_MAP"))
+    # Default None — do NOT inherit E2E_TEST_VIDEO from the shell (that pinned
+    # the same hardcode every /TUP). Pass --video only to force one file.
+    parser.add_argument("--video", default=None, help="Optional fixed MP4 (skips random library)")
+    parser.add_argument(
+        "--telemetry",
+        default=None,
+        help="Optional fixed .map (skips random library when set with --video)",
+    )
     parser.add_argument("--pipeline-timeout-min", type=int, default=120)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--skip-api-smoke", action="store_true")
@@ -209,7 +277,40 @@ def main(argv: list[str] | None = None) -> int:
         args.skip_journey = True
         args.skip_overnight_pytest = True
 
-    _configure_tup_env(force_pikzels=args.force_pikzels, skip_pikzels=args.skip_pikzels)
+    use_library = not bool(args.video or args.telemetry)
+    video_arg = args.video
+    telemetry_arg = args.telemetry
+    pair_note = None
+    if not use_library:
+        from tests.e2e.helpers.media_library import resolve_explicit_media_pair
+
+        v_path, t_path, pair_note = resolve_explicit_media_pair(video_arg, telemetry_arg)
+        if v_path is None or t_path is None:
+            missing = "video" if v_path is None else "map"
+            report_err = {
+                "ok": False,
+                "error": (
+                    f"Explicit media missing matching {missing} for same basename "
+                    f"(video={video_arg!r}, telemetry={telemetry_arg!r}, note={pair_note}). "
+                    "Pass both --video and --telemetry, or use the library."
+                ),
+            }
+            if args.json:
+                print(json.dumps(report_err, indent=2))
+            else:
+                print(f"TUP: RED — {report_err['error']}")
+            return 2
+        video_arg = str(v_path)
+        telemetry_arg = str(t_path)
+        # Pin both env vars so journey subprocess never fills the other half from a random library pair.
+        os.environ["E2E_TEST_VIDEO"] = video_arg
+        os.environ["E2E_TEST_TELEMETRY_MAP"] = telemetry_arg
+
+    _configure_tup_env(
+        force_pikzels=args.force_pikzels,
+        skip_pikzels=args.skip_pikzels,
+        use_library=use_library,
+    )
 
     report: dict[str, Any] = {
         "tup": True,
@@ -217,6 +318,9 @@ def main(argv: list[str] | None = None) -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "platforms": os.environ.get("E2E_UPLOAD_PLATFORMS", "all"),
         "use_persona": os.environ.get("E2E_USE_PERSONA", "1"),
+        "media_mode": "library" if use_library else "explicit",
+        "media_library": os.environ.get("E2E_MEDIA_LIBRARY"),
+        "explicit_pair_note": pair_note,
         "will_use_pikzels": should_use_pikzels(),
         "gate_before": gate_status(),
         "journey": None,
@@ -225,9 +329,42 @@ def main(argv: list[str] | None = None) -> int:
         "self_heal": None,
         "ok": False,
     }
+    if not use_library and video_arg and telemetry_arg:
+        report["explicit_video"] = video_arg
+        report["explicit_telemetry"] = telemetry_arg
+        print(
+            f"[TUP] Explicit media pair ({pair_note}): "
+            f"{Path(video_arg).name} + {Path(telemetry_arg).name}",
+            flush=True,
+        )
 
     if not args.skip_journey:
         from tests.e2e.helpers.api_ready import wait_for_api_ready
+
+        if use_library:
+            media = _preflight_media_library()
+            report["media_preflight"] = media
+            if not media.get("ok"):
+                report["ok"] = False
+                report["agent_action"] = (
+                    f"Fix E2E_MEDIA_LIBRARY ({media.get('error')}). "
+                    "Need matching basename .mp4+.map pairs, or pass --video/--telemetry."
+                )
+                ARTIFACTS.mkdir(parents=True, exist_ok=True)
+                out_path = ARTIFACTS / f"tup_{time.strftime('%Y%m%d_%H%M%S')}.json"
+                out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+                report["artifact"] = str(out_path)
+                if args.json:
+                    print(json.dumps(report, indent=2, default=str))
+                else:
+                    print(f"TUP: RED — media library: {media.get('error')}")
+                return 2
+            print(
+                f"[TUP] Media library: {media.get('pair_count')} pairs in "
+                f"{media.get('library')} — sample {media.get('sample_video')} "
+                f"+ {media.get('sample_map')} (journey picks a fresh random pair)",
+                flush=True,
+            )
 
         ready = wait_for_api_ready(os.environ.get("E2E_BASE_URL"), timeout_s=120.0)
         report["api_ready"] = ready
@@ -249,12 +386,13 @@ def main(argv: list[str] | None = None) -> int:
 
         print(
             f"[TUP] Live journey — platforms={report['platforms']} "
-            f"persona={report['use_persona']} pikzels={report['will_use_pikzels']}",
+            f"persona={report['use_persona']} pikzels={report['will_use_pikzels']} "
+            f"media={report['media_mode']}",
             flush=True,
         )
         report["journey"] = _run_live_journey(
-            video=args.video,
-            telemetry=args.telemetry,
+            video=video_arg,
+            telemetry=telemetry_arg,
             pipeline_timeout_min=args.pipeline_timeout_min,
             headless=args.headless,
             skip_api_smoke=args.skip_api_smoke,

@@ -38,6 +38,15 @@ def test_drop_none_pool_acquire():
     assert _before_send(ev, None) is None
 
 
+def test_drop_released_pool_proxy_race():
+    """UPLOADM8-43 — client-abort cancellation race; request already maps to 503."""
+    ev = _event(
+        exc_type="InterfaceError",
+        exc_value="cannot call Connection.fetchrow(): connection has been released back to the pool",
+    )
+    assert _before_send(ev, None) is None
+
+
 def test_drop_connection_lost_noise():
     ev = _event(
         message="Future exception was never retrieved\nfuture: <Future finished exception=ConnectionError('unexpected connection_lost() call')>",

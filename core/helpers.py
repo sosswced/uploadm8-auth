@@ -229,6 +229,123 @@ def sanitize_hashtag_body(raw: str | None, *, max_len: int = 50) -> str:
     return s[:max_len] if max_len > 0 else s
 
 
+# Full US state names → 2-letter abbr (discovery prefers #losangeles #california,
+# never #losangelesCA / #losangelescalifornia).
+_US_STATE_NAME_TO_ABBR: dict[str, str] = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "districtofcolumbia": "DC", "florida": "FL", "georgia": "GA", "hawaii": "HI",
+    "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME",
+    "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN",
+    "mississippi": "MS", "missouri": "MO", "montana": "MT", "nebraska": "NE",
+    "nevada": "NV", "newhampshire": "NH", "newjersey": "NJ", "newmexico": "NM",
+    "newyork": "NY", "northcarolina": "NC", "northdakota": "ND", "ohio": "OH",
+    "oklahoma": "OK", "oregon": "OR", "pennsylvania": "PA", "rhodeisland": "RI",
+    "southcarolina": "SC", "southdakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "westvirginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+_US_ABBR_TO_STATE_SLUG: dict[str, str] = {
+    abbr.lower(): name for name, abbr in _US_STATE_NAME_TO_ABBR.items()
+}
+_US_STATE_SLUGS_BY_LEN: tuple[str, ...] = tuple(
+    sorted(_US_STATE_NAME_TO_ABBR.keys(), key=len, reverse=True)
+)
+
+# "Destroy Lonely|Lil Uzi Vert", "Artist feat. Guest", "A / B", "A x B".
+# The collab "x" needs whitespace on BOTH sides so names that merely start
+# or end with the word X ("X Games", "X Ambassadors") are never split.
+_HASHTAG_ENTITY_SPLIT_RE = re.compile(
+    r"\s*(?:\||/|&|;|\bfeat\.?\b|\bft\.?\b)\s*|\s+x\s+",
+    re.IGNORECASE,
+)
+# "Las Vegas, NV" / "Los Angeles, California"
+_HASHTAG_CITY_STATE_RE = re.compile(
+    r"^\s*(?P<city>.+?)\s*,\s*(?P<state>[A-Za-z]{2}|[A-Za-z][A-Za-z\s]{2,})\s*$"
+)
+
+
+def split_hashtag_source_phrases(raw: str | None) -> list[str]:
+    """Split multi-entity sources before slugify so pipes/commas don't run on.
+
+    Examples:
+      ``Destroy Lonely|Lil Uzi Vert`` → ``["Destroy Lonely", "Lil Uzi Vert"]``
+      ``Las Vegas, NV`` → ``["Las Vegas", "Nevada"]`` (abbr expanded when known)
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    m = _HASHTAG_CITY_STATE_RE.match(text)
+    if m:
+        city = (m.group("city") or "").strip()
+        state_raw = (m.group("state") or "").strip()
+        state_key = re.sub(r"[^\w]", "", state_raw.lower())
+        if len(state_raw) == 2 and state_raw.isalpha():
+            state_out = _US_ABBR_TO_STATE_SLUG.get(state_raw.lower()) or state_raw
+            # Prefer human title case for known slugs when pushing separately.
+            if state_out in _US_STATE_NAME_TO_ABBR:
+                state_out = state_out  # slug form; sanitize will keep it
+            else:
+                state_out = state_raw.upper()
+        elif state_key in _US_STATE_NAME_TO_ABBR:
+            state_out = state_key
+        else:
+            state_out = state_raw
+        parts = [p for p in (city, state_out) if p]
+        if parts:
+            return parts
+    parts = [p.strip() for p in _HASHTAG_ENTITY_SPLIT_RE.split(text) if p and p.strip()]
+    return parts if parts else [text]
+
+
+def expand_geo_runon_hashtag(body: str | None, *, max_len: int = 50) -> list[str]:
+    """Split city+state run-ons into separate discovery tags.
+
+    ``losangelescalifornia`` / ``lasvegasnv`` → ``[losangeles, california]`` /
+    ``[lasvegas, nevada]``. Leaves unrelated slugs alone (returns ``[body]``).
+
+    Full state-name suffixes are unambiguous. Two-letter abbr suffixes are only
+    expanded when the stem is long enough that common names/brands
+    (``angelica``, ``veronica``, ``tesla``) are not shredded into fake geo tags.
+    """
+    slug = sanitize_hashtag_body(body, max_len=max_len)
+    if not slug:
+        return []
+    for state_slug in _US_STATE_SLUGS_BY_LEN:
+        if slug == state_slug:
+            return [slug]
+        if slug.endswith(state_slug) and len(slug) > len(state_slug) + 3:
+            city = slug[: -len(state_slug)]
+            if len(city) >= 4:
+                return [city[:max_len], state_slug]
+    # city + 2-letter abbr (lasvegasnv). Require a long stem so short brands and
+    # given names ending in state letters (angelica→ca, veronica→ca) stay intact.
+    if len(slug) >= 10:
+        abbr = slug[-2:]
+        state_slug = _US_ABBR_TO_STATE_SLUG.get(abbr)
+        if state_slug:
+            city = slug[:-2]
+            if len(city) >= 8 and city.isalpha():
+                return [city[:max_len], state_slug]
+    return [slug]
+
+
+def normalize_hashtag_bodies(raw_tags: list[str] | None, *, max_len: int = 50) -> list[str]:
+    """Sanitize + expand geo run-ons + split multi-entity sources; dedupe keep order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_tags or []:
+        for phrase in split_hashtag_source_phrases(str(raw)):
+            for piece in expand_geo_runon_hashtag(phrase, max_len=max_len):
+                body = sanitize_hashtag_body(piece, max_len=max_len)
+                if not body or body in seen:
+                    continue
+                seen.add(body)
+                out.append(body)
+    return out
+
+
 # AI sometimes pastes a JSON-ish hashtag array into prose; strip from captions/descriptions.
 _STRAY_HASH_JSON_BLOB = re.compile(r'#\s*"\s*\[(?:\\"|[^\]])*?\]\s*"', re.DOTALL)
 _STRAY_HASH_JSON_BRACKET = re.compile(r'#\s*\[(?:\\.|[^\]]){0,800}?\]', re.DOTALL)

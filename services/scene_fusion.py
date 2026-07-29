@@ -140,11 +140,16 @@ def has_scene_understanding(ctx: JobContext) -> bool:
 
 
 def _speed_mph(ctx: JobContext) -> float:
-    """Canonical consensus peak (single source of truth for fusion copy)."""
-    try:
-        from core.speed_consensus import consensus_peak_mph
+    """Canonical consensus peak (single source of truth for fusion copy).
 
-        return consensus_peak_mph(ctx)
+    Builds fresh (no artifact caching): fusion can run before all speed
+    sources are extracted on some recovery paths, and caching a premature
+    peak here would poison every later consumer.
+    """
+    try:
+        from core.speed_consensus import build_speed_consensus
+
+        return float(build_speed_consensus(ctx).get("peak_mph") or 0.0)
     except Exception:
         pass
     tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
@@ -334,7 +339,10 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
     """Fill ``ctx.video_understanding`` when Twelve Labs left it empty.
 
     Returns the fusion report (empty dict when skipped because TL already won).
+    Always speed-scrubs VU against consensus so TL prose cannot leak raw MPH.
     """
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
     vu = getattr(ctx, "video_understanding", None)
     if not isinstance(vu, dict):
         vu = {}
@@ -345,6 +353,7 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
         # Mark TL-sourced payloads when source missing.
         if not vu.get("source"):
             vu["source"] = "twelve_labs"
+        ensure_video_understanding_speed_scrubbed(ctx)
         return {"skipped": True, "reason": "scene_already_present", "source": vu.get("source")}
 
     fused = build_fusion_scene(ctx)
@@ -353,6 +362,7 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
             "[scene_fusion] no evidence for upload %s — left video_understanding empty",
             getattr(ctx, "upload_id", "?"),
         )
+        ensure_video_understanding_speed_scrubbed(ctx)
         return {"skipped": True, "reason": "no_evidence"}
 
     vu["scene_description"] = fused["scene_description"]
@@ -365,13 +375,14 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
         "providers": fused.get("providers") or {},
     }
     ctx.video_understanding = vu
+    ensure_video_understanding_speed_scrubbed(ctx)
 
     arts = getattr(ctx, "output_artifacts", None)
     if isinstance(arts, dict):
         arts["scene_fusion"] = {
             "source": "fusion",
-            "scene_chars": len(fused["scene_description"]),
-            "title_suggestion": fused.get("title_suggestion") or "",
+            "scene_chars": len(str(vu.get("scene_description") or "")),
+            "title_suggestion": vu.get("title_suggestion") or "",
             "providers": fused.get("providers") or {},
             "place_signs": fused.get("place_signs") or [],
         }
@@ -379,7 +390,7 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
     logger.info(
         "[scene_fusion] filled scene for upload %s (%d chars, signs=%s)",
         getattr(ctx, "upload_id", "?"),
-        len(fused["scene_description"]),
+        len(str(vu.get("scene_description") or "")),
         fused.get("place_signs") or [],
     )
     return fused

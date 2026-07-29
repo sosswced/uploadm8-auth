@@ -21,8 +21,10 @@ Flow:
 import asyncio
 import json
 import logging
-import os
 import math
+import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +39,15 @@ logger = logging.getLogger("uploadm8-worker")
 
 TWELVE_LABS_API_KEY = os.environ.get("TWELVE_LABS_API_KEY", "")
 TWELVELABS_INDEX_ID = os.environ.get("TWELVELABS_INDEX_ID", "")  # Pre-created index
+# After a tasks 404 on a stale env index, ignore TWELVELABS_INDEX_ID for this process.
+_IGNORE_ENV_INDEX = False
+# Cross-process latch: after a 404 heal, later workers prefer the healed index.
+_INDEX_STATE_PATH = Path(
+    os.environ.get(
+        "TWELVELABS_INDEX_STATE_PATH",
+        str(Path(os.environ.get("TMPDIR") or os.environ.get("TMP") or "/tmp") / "uploadm8_twelvelabs_index.json"),
+    )
+)
 
 # When Video Intelligence already produced rich object/text/logo/person tracks
 # Twelve Labs is largely redundant — every TL call costs ~$0.10/min indexed.
@@ -143,7 +154,7 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         raise SkipStage("No local video file for Twelve Labs")
 
     try:
-        index_id = TWELVELABS_INDEX_ID or await _get_or_create_index(ctx=ctx)
+        index_id = _resolve_index_id() or await _get_or_create_index(ctx=ctx)
         if not index_id:
             raise SkipStage("Could not get/create Twelve Labs index")
 
@@ -151,6 +162,25 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         video_id, index_fail = await _upload_and_index(
             video_path, index_id, ctx.upload_id, ctx=ctx
         )
+        # Stale TWELVELABS_INDEX_ID / deleted remote index → recreate once.
+        if not video_id and str(index_fail or "").startswith("upload HTTP 404"):
+            global _IGNORE_ENV_INDEX
+            _IGNORE_ENV_INDEX = True
+            _save_index_state(ignore_env=True, resolved_index_id="")
+            logger.warning(
+                "[twelvelabs] upload HTTP 404 on index_id=%s base=%s — "
+                "force-creating a new index and retrying once",
+                index_id,
+                TL_BASE_URL,
+            )
+            fresh = await _create_index(ctx=ctx, unique=True)
+            if fresh:
+                index_id = fresh
+                video_id, index_fail = await _upload_and_index(
+                    video_path, index_id, ctx.upload_id, ctx=ctx
+                )
+                if video_id:
+                    _save_index_state(ignore_env=True, resolved_index_id=str(index_id))
         if not video_id:
             raise SkipStage(
                 f"Video indexing failed{(': ' + index_fail) if index_fail else ''}"
@@ -196,9 +226,23 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
                         ",".join(cq_results.keys()),
                     )
 
+        # Never let TL-invented MPH reach captions/titles — consensus only.
+        # finalize=False: OSD stage runs after TL in the worker; defer the
+        # scrub when no trusted peak exists yet (consumers fail closed later).
+        try:
+            from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+            peak = ensure_video_understanding_speed_scrubbed(ctx, finalize=False)
+            logger.info(
+                "[twelvelabs] speed-scrubbed VU against consensus peak=%.1f",
+                peak,
+            )
+        except Exception as scrub_e:
+            logger.debug("[twelvelabs] speed scrub skipped: %s", scrub_e)
+
         logger.info(
             f"[twelvelabs]  video_id={video_id} "
-            f"description_len={len(description)} chars"
+            f"description_len={len(str(ctx.video_understanding.get('scene_description') or ''))} chars"
         )
         return ctx
 
@@ -228,39 +272,76 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         return ctx
 
 
-async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[str]:
-    """Get existing uploadm8 index or create one with Pegasus + Marengo."""
+def _load_index_state() -> Dict[str, Any]:
+    try:
+        if _INDEX_STATE_PATH.is_file():
+            data = json.loads(_INDEX_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_index_state(*, ignore_env: bool = False, resolved_index_id: str = "") -> None:
+    """Persist healed index so new workers skip a stale TWELVELABS_INDEX_ID."""
+    try:
+        payload = {
+            "v": 1,
+            "ignore_env": bool(ignore_env),
+            "resolved_index_id": str(resolved_index_id or "").strip(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _INDEX_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _INDEX_STATE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as e:
+        logger.debug("[twelvelabs] index state save failed: %s", e)
+
+
+def _resolve_index_id() -> str:
+    """Prefer healed process/file state, then env (unless ignored)."""
+    global _IGNORE_ENV_INDEX
+    state = _load_index_state()
+    if state.get("ignore_env"):
+        _IGNORE_ENV_INDEX = True
+    resolved = str(state.get("resolved_index_id") or "").strip()
+    if resolved:
+        return resolved
+    if _IGNORE_ENV_INDEX or state.get("ignore_env"):
+        return ""
+    return (TWELVELABS_INDEX_ID or "").strip()
+
+
+async def _create_index(
+    *, ctx: Optional[JobContext] = None, unique: bool = False
+) -> Optional[str]:
+    """POST a new Twelve Labs index (Pegasus + Marengo)."""
     headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
-
+    name = "uploadm8-content"
+    if unique:
+        name = f"uploadm8-content-{uuid.uuid4().hex[:8]}"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Check for existing uploadm8 index
-        resp = await client.get(f"{TL_BASE_URL}/indexes", headers=headers)
-        if resp.status_code == 200:
-            indexes = resp.json().get("data", [])
-            for idx in indexes:
-                if "uploadm8" in idx.get("name", "").lower():
-                    logger.info(f"[twelvelabs] Using existing index: {idx['_id']}")
-                    return idx["_id"]
-
-        # Create new index
         resp = await client.post(
             f"{TL_BASE_URL}/indexes",
             headers=headers,
             json={
-                "name": "uploadm8-content",
+                "name": name,
                 "models": [
-                    {"name": "pegasus1.2",  "options": ["visual", "audio"]},
-                    {"name": "marengo3.0",  "options": ["visual", "audio"]},
+                    {"name": "pegasus1.2", "options": ["visual", "audio"]},
+                    {"name": "marengo3.0", "options": ["visual", "audio"]},
                 ],
             },
         )
-
         if resp.status_code in (200, 201):
             index_id = resp.json().get("_id") or resp.json().get("id")
-            logger.info(f"[twelvelabs] Created index: {index_id}")
+            logger.info("[twelvelabs] Created index: %s name=%s", index_id, name)
+            if unique and index_id:
+                _save_index_state(ignore_env=True, resolved_index_id=str(index_id))
             return index_id
-
-        logger.warning(f"[twelvelabs] Index creation failed: {resp.status_code} {resp.text[:200]}")
+        logger.warning(
+            "[twelvelabs] Index creation failed: %s %s",
+            resp.status_code,
+            resp.text[:200],
+        )
         if ctx is not None:
             append_provider_error(
                 ctx,
@@ -272,6 +353,75 @@ async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[
                 response_body_snippet=resp.text[:1200],
             )
         return None
+
+
+async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[str]:
+    """Get existing uploadm8 index or create one with Pegasus + Marengo.
+
+    Prefer persisted healed ``resolved_index_id``, then unique
+    ``uploadm8-content-*`` names, then exact ``uploadm8-content``, then any
+    uploadm8* name — never the arbitrary first API hit after a heal.
+    """
+    headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
+    state = _load_index_state()
+    preferred = str(state.get("resolved_index_id") or "").strip()
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{TL_BASE_URL}/indexes", headers=headers)
+        if resp.status_code == 200:
+            indexes = resp.json().get("data", []) or []
+            by_id: Dict[str, Dict[str, Any]] = {}
+            for idx in indexes:
+                if not isinstance(idx, dict):
+                    continue
+                iid = str(idx.get("_id") or idx.get("id") or "").strip()
+                if iid:
+                    by_id[iid] = idx
+            if preferred and preferred in by_id:
+                logger.info("[twelvelabs] Using healed index from state: %s", preferred)
+                return preferred
+            if preferred and state.get("ignore_env"):
+                # State says ignore env; healed id may still be valid even if
+                # list pagination omitted it — try it before arbitrary picks.
+                logger.info(
+                    "[twelvelabs] Using persisted healed index (not in list page): %s",
+                    preferred,
+                )
+                return preferred
+
+            healed: List[Dict[str, Any]] = []
+            exact: Optional[str] = None
+            any_um8: Optional[str] = None
+            for idx in indexes:
+                if not isinstance(idx, dict):
+                    continue
+                name = str(idx.get("name") or "").lower()
+                iid = str(idx.get("_id") or idx.get("id") or "").strip()
+                if not iid or "uploadm8" not in name:
+                    continue
+                if name.startswith("uploadm8-content-"):
+                    healed.append(idx)
+                elif name == "uploadm8-content" and exact is None:
+                    exact = iid
+                elif any_um8 is None:
+                    any_um8 = iid
+            if healed:
+                healed.sort(
+                    key=lambda i: str(i.get("name") or ""),
+                    reverse=True,
+                )
+                pick = str(healed[0].get("_id") or healed[0].get("id") or "").strip()
+                if pick:
+                    logger.info("[twelvelabs] Using newest healed index: %s", pick)
+                    return pick
+            if exact:
+                logger.info("[twelvelabs] Using existing index: %s", exact)
+                return exact
+            if any_um8:
+                logger.info("[twelvelabs] Using existing index: %s", any_um8)
+                return any_um8
+
+    return await _create_index(ctx=ctx, unique=False)
 
 
 async def _upload_and_index(
@@ -313,13 +463,23 @@ async def _upload_and_index(
             )
 
         if resp.status_code not in (200, 201):
-            logger.warning(f"[twelvelabs] Upload failed: {resp.status_code} {resp.text[:300]}")
+            logger.warning(
+                "[twelvelabs] Upload failed: status=%s index_id=%s base=%s body=%s",
+                resp.status_code,
+                index_id,
+                TL_BASE_URL,
+                resp.text[:500],
+            )
             if ctx is not None:
                 append_provider_error(
                     ctx,
                     provider="twelvelabs",
                     stage="twelvelabs_stage",
-                    operation="upload_task",
+                    operation=(
+                        "upload_task_stale_index"
+                        if resp.status_code == 404
+                        else "upload_task"
+                    ),
                     message="task upload failed",
                     http_status=resp.status_code,
                     response_body_snippet=resp.text[:1200],

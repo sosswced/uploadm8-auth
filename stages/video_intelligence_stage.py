@@ -516,7 +516,13 @@ async def _build_vi_inline_proxy(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await proc.communicate()
+            try:
+                _, stderr = await proc.communicate()
+            except asyncio.CancelledError:
+                from stages.ffmpeg_progress import kill_process_quietly
+
+                await kill_process_quietly(proc)
+                raise
         except (OSError, FileNotFoundError) as e:
             logger.warning("[video_intelligence] ffmpeg proxy unavailable: %s", e)
             return None

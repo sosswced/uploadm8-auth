@@ -539,12 +539,14 @@ async def _live_extract_frames(video_path: Path, temp_dir: Path, n: int) -> List
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_streams", str(video_path)
         ]
+        from stages.ffmpeg_progress import communicate_or_kill, kill_process_quietly
+
         proc = await asyncio.create_subprocess_exec(
             *dur_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await proc.communicate()
+        stdout, _ = await communicate_or_kill(proc)
         data = json.loads(stdout.decode())
         duration = float(next(
             (s["duration"] for s in data.get("streams", [])
@@ -568,7 +570,11 @@ async def _live_extract_frames(video_path: Path, temp_dir: Path, n: int) -> List
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await proc2.wait()
+            try:
+                await proc2.wait()
+            except asyncio.CancelledError:
+                await kill_process_quietly(proc2)
+                raise
             if frame_path.exists() and frame_path.stat().st_size > 1024:
                 frames.append(frame_path)
     except Exception as e:
@@ -614,8 +620,14 @@ def _build_trill_beat(ctx: JobContext) -> Optional[str]:
             )
 
     if td:
-        if td.max_speed_mph and td.max_speed_mph > 0:
-            lines.append(f"Peak speed: {td.max_speed_mph:.0f} mph")
+        try:
+            from core.speed_consensus import consensus_peak_mph
+
+            _peak = consensus_peak_mph(ctx)
+        except Exception:
+            _peak = float(getattr(td, "max_speed_mph", 0) or 0)
+        if _peak and _peak > 0:
+            lines.append(f"Peak speed: {_peak:.0f} mph")
         if td.avg_speed_mph and td.avg_speed_mph > 0:
             lines.append(f"Average speed: {td.avg_speed_mph:.0f} mph")
         if td.total_distance_miles and td.total_distance_miles > 0:
@@ -920,6 +932,13 @@ def _build_narrative_prompt(
     scene_understanding_block = ""
     vu = getattr(ctx, "video_understanding", None) or {}
     if isinstance(vu, dict) and (vu.get("scene_description") or vu.get("title_suggestion")):
+        try:
+            from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+            ensure_video_understanding_speed_scrubbed(ctx)
+            vu = getattr(ctx, "video_understanding", None) or vu
+        except Exception:
+            pass
         sd = str(vu.get("scene_description") or "").strip()
         ts = str(vu.get("title_suggestion") or "").strip()
         scene_understanding_block = (
@@ -1363,8 +1382,14 @@ def _context_engine_caption_fallback(ctx: JobContext, category: str) -> str:
         bits.append(title[:120])
     if tel and getattr(tel, "location_display", None):
         bits.append(f"near {str(tel.location_display).strip()[:80]}")
-    if tel and (getattr(tel, "max_speed_mph", 0.0) or 0) > 0:
-        bits.append(f"peak {float(tel.max_speed_mph):.0f} mph")
+    try:
+        from core.speed_consensus import consensus_peak_mph
+
+        _peak = consensus_peak_mph(ctx)
+    except Exception:
+        _peak = float(getattr(tel, "max_speed_mph", 0.0) or 0) if tel else 0.0
+    if _peak > 0:
+        bits.append(f"peak {_peak:.0f} mph")
     if category and category != "general":
         bits.append(category.replace("_", " "))
     out = " | ".join([b for b in bits if b]).strip(" |")

@@ -28,8 +28,10 @@ def test_ffmpeg_wait_uses_heartbeat_and_live_time_parse():
     src = inspect.getsource(worker._run_deduplicated_transcode)
     assert "_wait_ffmpeg_with_heartbeat(proc" in src
     assert "ffmpeg heartbeat" in src
-    # Live mid-encode % from stderr time= (not bare communicate()).
-    assert "time=" in src
+    # Live mid-encode % via chunked stderr parse (not bare communicate() / readline).
+    assert "parse_ffmpeg_time_seconds" in src
+    assert "iter_ffmpeg_stderr_text" in src
+    assert ".readline" not in src
     assert "proc.communicate()" not in src
 
 
@@ -64,3 +66,5 @@ def test_legacy_transcode_video_uses_stage_progress_not_dead_api():
     src = inspect.getsource(transcode_stage.transcode_video)
     assert "update_stage_progress" in src
     assert "update_upload_progress" not in src
+    assert "iter_ffmpeg_stderr_text" in src
+    assert ".readline" not in src

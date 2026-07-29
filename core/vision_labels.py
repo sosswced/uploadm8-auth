@@ -269,6 +269,9 @@ _JUNK_HASHTAG_RE = re.compile(
     r"|highway\d+korean|countypacific|pacific.*veteran|memorialhwy"
     # Broadcast false-positive logos (Czech Radio) — not automotive brands
     r"|^[a-z]{2,12}radio$"
+    # Ambient logos: exact slug only (never substring — ups must not kill meetups)
+    r"|^(?:maersk|kohinoor|kohinoorhardtmuth|hardtmuth|quiksilver|fedex|ups|dhl)$"
+    r"|^(?:matson|matsoninc|cosco|evergreen|walmart|costco|circlek|chevron|exxon)$"
     r")"
 )
 

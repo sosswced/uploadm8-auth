@@ -361,7 +361,13 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            from stages.ffmpeg_progress import kill_process_quietly
+
+            await kill_process_quietly(proc)
+            raise
 
         if proc.returncode != 0 or not output_path.exists():
             err_raw = stderr.decode(errors="replace") if stderr else ""

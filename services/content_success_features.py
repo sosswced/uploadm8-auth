@@ -13,6 +13,7 @@ dataset/sklearn stack the training scripts pull in as UV deps.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Dict, List, Optional
 
 from services.ml_feature_registry import active_cat, active_num, label
@@ -333,14 +334,26 @@ def label_hotness(df):  # type: ignore[no-untyped-def]
 
 
 def _coerce(v: Any) -> Any:
-    if isinstance(v, float) and v != v:  # NaN
+    if isinstance(v, float) and not math.isfinite(v):
         return None
     if hasattr(v, "item"):
         try:
-            return v.item()
+            v = v.item()
         except Exception:
             return str(v)
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     return v
+
+
+def _finite_round(v: Any, ndigits: int, *, default: float = 0.0) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(f):
+        return default
+    return round(f, ndigits)
 
 
 def rank_dimension(df, by: List[str], *, min_samples: int = 3, limit: int = 15) -> List[Dict[str, Any]]:
@@ -371,12 +384,14 @@ def rank_dimension(df, by: List[str], *, min_samples: int = 3, limit: int = 15) 
         rec.update(
             {
                 "samples": int(r["samples"]),
-                "mean_engagement_pct": round(float(r["mean_engagement_pct"]), 4),
-                "mean_views": round(float(r["mean_views"]), 1),
-                "sum_views": int(r["sum_views"]),
-                "sum_interactions": int(r["sum_interactions"]),
-                "hot_rate": round(float(r["hot_rate"]), 4),
-                "hotness_index": round(float(r["hotness_index"]), 5),
+                "mean_engagement_pct": _finite_round(r["mean_engagement_pct"], 4),
+                "mean_views": _finite_round(r["mean_views"], 1),
+                "sum_views": int(r["sum_views"]) if math.isfinite(float(r["sum_views"])) else 0,
+                "sum_interactions": int(r["sum_interactions"])
+                if math.isfinite(float(r["sum_interactions"]))
+                else 0,
+                "hot_rate": _finite_round(r["hot_rate"], 4),
+                "hotness_index": _finite_round(r["hotness_index"], 5),
             }
         )
         out.append(rec)

@@ -62,6 +62,79 @@ def list_matching_pairs(library: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
+def find_sibling_media_path(path: Path) -> Path | None:
+    """Given a .mp4 or .map, return the matching same-stem partner if present.
+
+    Prefer the same directory; then search ``E2E_MEDIA_LIBRARY`` / default library.
+    """
+    if not path or not path.is_file():
+        return None
+    stem = _stem_key(path)
+    ext = path.suffix.lower()
+    parent = path.parent
+
+    def _scan_dir(folder: Path) -> Path | None:
+        try:
+            entries = list(folder.iterdir())
+        except OSError:
+            return None
+        if ext in _VIDEO_EXTS:
+            for entry in entries:
+                if entry.is_file() and entry.suffix.lower() in _MAP_EXTS and _stem_key(entry) == stem:
+                    return entry
+        elif ext in _MAP_EXTS:
+            for entry in entries:
+                if entry.is_file() and entry.suffix.lower() in _VIDEO_EXTS and _stem_key(entry) == stem:
+                    return entry
+        return None
+
+    hit = _scan_dir(parent)
+    if hit is not None:
+        return hit
+    lib = e2e_media_library()
+    if lib is not None and lib.resolve() != parent.resolve():
+        return _scan_dir(lib)
+    return None
+
+
+def resolve_explicit_media_pair(
+    video: Path | str | None = None,
+    telemetry: Path | str | None = None,
+) -> tuple[Path | None, Path | None, str]:
+    """Fill a missing half of an explicit video/map pair via same-stem sibling.
+
+    Returns ``(video, map, note)``. Never invents a random library pair for the
+    missing side — that would desync telemetry from the chosen clip.
+    """
+    v = Path(video) if video else None
+    t = Path(telemetry) if telemetry else None
+    if v is not None and not v.is_file():
+        v = None
+    if t is not None and not t.is_file():
+        t = None
+    note = "explicit"
+    if v is not None and t is None:
+        sib = find_sibling_media_path(v)
+        if sib is not None:
+            t = sib
+            note = "explicit_video_sibling_map"
+        else:
+            note = "explicit_video_map_missing"
+    elif t is not None and v is None:
+        sib = find_sibling_media_path(t)
+        if sib is not None:
+            v = sib
+            note = "explicit_map_sibling_video"
+        else:
+            note = "explicit_map_video_missing"
+    elif v is not None and t is not None:
+        if _stem_key(v) != _stem_key(t):
+            note = "explicit_stem_mismatch"
+        else:
+            note = "explicit_pair"
+    return v, t, note
+
+
 def pick_random_media_pair(
     library: Path | None = None,
     *,

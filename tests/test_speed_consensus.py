@@ -149,7 +149,193 @@ def test_scrub_converts_kph_before_comparing():
     assert "80" not in out2
 
 
-# ── Title gates use the consensus ───────────────────────────────────────
+def test_scrub_handles_spelled_out_units():
+    out = scrub_untrusted_speed_claims("Doing 46 miles per hour downtown.", 154.0)
+    assert "46" not in out
+    assert "downtown" in out
+    out2 = scrub_untrusted_speed_claims("About 74 kilometers per hour.", 154.0)
+    assert "74" not in out2
+
+
+def test_scrub_removes_ranges_without_dangling_fragments():
+    out = scrub_untrusted_speed_claims("Reaches speeds of 90-100 mph on the straight.", 154.0)
+    assert "90" not in out and "100" not in out
+    assert "-" not in out  # no dangling "90-" fragment
+    # Range kept when an endpoint agrees with the trusted peak.
+    out2 = scrub_untrusted_speed_claims("Holding 150 to 155 mph through the bend.", 154.0)
+    assert "150 to 155 mph" in out2
+
+
+def test_scrub_handles_no_space_before_unit():
+    out = scrub_untrusted_speed_claims("The car hits 46mph in traffic.", 154.0)
+    assert "46" not in out
+    out2 = scrub_untrusted_speed_claims("Hits 154MPH flat out.", 154.0)
+    assert "154MPH" in out2
+
+
+def test_ensure_vu_is_idempotent_and_tolerates_bad_shapes():
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        telemetry=_tel(128.0),
+        video_understanding={
+            "scene_description": "At 46 MPH the car weaves; later a 128 MPH burst.",
+            "title_suggestion": None,        # non-str must not crash
+            "custom_queries": "not-a-dict",  # wrong type must not crash
+        },
+    )
+    peak1 = ensure_video_understanding_speed_scrubbed(ctx)
+    snapshot = dict(ctx.video_understanding)
+    peak2 = ensure_video_understanding_speed_scrubbed(ctx)
+    assert peak1 == peak2 == 128.0
+    assert ctx.video_understanding == snapshot
+    assert "46" not in ctx.video_understanding["scene_description"]
+    assert "128 MPH" in ctx.video_understanding["scene_description"]
+
+
+def test_ensure_vu_noop_without_video_understanding():
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    assert ensure_video_understanding_speed_scrubbed(_ctx()) == 0.0
+
+
+def test_write_time_scrub_defers_until_speed_sources_ready():
+    """Worker order: Twelve Labs runs BEFORE dashcam OSD. A write-time scrub
+    with finalize=False must not drop claims prematurely nor cache peak=0."""
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Cruising steady at 68 MPH down the freeway.",
+        },
+    )
+    # TL stage time: no telemetry / OSD extracted yet → defer, don't mutate.
+    peak_early = ensure_video_understanding_speed_scrubbed(ctx, finalize=False)
+    assert peak_early == 0.0
+    assert "68 MPH" in ctx.video_understanding["scene_description"]
+    # Must not have poisoned the cached consensus artifact with peak=0.
+    assert SPEED_CONSENSUS_ARTIFACT not in ctx.output_artifacts
+
+    # OSD stage later recovers a matching HUD peak.
+    ctx.dashcam_osd_context = {
+        "max_speed_mph": 68.0,
+        "speed_series": [{"mph": 66.0, "t_s": 2.0}, {"mph": 68.0, "t_s": 6.0}],
+    }
+    peak_late = ensure_video_understanding_speed_scrubbed(ctx)
+    assert peak_late == 68.0
+    # TL claim agrees with the OSD consensus → survives.
+    assert "68 MPH" in ctx.video_understanding["scene_description"]
+    # Consumers now cache the correct consensus.
+    assert consensus_peak_mph(ctx) == 68.0
+
+
+def test_write_time_scrub_defers_on_weak_pre_osd_vision_peak():
+    """Bugbot: a vision-OCR peak >= 5 present before the OSD stage must NOT
+    trigger the write-time scrub — only telemetry is final by TL time."""
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        vision_context={"ocr_text": "HUD shows 40 MPH in the corner"},
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Cruising steady at 68 MPH down the freeway.",
+        },
+    )
+    ensure_video_understanding_speed_scrubbed(ctx, finalize=False)
+    # Deferred: the 68 MPH claim survives to be judged against the OSD peak.
+    assert "68 MPH" in ctx.video_understanding["scene_description"]
+
+    ctx.dashcam_osd_context = {
+        "max_speed_mph": 68.0,
+        "speed_series": [{"mph": 66.0, "t_s": 2.0}, {"mph": 68.0, "t_s": 6.0}],
+    }
+    ensure_video_understanding_speed_scrubbed(ctx)
+    assert "68 MPH" in ctx.video_understanding["scene_description"]
+
+
+def test_write_time_scrub_applies_when_telemetry_final():
+    """Telemetry outranks all later sources, so TL-time scrub against a
+    telemetry peak is safe and should happen immediately."""
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        telemetry=_tel(128.0),
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Weaving at 46 MPH before a 128 MPH burst.",
+        },
+    )
+    ensure_video_understanding_speed_scrubbed(ctx, finalize=False)
+    assert "46" not in ctx.video_understanding["scene_description"]
+    assert "128 MPH" in ctx.video_understanding["scene_description"]
+
+
+def test_consumer_scrub_fails_closed_when_no_speed_source_at_all():
+    """If no trusted source ever appears, consumption-time scrub drops claims."""
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Blasting at 130 MPH through the desert.",
+        },
+    )
+    ensure_video_understanding_speed_scrubbed(ctx)  # finalize=True default
+    assert "130" not in ctx.video_understanding["scene_description"]
+
+
+def test_ensure_vu_scrubs_twelve_labs_wrong_mph():
+    """TL scene prose with invented MPH must be scrubbed against consensus."""
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        telemetry=_tel(128.0),
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": (
+                "Dashcam clip cruising at 46 MPH through Las Vegas traffic "
+                "before the car surges to 90 MPH on the strip."
+            ),
+            "title_suggestion": "46 MPH night cruise",
+            "custom_queries": {"pace": "Looks like about 55 mph"},
+        },
+    )
+    peak = ensure_video_understanding_speed_scrubbed(ctx)
+    assert peak == 128.0
+    vu = ctx.video_understanding
+    assert "46" not in vu["scene_description"]
+    assert "90" not in vu["scene_description"]
+    assert "55" not in vu["custom_queries"]["pace"]
+    assert "46" not in vu["title_suggestion"]
+
+
+def test_ensure_vu_keeps_consensus_peak_in_tl_prose():
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    ctx = _ctx(
+        telemetry=_tel(128.0),
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Hitting 128 MPH near the Strip with neon lights.",
+        },
+    )
+    ensure_video_understanding_speed_scrubbed(ctx)
+    assert "128 MPH" in ctx.video_understanding["scene_description"]
+
+
+def test_collect_evidence_ignores_twelve_labs_speed():
+    """Evidence pool peak must come from consensus, never TL narrative."""
+    ctx = _ctx(
+        telemetry=_tel(128.0),
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": "Vehicle traveling at 42 MPH downtown.",
+        },
+    )
+    pool = collect_evidence(ctx)
+    assert pool.max_speed_mph == 128.0
+    assert pool.speed_source == "telemetry"
 
 
 def test_wrong_mph_title_is_thin_and_rewritten():
@@ -302,3 +488,96 @@ def test_speed_tolerance_floor_and_pct():
     assert speed_tolerance_mph(0) == 8.0
     assert speed_tolerance_mph(50) == 8.0
     assert speed_tolerance_mph(150) == 18.0
+
+
+# ── LLM prompt integration: what the model actually sees ────────────────
+
+
+def test_m8_prompt_never_sees_twelve_labs_wrong_speeds():
+    """Real build_scene_graph + _build_m8_prompt: TL prose claiming 46/90/55
+    MPH on a 128 MPH telemetry run must reach the LLM with only 128."""
+    import json as _json
+    import re as _re
+
+    from stages.m8_engine import _build_m8_prompt, build_scene_graph
+
+    ctx = _ctx(
+        telemetry=SimpleNamespace(
+            max_speed_mph=128.0,
+            avg_speed_mph=96.0,
+            total_distance_miles=4.2,
+            euphoria_seconds=12.0,
+            location_display="Las Vegas, Nevada",
+            location_city="Las Vegas",
+            location_state="Nevada",
+            location_country="United States",
+            location_road="Las Vegas Blvd",
+            location_start_display=None,
+            gazetteer_place_name=None,
+            padus_unit_name=None,
+            near_padus=False,
+            points=[],
+            mid_lat=36.11, mid_lon=-115.17,
+            start_lat=36.10, start_lon=-115.17,
+        ),
+        video_understanding={
+            "source": "twelve_labs",
+            "scene_description": (
+                "Dashcam clip cruising at 46 MPH through Las Vegas traffic. "
+                "Briefly touching 90 MPH near the strip, then settling to "
+                "around 55 miles per hour past the neon signs."
+            ),
+            "title_suggestion": "46 MPH Night Cruise Through Vegas",
+        },
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Destroy Lonely",
+            "music_title": "NEVEREVER",
+        },
+        vision_context={"labels": ["car", "night"], "ocr_text": ""},
+        user_id="u1",
+        platforms=["youtube", "tiktok"],
+        user_settings={},
+        hashtags=[],
+        hydration_payload=None,
+        entitlements=SimpleNamespace(max_caption_frames=6),
+        visual_recognition=None,
+        video_info=None,
+    )
+
+    scene = build_scene_graph(ctx, "automotive")
+    prompt = _build_m8_prompt(
+        ctx, scene, "automotive", "energetic", "hype", "niche", 8,
+        True, True, True, historical={}, strategy=None,
+        include_evidence_matrix=False, caption_voice_ui="default",
+    )
+
+    for blob_name, blob in (("prompt", prompt), ("scene_graph", _json.dumps(scene, default=str))):
+        for wrong in ("46", "90", "55"):
+            assert not _re.search(
+                rf"\b{wrong}\s*(mph|miles per hour)", blob, _re.IGNORECASE
+            ), f"{blob_name} leaked TL speed {wrong}"
+    assert "128" in prompt, "consensus peak missing from prompt"
+
+
+def test_anchor_and_title_speed_use_consensus_block():
+    """Anchor/title builders must read scene_graph.speed_consensus, not raw OSD/geo peaks."""
+    from stages.m8_engine import _best_hydration_anchor
+
+    sg = {
+        "speed_consensus": {"peak_mph": 55.0, "source": "telemetry"},
+        # Raw peaks disagree — a mis-OCR'd HUD / stale geo must never win.
+        "dashcam_osd": {"max_speed_mph": 88.0},
+        "geo": {"road": "I-5", "max_speed_mph": 91.0},
+    }
+    anchor = _best_hydration_anchor(sg)
+    assert "55 MPH" in anchor
+    assert "88" not in anchor and "91" not in anchor
+
+    # No consensus peak → fail closed (no MPH in the anchor at all).
+    sg_none = {
+        "speed_consensus": {},
+        "dashcam_osd": {"max_speed_mph": 88.0},
+        "geo": {"road": "I-5"},
+    }
+    assert "MPH" not in _best_hydration_anchor(sg_none)

@@ -865,13 +865,25 @@ async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, 
         async with pool.acquire() as conn:
             # Cast $2 consistently — asyncpg AmbiguousParameterError when the same
             # param is inferred as varchar (column) and text (jsonb_build_object).
+            # GREATEST on progress so parallel multimodal stages (audio/vision/VI/TL)
+            # cannot regress the bar after a later stage already advanced it.
+            # Stage name only advances when the new % is >= current (avoids flipping
+            # back to "Building platform formats" / "Analyzing audio" mid-VI).
             await conn.execute(
                 """
                 UPDATE uploads
-                SET processing_stage    = $2::text,
-                    processing_progress = $3,
+                SET processing_stage = CASE
+                        WHEN $3::int >= COALESCE(processing_progress, 0)
+                        THEN $2::text
+                        ELSE processing_stage
+                    END,
+                    processing_progress = GREATEST(COALESCE(processing_progress, 0), $3::int),
                     output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
-                        || jsonb_build_object('last_processing_stage', $2::text),
+                        || CASE
+                            WHEN $3::int >= COALESCE(processing_progress, 0)
+                            THEN jsonb_build_object('last_processing_stage', $2::text)
+                            ELSE '{}'::jsonb
+                        END,
                     updated_at          = NOW()
                 WHERE id = $1::uuid
                 """,

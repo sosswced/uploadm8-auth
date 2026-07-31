@@ -65,12 +65,9 @@ def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dic
     )
 
     prefs = user_prefs or {}
-    model = (
-        prefs.get("trill_openai_model")
-        or prefs.get("trillOpenaiModel")
-        or prefs.get("openai_model")
-        or "gpt-4o-mini"
-    )
+    from core.openai_caption_model import resolve_openai_caption_model
+
+    model = resolve_openai_caption_model(prefs)
     caption_style = str(
         prefs.get("captionStyle") or prefs.get("caption_style") or "story"
     ).strip().lower()

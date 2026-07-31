@@ -568,7 +568,7 @@ async def get_user_preferences(
                 "trillAiEnhance": (
                     True if d.get("trill_ai_enhance") is None else bool(d.get("trill_ai_enhance"))
                 ),
-                "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+                "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o"),
                 "trillLeaderboardOptIn": bool(d.get("trill_leaderboard_opt_in", False)),
                 "trillMapSharingOptIn": bool(d.get("trill_map_sharing_opt_in", False)),
                 "styledThumbnails": d.get("styled_thumbnails", True),
@@ -675,7 +675,7 @@ async def get_user_preferences(
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": True, "discordWebhook": None,
             "trillEnabled": True, "trillMinScore": 60,
-            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o-mini",
+            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o",
             "trillLeaderboardOptIn": False, "trillMapSharingOptIn": False,
             "styledThumbnails": True,
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,

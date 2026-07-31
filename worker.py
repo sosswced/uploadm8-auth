@@ -1413,10 +1413,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 ctx.vehicle_model_name = _lab.get("model_name")
         except Exception as _ve:
             logger.debug("[%s] vehicle label hydrate skipped: %s", upload_id, _ve)
-        ctx.user_settings["_openai_model_override"] = (
-            ctx.user_settings.get("trillOpenaiModel")
-            or ctx.user_settings.get("trill_openai_model")
-            or "gpt-4o"
+        from core.openai_caption_model import resolve_openai_caption_model
+
+        # Sticky override so caption_stage / M8 always see the resolved allowlisted model.
+        ctx.user_settings["_openai_model_override"] = resolve_openai_caption_model(
+            ctx.user_settings
         )
 
         # ── Server-side entitlement cap enforcement ───────────────────────
@@ -6826,6 +6827,15 @@ async def main() -> None:
         background_loops.append(("platform_metrics_cache", run_platform_metrics_cache_loop))
     if _loop_enabled("WORKER_ENABLE_ADMIN_EMAIL_JOBS", True):
         background_loops.append(("admin_email_jobs", run_admin_email_jobs_loop))
+    if _loop_enabled("WORKER_ENABLE_TOKEN_KEEPALIVE", True):
+        from services.platform_oauth_refresh import run_platform_token_keepalive_loop
+
+        background_loops.append(
+            (
+                "token_keepalive",
+                lambda: run_platform_token_keepalive_loop(db_pool, shutdown_event),
+            )
+        )
 
     tasks = [
         asyncio.create_task(_supervise(name, factory))

@@ -537,11 +537,9 @@ async def run_pipeline(args: argparse.Namespace) -> int:
     }
     job_data = {"job_id": job_id, "idempotency_key": job_id}
     ctx = create_context(job_data, upload_record, user_settings, ent)
-    ctx.user_settings["_openai_model_override"] = (
-        ctx.user_settings.get("trillOpenaiModel")
-        or ctx.user_settings.get("trill_openai_model")
-        or "gpt-4o-mini"
-    )
+    from core.openai_caption_model import resolve_openai_caption_model
+
+    ctx.user_settings["_openai_model_override"] = resolve_openai_caption_model(ctx.user_settings)
 
     out_thumb = Path(__file__).resolve().parent / "_simulate_full_thumb.jpg"
     thumb_out_dir: Optional[Path] = None

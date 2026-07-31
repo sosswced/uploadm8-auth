@@ -2212,6 +2212,13 @@ async def save_refreshed_token(
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
     token_row_id: Optional[str] = None,
+    expires_at: Optional[str] = None,
+    expires_in: Optional[int] = None,
+    refresh_expires_at: Optional[str] = None,
+    refresh_expires_in: Optional[int] = None,
+    access_obtained_at: Optional[str] = None,
+    access_non_expiring: Optional[bool] = None,
+    extra_plain: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
@@ -2301,6 +2308,25 @@ async def save_refreshed_token(
                     current_plain["refresh_token"] = refresh_token
                 if open_id:
                     current_plain["open_id"] = open_id
+                if expires_at is not None:
+                    current_plain["expires_at"] = expires_at
+                if expires_in is not None:
+                    current_plain["expires_in"] = int(expires_in)
+                if refresh_expires_at is not None:
+                    current_plain["refresh_expires_at"] = refresh_expires_at
+                if refresh_expires_in is not None:
+                    current_plain["refresh_expires_in"] = int(refresh_expires_in)
+                if access_obtained_at is not None:
+                    current_plain["access_obtained_at"] = access_obtained_at
+                if access_non_expiring is True:
+                    current_plain["access_non_expiring"] = True
+                    current_plain["expires_at"] = None
+                elif access_non_expiring is False:
+                    current_plain.pop("access_non_expiring", None)
+                if isinstance(extra_plain, dict):
+                    for k, v in extra_plain.items():
+                        if v is not None and k not in ("access_token",):
+                            current_plain[k] = v
 
                 # Re-encrypt and write back as clean TEXT
                 new_blob_str = json.dumps(encrypt_blob(current_plain))

@@ -298,7 +298,11 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     except (TypeError, ValueError):
         trill_min_score = 60
     trill_ai_enhance = _coerce_bool(p.get("trill_ai_enhance"), True)
-    trill_openai_model = str(p.get("trill_openai_model", "gpt-4o-mini") or "gpt-4o-mini")[:50]
+    from core.openai_caption_model import normalize_openai_caption_model
+
+    trill_openai_model = normalize_openai_caption_model(
+        p.get("trill_openai_model") or p.get("trillOpenaiModel")
+    )[:50]
     use_audio_context = _coerce_bool(p.get("useAudioContext", p.get("use_audio_context")), True)
     youtube_shorts_copyright_trim = _coerce_bool(
         p.get("youtubeShortsCopyrightTrim", p.get("youtube_shorts_copyright_trim")),

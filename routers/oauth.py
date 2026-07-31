@@ -535,11 +535,21 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
 
             # Store the token — include platform-specific IDs in the blob so
             # publish_stage can read them without needing a separate DB lookup.
+            from core.platform_token_expiry import normalize_connect_expires_at, stamp_token_expiry
+
+            _raw_exp = token_data.get("expires_in") or token_payload.get("expires_in")
+            _exp_fields = normalize_connect_expires_at(_raw_exp)
             blob_payload = {
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token") or token_payload.get("refresh_token"),
-                "expires_at": token_data.get("expires_in") or token_payload.get("expires_in"),
+                **_exp_fields,
             }
+            # Meta page tokens from /me/accounts are typically non-expiring when
+            # derived from a long-lived user token; stamp cadence fields anyway.
+            if platform in ("instagram", "facebook") and not _raw_exp:
+                blob_payload.update(
+                    stamp_token_expiry(blob_payload, non_expiring=True)
+                )
             if platform in ("instagram", "facebook"):
                 blob_payload["meta_oauth_mode"] = meta_oauth_mode()
                 if platform == "instagram":
@@ -550,6 +560,10 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 _asid = locals().get("facebook_user_asid")
                 if _asid:
                     blob_payload["facebook_user_id"] = str(_asid)
+                # Keep user LLT for fb_exchange_token (page tokens often cannot re-exchange).
+                _uat = locals().get("user_access_token")
+                if _uat:
+                    blob_payload["meta_user_token"] = str(_uat)
             if platform == "instagram" and account_id:
                 blob_payload["ig_user_id"] = str(account_id)
             if platform == "facebook" and account_id:

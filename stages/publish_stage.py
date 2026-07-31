@@ -902,11 +902,18 @@ async def _refresh_tiktok_token(
     db_pool=None,
     user_id: str = None,
     token_row_id: str | None = None,
+    *,
+    force: bool = False,
 ) -> dict:
     """Refresh a TikTok access token using the stored refresh_token.
     TikTok access tokens expire after 24 hours; refresh tokens after 365 days.
     Persists the new token blob to DB if db_pool and user_id are provided.
     """
+    from core.platform_token_expiry import should_refresh_access_token, stamp_token_expiry
+
+    if not force and not should_refresh_access_token("tiktok", token_data):
+        return token_data
+
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
         logger.warning("TikTok: No refresh_token stored, cannot refresh — user must reconnect")
@@ -940,12 +947,15 @@ async def _refresh_tiktok_token(
                     return token_data
                 new_refresh = new_tokens.get("refresh_token", refresh_token)
                 new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
-                updated = {
-                    **token_data,
-                    "access_token":  new_access,
-                    "refresh_token": new_refresh,
-                    "expires_at":    new_tokens.get("expires_in"),
-                }
+                updated = stamp_token_expiry(
+                    {
+                        **token_data,
+                        "access_token": new_access,
+                        "refresh_token": new_refresh,
+                    },
+                    expires_in=new_tokens.get("expires_in"),
+                    refresh_expires_in=new_tokens.get("refresh_expires_in"),
+                )
                 if new_open_id:
                     updated["open_id"] = new_open_id
                 # Persist back to DB so future jobs use the fresh token
@@ -959,6 +969,11 @@ async def _refresh_tiktok_token(
                             refresh_token=new_refresh,
                             open_id=new_open_id,
                             token_row_id=token_row_id,
+                            expires_at=updated.get("expires_at"),
+                            expires_in=updated.get("expires_in"),
+                            refresh_expires_at=updated.get("refresh_expires_at"),
+                            refresh_expires_in=updated.get("refresh_expires_in"),
+                            access_obtained_at=updated.get("access_obtained_at"),
                         )
                     except Exception as save_err:
                         logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
@@ -978,6 +993,8 @@ async def _refresh_meta_token(
     db_pool=None,
     user_id: str = None,
     token_row_id: str | None = None,
+    *,
+    force: bool = False,
 ) -> dict:
     """Refresh a Meta (Instagram/Facebook) Page access token.
     
@@ -988,8 +1005,20 @@ async def _refresh_meta_token(
     If the user token has expired entirely, returns original token_data and logs a warning
     so publish proceeds and fails with a clear error rather than silently skipping.
     """
+    from core.platform_token_expiry import should_refresh_access_token
+
+    plat = str(platform or "").lower()
+    if not force and not should_refresh_access_token(plat, token_data):
+        return token_data
+
     access_token = token_data.get("access_token")
-    if not access_token:
+    # Prefer long-lived user token for fb_exchange_token; page tokens often cannot re-exchange.
+    exchange_token = (
+        token_data.get("meta_user_token")
+        or token_data.get("user_access_token")
+        or access_token
+    )
+    if not exchange_token:
         return token_data
 
     app_id = os.environ.get("META_APP_ID", "") or os.environ.get("FACEBOOK_CLIENT_ID", "")
@@ -1001,14 +1030,14 @@ async def _refresh_meta_token(
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            # Step 1: Exchange current token for a fresh long-lived user token
+            # Step 1: Exchange user (preferred) token for a fresh long-lived user token
             exchange_resp = await client.get(
                 "https://graph.facebook.com/v18.0/oauth/access_token",
                 params={
                     "grant_type": "fb_exchange_token",
                     "client_id": app_id,
                     "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
+                    "fb_exchange_token": exchange_token,
                 },
             )
             if exchange_resp.status_code != 200:
@@ -1040,11 +1069,26 @@ async def _refresh_meta_token(
                     matching = next((p for p in pages if p.get("id") == page_id), None)
                     if matching:
                         new_page_token = matching.get("access_token", new_user_token)
-                        updated = {
-                            **token_data,
-                            "access_token": new_page_token,
-                            "expires_at": None,  # Page tokens from LLT don't expire
-                        }
+                        from core.platform_token_expiry import stamp_token_expiry
+
+                        exchange_body = {}
+                        try:
+                            exchange_body = exchange_resp.json() or {}
+                        except Exception:
+                            exchange_body = {}
+                        updated = stamp_token_expiry(
+                            {
+                                **token_data,
+                                "access_token": new_page_token,
+                                "meta_user_token": new_user_token,
+                            },
+                            non_expiring=True,
+                        )
+                        if exchange_body.get("expires_in"):
+                            user_stamp = stamp_token_expiry(
+                                {}, expires_in=exchange_body.get("expires_in")
+                            )
+                            updated["meta_user_expires_at"] = user_stamp.get("expires_at")
                         if db_pool and user_id:
                             try:
                                 await db_stage.save_refreshed_token(
@@ -1053,6 +1097,13 @@ async def _refresh_meta_token(
                                     platform=platform,
                                     access_token=new_page_token,
                                     token_row_id=token_row_id,
+                                    expires_at=None,
+                                    access_obtained_at=updated.get("access_obtained_at"),
+                                    access_non_expiring=True,
+                                    extra_plain={
+                                        "meta_user_token": new_user_token,
+                                        "meta_user_expires_at": updated.get("meta_user_expires_at"),
+                                    },
                                 )
                             except Exception as save_err:
                                 logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -1112,15 +1163,28 @@ async def _refresh_meta_token(
                     )
 
             # Build updated blob — preserve any existing IDs, override with recovered ones
-            updated = {
-                **token_data,
-                "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
-                "expires_at":    None,
-            }
+            from core.platform_token_expiry import stamp_token_expiry
+
+            exchange_expires_in = None
+            try:
+                exchange_expires_in = exchange_resp.json().get("expires_in")
+            except Exception:
+                exchange_expires_in = None
+            updated = stamp_token_expiry(
+                {
+                    **token_data,
+                    "access_token": recovered_page_token if platform == "instagram" else new_user_token,
+                    "meta_user_token": new_user_token,
+                },
+                non_expiring=True,
+            )
+            if exchange_expires_in:
+                user_stamp = stamp_token_expiry({}, expires_in=exchange_expires_in)
+                updated["meta_user_expires_at"] = user_stamp.get("expires_at")
             if platform == "instagram" and recovered_ig_user_id:
                 updated["ig_user_id"] = recovered_ig_user_id
             if platform == "facebook" and recovered_page_id:
-                updated["page_id"]    = recovered_page_id
+                updated["page_id"] = recovered_page_id
                 updated["access_token"] = recovered_page_token
 
             if db_pool and user_id:
@@ -1131,6 +1195,15 @@ async def _refresh_meta_token(
                         platform=platform,
                         access_token=updated["access_token"],
                         token_row_id=token_row_id,
+                        expires_at=None,
+                        access_obtained_at=updated.get("access_obtained_at"),
+                        access_non_expiring=True,
+                        extra_plain={
+                            "meta_user_token": new_user_token,
+                            "meta_user_expires_at": updated.get("meta_user_expires_at"),
+                            "ig_user_id": updated.get("ig_user_id"),
+                            "page_id": updated.get("page_id"),
+                        },
                     )
                 except Exception as save_err:
                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -1227,8 +1300,13 @@ async def publish_to_tiktok(
 
     Flow: init upload -> PUT binary to upload_url -> returns publish_id
     """
-    # Always refresh token first — TikTok access tokens expire after 24 hours
-    token_data = await _refresh_tiktok_token(token_data, db_pool=db_pool, user_id=getattr(ctx, "user_id", None))
+    # Refresh when within lead time of expiry (absolute expires_at / legacy TTL).
+    token_data = await _refresh_tiktok_token(
+        token_data,
+        db_pool=db_pool,
+        user_id=getattr(ctx, "user_id", None),
+        token_row_id=token_row_id,
+    )
 
     access_token = token_data.get("access_token")
     if not access_token:
@@ -1441,11 +1519,18 @@ async def _refresh_youtube_token(
     db_pool=None,
     user_id: str = None,
     token_row_id: str | None = None,
+    *,
+    force: bool = False,
 ) -> dict:
     """Attempt to refresh a YouTube access token using the stored refresh_token.
     Returns updated token_data dict with new access_token, or original if refresh fails.
     Persists updated token to DB if db_pool and user_id are provided.
     """
+    from core.platform_token_expiry import should_refresh_access_token
+
+    if not force and not should_refresh_access_token("youtube", token_data):
+        return token_data
+
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
         logger.warning("YouTube: No refresh_token stored, cannot refresh")
@@ -1472,11 +1557,16 @@ async def _refresh_youtube_token(
             if resp.status_code == 200:
                 new_tokens = resp.json()
                 logger.info("YouTube: Token refreshed successfully")
+                from core.platform_token_expiry import stamp_token_expiry
+
                 new_access = new_tokens["access_token"]
-                updated = {
-                    **token_data,
-                    "access_token": new_access,
-                }
+                updated = stamp_token_expiry(
+                    {
+                        **token_data,
+                        "access_token": new_access,
+                    },
+                    expires_in=new_tokens.get("expires_in") or 3600,
+                )
                 if db_pool and user_id:
                     try:
                         await db_stage.save_refreshed_token(
@@ -1485,6 +1575,10 @@ async def _refresh_youtube_token(
                             platform="youtube",
                             access_token=new_access,
                             token_row_id=token_row_id,
+                            expires_at=updated.get("expires_at"),
+                            expires_in=updated.get("expires_in"),
+                            access_obtained_at=updated.get("access_obtained_at"),
+                            access_non_expiring=False,
                         )
                     except Exception as save_err:
                         logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")
@@ -1502,13 +1596,19 @@ async def publish_to_youtube(
     ctx: JobContext,
     token_data: dict,
     db_pool=None,
+    token_row_id: str | None = None,
 ) -> PlatformResult:
     """Publish video to YouTube using resumable upload (Shorts vs long-form via snippet + URL).
 
     Flow: POST metadata (get Location header) -> PUT binary -> video_id
     """
-    # Always refresh token first — YouTube access tokens expire after 1 hour
-    token_data = await _refresh_youtube_token(token_data, db_pool=db_pool, user_id=getattr(ctx, "user_id", None))
+    # Refresh when within lead time of expiry (absolute expires_at / legacy TTL).
+    token_data = await _refresh_youtube_token(
+        token_data,
+        db_pool=db_pool,
+        user_id=getattr(ctx, "user_id", None),
+        token_row_id=token_row_id,
+    )
 
     access_token = token_data.get("access_token")
     if not access_token:
@@ -1702,6 +1802,7 @@ async def publish_to_instagram(
     token_data: dict,
     video_url: Optional[str] = None,
     db_pool=None,
+    token_row_id: str | None = None,
 ) -> PlatformResult:
     """Publish video to Instagram Reels via Graph API.
 
@@ -1718,9 +1819,13 @@ async def publish_to_instagram(
       - Publicly accessible video URL (presigned R2 or public R2)
       - instagram_content_publish permission on the access token
     """
-    # Refresh Meta token before use — long-lived tokens expire after ~60 days
+    # Refresh when within Meta lead window (or unknown age for non-expiring page tokens).
     token_data = await _refresh_meta_token(
-        token_data, "instagram", db_pool=db_pool, user_id=getattr(ctx, "user_id", None)
+        token_data,
+        "instagram",
+        db_pool=db_pool,
+        user_id=getattr(ctx, "user_id", None),
+        token_row_id=token_row_id,
     )
 
     access_token = token_data.get("access_token")
@@ -2034,6 +2139,7 @@ async def publish_to_facebook(
     token_data: dict,
     video_url: Optional[str] = None,
     db_pool=None,
+    token_row_id: str | None = None,
 ) -> PlatformResult:
     """Publish video to Facebook as a Reel.
 
@@ -2043,9 +2149,13 @@ async def publish_to_facebook(
 
     As of June 2025, all Facebook videos are treated as Reels.
     """
-    # Refresh Meta token before use — long-lived tokens expire after ~60 days
+    # Refresh when within Meta lead window (or unknown age for non-expiring page tokens).
     token_data = await _refresh_meta_token(
-        token_data, "facebook", db_pool=db_pool, user_id=getattr(ctx, "user_id", None)
+        token_data,
+        "facebook",
+        db_pool=db_pool,
+        user_id=getattr(ctx, "user_id", None),
+        token_row_id=token_row_id,
     )
 
     access_token = token_data.get("access_token")
@@ -2565,18 +2675,30 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 )
 
             elif platform == "youtube":
-                result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
+                result = await publish_to_youtube(
+                    video_file, ctx, token_data, db_pool=db_pool, token_row_id=token_id
+                )
 
             elif platform == "instagram":
                 video_url = _get_video_public_url(ctx, "instagram")
                 result = await publish_to_instagram(
-                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+                    video_file,
+                    ctx,
+                    token_data,
+                    video_url=video_url,
+                    db_pool=db_pool,
+                    token_row_id=token_id,
                 )
 
             elif platform == "facebook":
                 video_url = _get_video_public_url(ctx, "facebook")
                 result = await publish_to_facebook(
-                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+                    video_file,
+                    ctx,
+                    token_data,
+                    video_url=video_url,
+                    db_pool=db_pool,
+                    token_row_id=token_id,
                 )
 
             else:

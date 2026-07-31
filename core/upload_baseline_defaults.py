@@ -107,8 +107,8 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "trillMinScore": 60,
     "trill_ai_enhance": True,
     "trillAiEnhance": True,
-    "trill_openai_model": "gpt-4o-mini",
-    "trillOpenaiModel": "gpt-4o-mini",
+    "trill_openai_model": "gpt-4o",
+    "trillOpenaiModel": "gpt-4o",
     # Per-service AI toggles (Settings page mirrors these keys)
     "ai_service_telemetry": True,
     "aiServiceTelemetry": True,

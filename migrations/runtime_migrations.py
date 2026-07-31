@@ -2162,6 +2162,11 @@ async def run_migrations(db_pool):
                     )
                     WHERE status IN ('pending', 'accepted');
             """),
+            # Caption Smart Model default: gpt-4o for new preference rows (no mass UPDATE).
+            (1100, """
+                ALTER TABLE user_preferences
+                    ALTER COLUMN trill_openai_model SET DEFAULT 'gpt-4o';
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

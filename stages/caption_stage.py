@@ -62,7 +62,13 @@ from services.pipeline_ai_trace import record_ai_pipeline_trace
 logger = logging.getLogger("uploadm8-worker.caption")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_CAPTION_MODEL", "gpt-4o-mini")
+from core.openai_caption_model import (
+    DEFAULT_OPENAI_CAPTION_MODEL,
+    resolve_openai_caption_model,
+)
+
+# Env OPENAI_CAPTION_MODEL wins when allowlisted; else gpt-4o (see core.openai_caption_model).
+OPENAI_MODEL_DEFAULT = DEFAULT_OPENAI_CAPTION_MODEL
 
 # M8_ENGINE path: scene graph + user-seeded content_strategy → OpenAI JSON → rank → ctx.
 # Set UPLOADM8_M8_CAPTION_ENGINE=false to force the legacy single-prompt narrative path only.
@@ -1520,7 +1526,7 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
     pref_max = max(1, min(pref_max, 50))
     hashtag_count = pref_max if generate_hashtags else 0
 
-    model = str(us.get("trillOpenaiModel") or us.get("openai_model") or OPENAI_MODEL_DEFAULT)
+    model = resolve_openai_caption_model(us)
 
     # ── Frame count: entitlement ceiling × user setting, clamped 2–12 ────────
     max_caption_frames = getattr(ctx.entitlements, "max_caption_frames", 6) or 6

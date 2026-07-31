@@ -64,7 +64,7 @@ from services.pipeline_ai_trace import record_ai_pipeline_trace
 
 logger = logging.getLogger("uploadm8-worker.m8")
 
-M8_ENGINE_VERSION = "1.3.0"
+M8_ENGINE_VERSION = "1.4.0"
 
 # When uploads reach caption before platforms are persisted, or transcode was skipped with
 # an empty ``platforms`` row, M8 must still rank + write per-platform captions. Matches
@@ -72,6 +72,132 @@ M8_ENGINE_VERSION = "1.3.0"
 M8_DEFAULT_PLATFORMS: Tuple[str, ...] = ("youtube", "instagram", "facebook", "tiktok")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# Completion budget: enough room for craft (~220 prose + ~40 JSON per variant).
+_M8_COMPLETION_CLAMP = 16000
+_M8_COMPLETION_FLOOR = 5200
+_M8_TOKENS_PER_VARIANT = 280
+_M8_SCENE_GRAPH_CHAR_BUDGET = 24000
+
+# Priority keys kept whole when serializing scene graph for the prompt.
+_M8_SG_PRIORITY_KEYS: Tuple[str, ...] = (
+    "hydration_story",
+    "scene_story",
+    "timeline",
+    "geo",
+    "music",
+    "dashcam_osd",
+    "transcript",
+    "trill",
+    "platforms",
+    "category",
+    "audio_environment",
+    "fusion_narrative",
+    "trend_intel",
+    "video_intelligence",
+    "vision",
+    "video_understanding",
+    "telemetry",
+)
+
+
+def m8_completion_budget(n_platforms: int, *, include_matrix: bool = False) -> int:
+    """Main-variant completion budget. Matrix must use a separate call/budget."""
+    n = max(1, int(n_platforms or 1))
+    base = max(_M8_COMPLETION_FLOOR, _M8_TOKENS_PER_VARIANT * n * 5)
+    # Matrix is never shared with this budget; caller runs a second pass if needed.
+    _ = include_matrix
+    return min(_M8_COMPLETION_CLAMP, int(base))
+
+
+def m8_temperature_for_tone(tone_ui: str) -> float:
+    """Scale sampling heat from TONE intensity facet (1–5)."""
+    try:
+        intensity = int((_m8_tone_directive(tone_ui).get("facets") or {}).get("intensity") or 2)
+    except Exception:
+        intensity = 2
+    intensity = max(1, min(5, intensity))
+    return round(0.55 + 0.08 * intensity, 3)
+
+
+def serialize_scene_graph_for_prompt(
+    scene_graph: Dict[str, Any],
+    *,
+    char_budget: int = _M8_SCENE_GRAPH_CHAR_BUDGET,
+) -> str:
+    """Serialize scene graph without mid-string JSON cuts.
+
+    Keeps high-value keys intact; drops whole low-value / bulky subtrees until
+    under ``char_budget``. Never returns a truncated mid-object string.
+    """
+    if not isinstance(scene_graph, dict):
+        return "{}"
+    budget = max(2000, int(char_budget or _M8_SCENE_GRAPH_CHAR_BUDGET))
+
+    def _dump(obj: Any) -> str:
+        return json.dumps(obj, indent=2, default=str)
+
+    # Start with a shallow copy; progressively strip bulky lists under vision/VI.
+    working: Dict[str, Any] = dict(scene_graph)
+    text = _dump(working)
+    if len(text) <= budget:
+        return text
+
+    # Drop bulky low-value fields first.
+    drop_candidates = (
+        ("vision", "raw_frames"),
+        ("vision", "frame_details"),
+        ("vision", "labels"),
+        ("vision", "objects"),
+        ("video_intelligence", "object_tracks"),
+        ("video_intelligence", "shot_changes"),
+        ("video_intelligence", "raw"),
+        ("telemetry", "points"),
+        ("telemetry", "series"),
+        ("trend_intel", "rows"),
+        ("audio_environment", "yamnet_events"),
+    )
+    for parent, child in drop_candidates:
+        node = working.get(parent)
+        if isinstance(node, dict) and child in node:
+            node = dict(node)
+            node.pop(child, None)
+            working[parent] = node
+            text = _dump(working)
+            if len(text) <= budget:
+                return text
+
+    # Keep only priority keys (+ any remaining small scalars).
+    slim: Dict[str, Any] = {}
+    for key in _M8_SG_PRIORITY_KEYS:
+        if key in working:
+            slim[key] = working[key]
+    text = _dump(slim)
+    if len(text) <= budget:
+        return text
+
+    # Last resort: truncate large string leaves inside priority keys, not the JSON wrapper.
+    for key in list(slim.keys()):
+        val = slim[key]
+        if isinstance(val, str) and len(val) > 800:
+            slim[key] = val[:800] + "…"
+        elif isinstance(val, dict):
+            trimmed = dict(val)
+            for sk, sv in list(trimmed.items()):
+                if isinstance(sv, str) and len(sv) > 600:
+                    trimmed[sk] = sv[:600] + "…"
+                elif isinstance(sv, list) and len(sv) > 12:
+                    trimmed[sk] = sv[:12]
+            slim[key] = trimmed
+        elif isinstance(val, list) and len(val) > 16:
+            slim[key] = val[:16]
+        text = _dump(slim)
+        if len(text) <= budget:
+            return text
+
+    # Absolute floor: priority spine only as compact JSON (still valid).
+    spine = {k: slim[k] for k in ("hydration_story", "timeline", "geo", "music", "dashcam_osd", "platforms") if k in slim}
+    return _dump(spine)
 
 
 def _effective_m8_platforms(ctx: JobContext) -> List[str]:
@@ -903,17 +1029,28 @@ def _build_m8_prompt(
 
     hashtag_rule = ""
     if generate_hashtags and hashtag_count > 0:
+        style_defs = {
+            "lowercase": "all tags lowercase single tokens (dashcamride)",
+            "capitalized": "TitleCase or CapitalizedWords for readability (DashcamRide)",
+            "camelcase": "camelCase discovery tags (dashcamRide)",
+            "mixed": "mix niche proper nouns with lowercase community tags",
+            "trending": "favor timely niche search terms from trend_intel / music / place — still evidenced",
+            "niche": "deep vertical tags only (artist, road, vehicle, protected land) — no broad lifestyle tags",
+        }
+        style_hint = style_defs.get(hashtag_style, style_defs["mixed"])
         hashtag_rule = (
             f"Include exactly {hashtag_count} hashtags per variant as JSON array of words "
-            f"WITHOUT '#'. Style: {hashtag_style}. "
+            f"WITHOUT '#'. Style: {hashtag_style} — {style_hint}. "
             "Each tag must be a concrete niche/topic/search term (artist fragment, hobby, vehicle, place type). "
             "When scene_graph.geo.gazetteer_place, geo.protected_area_name, or geo.near_protected_land are set, "
             "include at least one discovery tag tied to that real place or protected-land context (no false claims). "
             "When scene_graph.transcript.text, music.*, or audio_environment (e.g. yamnet_events) are populated, "
             "derive several tags from those signals (spoken topics, song title/artist fragments, ambient sound cues) "
             "so discovery matches what viewers hear — not only generic visuals. "
-            "NEVER use meta filler: cinematic, caption, viral, content, video, reels, trending, photography, "
-            "youtube, tiktok, instagram, follow, like, subscribe."
+            "Prefer scene_graph.timeline beats, video_intelligence logos / brand OCR, geo, landmarks, music. "
+            "NEVER use meta filler or weak Vision taxonomy: cinematic, caption, viral, content, video, reels, "
+            "trending, photography, youtube, tiktok, instagram, follow, like, subscribe, nature, horizon, "
+            "modeoftransport, colors, windshield, driving."
         )
     else:
         hashtag_rule = "Use empty [] for hashtags in every variant."
@@ -998,7 +1135,7 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
                 "evidence density is mandatory."
             )
 
-    sg = json.dumps(scene_graph, indent=2)[:24000]
+    sg = serialize_scene_graph_for_prompt(scene_graph)
 
     must_use_base = build_must_use_shortlist(scene_graph)
     must_use = merge_m8_must_use_tokens(must_use_base, ctx, max_tokens=12)
@@ -1021,12 +1158,12 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
         bullets = "\n".join(f"  - {tok}" for tok in must_use)
         need_n = 1 if freestyle else 2
         must_use_block = (
-            "\nMUST_USE EVIDENCE SHORTLIST (these tokens are FACTS from this clip — "
-            f"every winning caption AND title MUST contain at least {need_n} of these verbatim):\n"
+            "\nMUST_USE EVIDENCE SHORTLIST (facts from this clip — weave ≥"
+            f"{need_n} into every caption AND title verbatim when present):\n"
             f"{bullets}\n"
-            f"Variants that fail to use ≥{need_n} of these tokens will be REJECTED by the ranker "
-            "with a -200 score and CANNOT win, regardless of how good the prose sounds.\n"
-            "Prefer HUD speed SAMPLE tokens from the timeline/brief over a single suspicious peak.\n"
+            "Winning copy sounds specific because it uses these tokens naturally — "
+            "not because it stacks them as a checklist. Prefer HUD speed SAMPLE tokens "
+            "from the timeline/brief over a single suspicious peak.\n"
         )
         evidence_clusters: List[str] = []
         if any(("MPH" in t) or ("mph" in t) for t in must_use):
@@ -1146,12 +1283,35 @@ CAPTION EVIDENCE MATRIX (TikTok-style micro-captions, SAME frames + scene graph)
     try:
         from services.generic_hard_ban import m8_hard_ban_prompt_block
 
-        hard_ban_block = m8_hard_ban_prompt_block(limit=100)
+        hard_ban_block = m8_hard_ban_prompt_block(limit=60)
     except Exception:
         hard_ban_block = (
             "HARD-BAN: never use nature/horizon/modeoftransport/colors/vague category labels "
             "as title, caption, or hashtag.\n"
         )
+
+    creative_full = _m8_creative_directive_block(
+        caption_style, caption_tone, caption_voice_ui, variant_seed=_m8_variant_seed(ctx)
+    )
+    try:
+        from core.caption_creative import cell_micro_brief as _authority_micro
+
+        creative_spine = (
+            f"CREATIVE SPINE (obey for every variant — restated for recency): "
+            f"{_authority_micro(caption_style, caption_tone, caption_voice_ui)}. "
+            f"UI settings win for delivery; strategy is per-platform length/risk only."
+        )
+    except Exception:
+        creative_spine = (
+            f"CREATIVE SPINE: style={caption_style} tone={caption_tone} voice={caption_voice_ui} "
+            "(UI settings win for delivery)."
+        )
+    authority_line = (
+        f"CREATIVE AUTHORITY (single source — do not average with strategy slugs): "
+        f"style={caption_style} tone={caption_tone} voice={caption_voice_ui}. "
+        f"Strategy context (constraints only, not voice): policy_style={base_style} "
+        f"policy_tone={base_tone} policy_persona={base_persona}."
+    )
 
     return f"""You are {M8_ENGINE_AI_DISPLAY} - UploadM8's M8_ENGINE multimodal publishing brain
 (version {M8_ENGINE_VERSION}). You combine evidence from the scene graph with M8_ENGINE AI priors when provided.
@@ -1185,14 +1345,13 @@ ANTI-GENERIC RULES. If audio_environment or fusion_narrative describe ambience, 
 and hashtag tokens so posts match how the clip sounds, not only how it looks.
 
 {hydration_timeline_brief}
+{creative_full}
 SCENE GRAPH (evidence - do not invent beyond it; you may interpret visually grounded details):
 {sg}
 
 CATEGORY: {category}
-USER ACCOUNT SETTINGS (UI): caption_style={caption_style} caption_tone={caption_tone} caption_voice={caption_voice_ui}
-EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a license to flatten the user's voice): style={base_style} tone={base_tone} persona={base_persona}
+{authority_line}
 {_user_brand_directive(ctx)}
-{_m8_creative_directive_block(caption_style, caption_tone, caption_voice_ui, variant_seed=_m8_variant_seed(ctx))}
 {_task_prompt(generate_title, generate_caption, generate_hashtags)}
 
 {fusion}
@@ -1208,9 +1367,11 @@ EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a licens
 PLATFORM RULES:
 {chr(10).join(plat_blocks)}
 {matrix_section}
+{creative_spine}
 TASK:
 For EACH platform listed in scene_graph.platforms, output EXACTLY 5 variants ranked as "variant_index" 1..5.
 Each variant must feel meaningfully different (hook style, angle, emotion), not minor word swaps.
+Audible Style / Tone / Voice from the CREATIVE SPINE must be present in every variant.
 
 Fields per variant:
 - title: string or null (YouTube needs title; TikTok null)
@@ -1226,17 +1387,10 @@ ANTI-GENERIC RULES:
 - Do not claim the creator wrote/performed an original song if transcript_role is third_party_lyrics or music is identified as a known track unless Scene Graph explicitly says otherwise.
 - Do not write in first person as the recording artist (no "I channel", "my vocals", "my track") when lyrics are third-party unless the visuals show a clear performance.
 - Prefer concrete nouns from geo/OCR/telemetry/brands/landmarks over abstract hype.
-- NEVER use weak Vision taxonomy as title, caption, or hashtag: nature, horizon, scenery,
-  landscape, outdoors, mode of transport, vehicle, car, road, sky, clouds, trees, water,
-  or any color word (blue/green/red/yellow/…). Those are detector categories, not stories.
-- When scene_graph.vision.recognition_summary or recognition_flat is present, treat it as
-  inventory of specific entities (year/make vehicles, brand logos, named products) — cite
-  those proper nouns only. Do NOT cite colors or coarse category labels.
-- HASHTAGS: Prefer scene_graph.timeline beats, video_intelligence logos / brand OCR, geo,
-  landmarks, music artist/title. Do NOT use coarse Vision detector labels (color, windshield,
-  boat, motorvehicle, lensflare, driving, nature, horizon, modeoftransport) ever.
-- Hashtags must read like real community search terms, not platform metadata or taxonomy.
-- Captions are prose-only: never paste JSON hashtag arrays or quoted hash-plus-bracket fragments into caption; use the hashtags array only.
+- Obey the HARD-BAN REGISTRY above for weak taxonomy / colors / vague categories (stated once — do not reintroduce those tokens).
+- When scene_graph.vision.recognition_summary or recognition_flat is present, cite specific entity proper nouns only.
+- Hashtags must read like real community search terms (see hashtag Style rule above).
+- Captions are prose-only: never paste JSON hashtag arrays into caption; use the hashtags array only.
 - No Unicode emojis or emoticons in any title or caption field.
 
 Return ONLY valid JSON (no markdown) in this exact shape:
@@ -1695,11 +1849,72 @@ def _hook_strength_score(text: str) -> float:
     score = 0.0
     if "?" in first:
         score += 2.0
-    if any(k in first for k in ("when", "why", "how", "this", "pov", "today")):
+    # Reward concrete openers; do NOT reward "pov" / "this" (banned clickbait shapes).
+    if any(k in first for k in ("when", "why", "how", "today", "near", "mph", "on ")):
         score += 3.0
     if len(first.split()) <= 16:
         score += 2.0
     return score
+
+
+def _facet_adherence_score(
+    caption: str,
+    title: str,
+    *,
+    style_ui: str = "",
+    tone_ui: str = "",
+    voice_ui: str = "",
+) -> float:
+    """Reward copy that matches STYLE length / TONE punctuation / VOICE POV facets."""
+    blob = f"{caption or ''} {title or ''}".strip()
+    if not blob:
+        return -4.0
+    score = 0.0
+    try:
+        style = _m8_style_directive(style_ui or "story")
+        tone = _m8_tone_directive(tone_ui or "authentic")
+        voice = _m8_voice_directive(voice_ui or "default")
+    except Exception:
+        return 0.0
+
+    length_spec = str((style.get("facets") or {}).get("length") or "").lower()
+    cap_len = len((caption or "").strip())
+    if "under 120" in length_spec:
+        score += 6.0 if cap_len and cap_len <= 140 else (-4.0 if cap_len > 220 else 0.0)
+    elif "under 200" in length_spec:
+        score += 4.0 if cap_len and cap_len <= 220 else (-3.0 if cap_len > 320 else 0.0)
+    elif "150" in length_spec and "320" in length_spec:
+        score += 5.0 if 140 <= cap_len <= 340 else (-3.0 if cap_len and cap_len < 80 else 0.0)
+    elif "100" in length_spec and "220" in length_spec:
+        score += 4.0 if 90 <= cap_len <= 240 else 0.0
+    elif "140" in length_spec and "280" in length_spec:
+        score += 4.0 if 120 <= cap_len <= 300 else 0.0
+
+    punct = str((tone.get("facets") or {}).get("punctuation") or "").lower()
+    if "no exclamation" in punct or "no exclamation marks" in punct:
+        score += 3.0 if "!" not in blob else -5.0
+    intensity = int((tone.get("facets") or {}).get("intensity") or 2)
+    bangs = blob.count("!")
+    if intensity <= 2 and bangs >= 2:
+        score -= 4.0
+    if intensity >= 4 and bangs == 0 and cap_len > 80:
+        score -= 1.0  # mild — high heat without any punch
+
+    pov = str((voice.get("facets") or {}).get("pov") or "").lower()
+    low = blob.lower()
+    if "third-person" in pov or "third person" in pov:
+        if re.search(r"\b(i|i'm|we're|we are)\b", low):
+            score -= 3.0
+        else:
+            score += 2.0
+    if "second person" in pov or "'you'" in pov or "you'-oriented" in pov:
+        if re.search(r"\byou\b", low):
+            score += 2.0
+    if "first-person" in pov or "first person" in pov or "shotgun" in pov:
+        if re.search(r"\b(i|i'm|we|we're)\b", low):
+            score += 2.0
+
+    return max(-12.0, min(14.0, score))
 
 
 def _quality_gate_penalty(platform: str, title: str, caption: str) -> float:
@@ -1832,6 +2047,9 @@ def score_variant(
     must_use: Optional[List[str]] = None,
     *,
     min_must_use: int = 2,
+    caption_style: str = "",
+    caption_tone: str = "",
+    caption_voice: str = "",
 ) -> Tuple[float, str]:
     """
     Return (score, rationale). Higher is better.
@@ -1847,6 +2065,13 @@ def score_variant(
     base += _length_score(platform, caption, title)
     base += _hook_strength_score(caption or title)
     base += _specificity_bonus(caption, title, scene_graph)
+    base += _facet_adherence_score(
+        caption,
+        title,
+        style_ui=caption_style,
+        tone_ui=caption_tone,
+        voice_ui=caption_voice,
+    )
     base -= _penalize_generic(caption + " " + title)
     base -= _attribution_penalty(caption, title, scene_graph)
     base -= _quality_gate_penalty(platform, title, caption)
@@ -1854,6 +2079,15 @@ def score_variant(
     tags = variant.get("hashtags") or []
     if isinstance(tags, list):
         base -= penalize_generic_vision_hashtags(tags)
+        # Positive reward: tags that overlap scene evidence tokens.
+        if must_use:
+            hit = 0
+            tag_blob = " ".join(str(t).lower() for t in tags)
+            for tok in must_use[:8]:
+                t = str(tok or "").lower().strip().lstrip("#")
+                if len(t) > 2 and t in tag_blob:
+                    hit += 1
+            base += min(6.0, hit * 2.0)
 
     # Hard evidence-coverage floor: any candidate that uses ZERO tokens from
     # the must_use shortlist when evidence exists scores -200. This is the
@@ -1876,7 +2110,7 @@ def score_variant(
         hist_note = " (+historical prior)"
 
     rationale = (
-        f"length/style fit + specificity{coverage_note} "
+        f"length/style fit + specificity + facet{coverage_note} "
         f"- generic/attribution penalties{hist_note}"
     )
     return base, rationale
@@ -1903,11 +2137,19 @@ def rank_and_select(
     must_use_base = build_must_use_shortlist(scene_graph)
     must_use = merge_m8_must_use_tokens(must_use_base, ctx, max_tokens=12)
     style_ui = ""
+    tone_ui = ""
+    voice_ui = ""
     if ctx is not None:
         us = getattr(ctx, "user_settings", None) or {}
         style_ui = str(us.get("captionStyle") or us.get("caption_style") or "").lower()
+        tone_ui = str(us.get("captionTone") or us.get("caption_tone") or "").lower()
+        voice_ui = str(us.get("captionVoice") or us.get("caption_voice") or "").lower()
     if not style_ui:
         style_ui = str(((strategy or {}).get("outputs") or {}).get("caption_style") or "").lower()
+    if not tone_ui:
+        tone_ui = str(((strategy or {}).get("outputs") or {}).get("tone") or "").lower()
+    if not voice_ui:
+        voice_ui = str(((strategy or {}).get("outputs") or {}).get("voice_persona") or "").lower()
     min_must = 1 if style_ui == "freestyle" else 2
 
     for pl in scene_graph.get("platforms") or []:
@@ -1921,7 +2163,15 @@ def rank_and_select(
             if not isinstance(v, dict):
                 continue
             sc, why = score_variant(
-                pl, v, scene_graph, historical_signals, must_use=must_use, min_must_use=min_must
+                pl,
+                v,
+                scene_graph,
+                historical_signals,
+                must_use=must_use,
+                min_must_use=min_must,
+                caption_style=style_ui,
+                caption_tone=tone_ui,
+                caption_voice=voice_ui,
             )
             item = {
                 "variant_index": v.get("variant_index"),
@@ -2303,11 +2553,13 @@ async def _call_openai_m8_json(
     model: str,
     max_completion_tokens: int = 3500,
     http_timeout_sec: float = 120.0,
+    temperature: float = 0.55,
 ) -> Tuple[Dict[str, Any], Dict[str, int], str]:
     """Vision + JSON response.
 
     Returns ``(parsed, tokens, error_class)`` where ``error_class`` is empty on
-    success, or e.g. ``openai_quota`` / ``http_400`` / ``parse_failed``.
+    success, or e.g. ``openai_quota`` / ``http_400`` / ``parse_failed`` /
+    ``length_truncated``.
     """
     if not OPENAI_API_KEY:
         logger.warning(
@@ -2333,12 +2585,17 @@ async def _call_openai_m8_json(
             logger.warning("M8: could not attach frame %s: %s", frame, e)
 
     tokens = {"prompt": 0, "completion": 0}
-    mc = max(800, min(int(max_completion_tokens or 3500), 16000))
+    mc = max(800, min(int(max_completion_tokens or 3500), _M8_COMPLETION_CLAMP))
+    try:
+        temp = float(temperature)
+    except (TypeError, ValueError):
+        temp = 0.55
+    temp = max(0.2, min(1.2, temp))
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": mc,
-        "temperature": 0.55,
+        "temperature": temp,
         "response_format": {"type": "json_object"},
     }
     resp: Optional[httpx.Response] = None
@@ -2388,14 +2645,25 @@ async def _call_openai_m8_json(
             "prompt": int(usage.get("prompt_tokens") or 0),
             "completion": int(usage.get("completion_tokens") or 0),
         }
-        raw = data["choices"][0]["message"]["content"]
+        choice0 = (data.get("choices") or [{}])[0] if isinstance(data.get("choices"), list) else {}
+        finish_reason = str((choice0 or {}).get("finish_reason") or "").strip().lower()
+        raw = ((choice0 or {}).get("message") or {}).get("content") or ""
         if "```" in raw:
             raw = raw.split("```", 1)[-1].split("```", 1)[0]
         try:
             parsed = json.loads(raw.strip())
         except json.JSONDecodeError as e:
-            logger.warning("M8 Engine JSON parse failed: %s", e)
+            logger.warning("M8 Engine JSON parse failed: %s (finish_reason=%s)", e, finish_reason)
+            if finish_reason == "length":
+                return {}, tokens, "length_truncated"
             return {}, tokens, "parse_failed"
+        if finish_reason == "length":
+            # Parsed but likely truncated mid-structure — treat as soft length failure
+            # when platforms look incomplete so the ladder can expand budget.
+            plats = parsed.get("platforms") if isinstance(parsed, dict) else None
+            if not isinstance(plats, dict) or not plats:
+                return {}, tokens, "length_truncated"
+            logger.warning("M8 Engine finish_reason=length with partial JSON; using parsed payload")
         return parsed, tokens, ""
     except asyncio.CancelledError:
         raise
@@ -2639,6 +2907,8 @@ async def run_m8_caption_engine(
             )
         except Exception as e:
             logger.debug("M8 extra strategy context skipped: %s", e)
+    # Main variants never share completion budget with the evidence matrix.
+    # Matrix stays off-by-default; when enabled, request it in a later expand tier only.
     prompt = _build_m8_prompt(
         ctx,
         scene,
@@ -2652,26 +2922,13 @@ async def run_m8_caption_engine(
         generate_hashtags,
         historical=historical,
         strategy=strategy,
-        include_evidence_matrix=include_mat,
+        include_evidence_matrix=False,
         caption_voice_ui=str(caption_voice or "default").lower(),
         extra_strategy_block=extra_strategy_block,
     )
-    _trace_m8(ctx, str(ctx.upload_id), "prompt", {
-        "model": model,
-        "prompt_chars": len(prompt),
-        "prompt_preview": prompt,
-        "frame_count": len(frames),
-        "include_matrix": bool(include_mat),
-    })
-
-    n_matrix = len(_evidence_matrix_cell_specs(caption_style, caption_tone, caption_voice))
-    max_compl = 7800 if include_mat else 3500
-    http_to = 200.0 if include_mat else 120.0
-
-    # Compact prompt (no evidence matrix) for retry ladder after full fails.
-    compact_prompt = prompt
+    matrix_prompt = ""
     if include_mat:
-        compact_prompt = _build_m8_prompt(
+        matrix_prompt = _build_m8_prompt(
             ctx,
             scene,
             category,
@@ -2684,35 +2941,72 @@ async def run_m8_caption_engine(
             generate_hashtags,
             historical=historical,
             strategy=strategy,
-            include_evidence_matrix=False,
+            include_evidence_matrix=True,
             caption_voice_ui=str(caption_voice or "default").lower(),
             extra_strategy_block=extra_strategy_block,
         )
-    # Soft cap oversized prompts (Vision + huge fusion dumps → 400/timeouts).
+    _trace_m8(ctx, str(ctx.upload_id), "prompt", {
+        "model": model,
+        "prompt_chars": len(prompt),
+        "prompt_preview": prompt,
+        "frame_count": len(frames),
+        "include_matrix": bool(include_mat),
+        "matrix_deferred": bool(include_mat),
+    })
+
+    n_matrix = len(_evidence_matrix_cell_specs(caption_style, caption_tone, caption_voice))
+    n_plats = len([p for p in (scene.get("platforms") or []) if p]) or len(M8_DEFAULT_PLATFORMS)
+    max_compl = m8_completion_budget(n_plats, include_matrix=False)
+    expand_compl = min(_M8_COMPLETION_CLAMP, max(max_compl + 2000, int(max_compl * 1.35)))
+    matrix_compl = min(_M8_COMPLETION_CLAMP, 4000)
+    http_to = 120.0
+    temperature = m8_temperature_for_tone(caption_tone)
+
+    compact_prompt = prompt
+    # Soft cap oversized prompts at a section boundary when possible.
     if len(compact_prompt) > 28_000:
-        compact_prompt = compact_prompt[:28_000].rstrip() + "\n…[prompt trimmed]"
+        cut_at = compact_prompt.rfind("\nPLATFORM RULES:", 0, 28_000)
+        if cut_at < 10_000:
+            cut_at = 28_000
+        compact_prompt = compact_prompt[:cut_at].rstrip() + "\n…[prompt trimmed]"
+
+    full_prompt = prompt if len(prompt) <= 48_000 else (
+        prompt[: prompt.rfind("\nPLATFORM RULES:", 0, 48_000) or 48_000].rstrip() + "\n…[prompt trimmed]"
+    )
 
     ladder = [
         {
             "tier": "full",
             "frames": list(frames[:6]),
-            "prompt": prompt if len(prompt) <= 48_000 else prompt[:48_000].rstrip() + "\n…[prompt trimmed]",
+            "prompt": full_prompt,
             "max_compl": max_compl,
             "http_to": http_to,
+            "temperature": temperature,
+        },
+        {
+            "tier": "full_expand",
+            "frames": list(frames[:6]),
+            "prompt": full_prompt,
+            "max_compl": expand_compl,
+            "http_to": 160.0,
+            "temperature": temperature,
+            "only_for": frozenset({"length_truncated", "parse_failed"}),
         },
         {
             "tier": "compact",
             "frames": list(frames[:2]),
             "prompt": compact_prompt,
-            "max_compl": 2500,
+            "max_compl": max(3500, max_compl // 2),
             "http_to": 90.0,
+            "temperature": temperature,
         },
         {
             "tier": "text_only",
             "frames": [],
             "prompt": compact_prompt,
-            "max_compl": 2000,
+            "max_compl": max(2500, max_compl // 3),
             "http_to": 60.0,
+            "temperature": max(0.4, temperature - 0.1),
         },
     ]
 
@@ -2722,17 +3016,27 @@ async def run_m8_caption_engine(
     used_tier = "none"
     # Terminal — do not burn more OpenAI calls after billing/key failures.
     _no_retry = frozenset({"openai_quota", "no_api_key"})
+    _expand_errors = frozenset({"length_truncated", "parse_failed"})
     for i, step in enumerate(ladder):
+        only_for = step.get("only_for")
+        if only_for is not None:
+            if i == 0 or err_class not in only_for:
+                continue
         if i > 0 and err_class in _no_retry:
             break
         if i > 0 and err_class == "openai_rate_limit":
             await asyncio.sleep(1.2)
+        # After expand, non-expand failures fall through to compact.
+        if step.get("tier") == "compact" and err_class in _expand_errors and used_tier == "full":
+            # expand was skipped or failed — continue to compact
+            pass
         parsed, tokens, err_class = await _call_openai_m8_json(
             frames=list(step["frames"]),
             prompt=str(step["prompt"]),
             model=model,
             max_completion_tokens=int(step["max_compl"]),
             http_timeout_sec=float(step["http_to"]),
+            temperature=float(step.get("temperature") or temperature),
         )
         used_tier = str(step["tier"])
         _trace_m8(ctx, str(ctx.upload_id), "llm_tier", {
@@ -2742,11 +3046,38 @@ async def run_m8_caption_engine(
             "frame_count": len(step["frames"]),
             "prompt_chars": len(str(step["prompt"])),
             "tokens": tokens,
+            "max_compl": int(step["max_compl"]),
+            "temperature": float(step.get("temperature") or temperature),
         })
         if parsed:
             break
         if err_class in _no_retry:
             break
+
+    # Optional second call: evidence matrix only (own budget — never competes with variants).
+    if parsed and include_mat and matrix_prompt:
+        try:
+            mat_parsed, mat_tokens, mat_err = await _call_openai_m8_json(
+                frames=list(frames[:2]),
+                prompt=matrix_prompt if len(matrix_prompt) <= 40_000 else matrix_prompt[:40_000],
+                model=model,
+                max_completion_tokens=matrix_compl,
+                http_timeout_sec=120.0,
+                temperature=temperature,
+            )
+            tokens = {
+                "prompt": int(tokens.get("prompt") or 0) + int(mat_tokens.get("prompt") or 0),
+                "completion": int(tokens.get("completion") or 0) + int(mat_tokens.get("completion") or 0),
+            }
+            if isinstance(mat_parsed, dict) and mat_parsed.get("caption_evidence_matrix"):
+                parsed["caption_evidence_matrix"] = mat_parsed.get("caption_evidence_matrix")
+            _trace_m8(ctx, str(ctx.upload_id), "matrix_pass", {
+                "ok": bool(mat_parsed),
+                "error_class": mat_err or "",
+                "tokens": mat_tokens,
+            })
+        except Exception as _mat_e:
+            logger.warning("M8 matrix second-pass skipped: %s", _mat_e)
 
     if not parsed:
         err = "openai_quota" if err_class == "openai_quota" else (err_class or "empty_or_failed")
@@ -2766,7 +3097,7 @@ async def run_m8_caption_engine(
         }
 
     matrix_san: Optional[Dict[str, Any]] = None
-    if include_mat and used_tier == "full":
+    if include_mat:
         matrix_san = _sanitize_evidence_matrix(
             parsed.get("caption_evidence_matrix") if isinstance(parsed, dict) else None,
             n_matrix,

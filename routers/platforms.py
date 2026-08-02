@@ -51,14 +51,31 @@ async def tiktok_creator_info(
     See https://developers.tiktok.com/doc/content-sharing-guidelines
     """
     user_id = resolve_billing_user_id(user)
+    requested_id = str(body.account_id).strip()
     token_data, identity = await db_stage.load_platform_token_with_identity(
         core.state.db_pool,
         user_id,
         "tiktok",
-        token_row_id=str(body.account_id).strip(),
+        token_row_id=requested_id,
     )
+    # Stale chip / group UUID after OAuth reconnect — fall back to sole live TikTok.
     if not token_data:
-        raise HTTPException(404, "TikTok account not found")
+        live_ids = await db_stage.load_all_platform_token_ids(
+            core.state.db_pool, user_id, "tiktok"
+        )
+        if len(live_ids) == 1:
+            token_data, identity = await db_stage.load_platform_token_with_identity(
+                core.state.db_pool,
+                user_id,
+                "tiktok",
+                token_row_id=live_ids[0],
+            )
+    if not token_data:
+        raise HTTPException(
+            404,
+            "TikTok account not found — refresh the page or reconnect TikTok "
+            "(selected account may be from a previous connection).",
+        )
 
     if isinstance(token_data, dict) and token_data.get("kid"):
         try:

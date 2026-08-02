@@ -1609,6 +1609,8 @@ async def load_platform_token_with_identity(
                     parsed["_account_name"] = row_dict.get("account_name", "")
                     parsed["_account_username"] = row_dict.get("account_username", "") or ""
                     parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
+                    if account_id_col:
+                        parsed["_platform_account_id"] = str(account_id_col)
                 return parsed, identity
 
             return None, None
@@ -1675,6 +1677,7 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
                 parsed["_token_id"] = str(row_dict.get("id", ""))
                 account_id_col = row_dict.get("account_id")
                 if account_id_col:
+                    parsed["_platform_account_id"] = str(account_id_col)
                     if row_dict.get("platform") == "instagram" and not parsed.get("ig_user_id"):
                         parsed["ig_user_id"] = str(account_id_col)
             return parsed

@@ -428,6 +428,32 @@ async def ml_engine_run(user: dict = Depends(require_admin)):
     return result
 
 
+@router.get("/ml/publish-hour-insights")
+async def ml_publish_hour_insights(
+    user: dict = Depends(require_admin),
+    timezone: str = Query("America/Chicago", min_length=1, max_length=64),
+):
+    """
+    Fleet best posting times: M8 hour priors + app-wide weekday×hour×platform combos.
+
+    Hours are remapped into ``timezone`` so admins can literally pinpoint clocks.
+    """
+    from services.best_posting_times import (
+        best_posting_times_fallback,
+        build_admin_publish_hour_insights,
+    )
+
+    if core.state.db_pool is None:
+        return best_posting_times_fallback(scope="fleet", error="database_unavailable")
+    try:
+        return await build_admin_publish_hour_insights(
+            core.state.db_pool, reference_timezone=timezone
+        )
+    except Exception:
+        logger.exception("GET /api/admin/ml/publish-hour-insights failed")
+        return best_posting_times_fallback(scope="fleet", error="publish_hour_insights_unavailable")
+
+
 @router.get("/ml/observability-trends")
 async def ml_observability_trends(days: int = Query(30, ge=7, le=90), user: dict = Depends(require_admin)):
     """

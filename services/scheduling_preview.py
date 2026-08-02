@@ -19,8 +19,8 @@ def smart_schedule_explanation(
             "time": dt.strftime("%I:%M %p UTC"),
             "iso": dt.isoformat(),
             "reason": (
-                f"Data-informed slot for {plat.title()} "
-                f"(engagement signals + momentum, shown in {user_timezone})"
+                f"Data-informed local slot for {plat.title()} "
+                f"(research priors + engagement signals, {user_timezone})"
             ),
         }
     return out

@@ -43,19 +43,43 @@ def slot_dates(row: dict[str, Any]) -> set[date]:
     return {dt.date() for dt in all_slot_datetimes(row)}
 
 
+def day_occupancy_from_today(
+    row: dict[str, Any],
+    *,
+    today: date,
+    num_days: int,
+    horizon: Optional[int] = None,
+) -> dict[int, int]:
+    """
+    1-based day offset → slot count for this upload.
+
+    ``horizon`` defaults to ``num_days``. Pass the smart-schedule expand horizon
+    so spill slots past the primary window stay visible for deconflict.
+    """
+    limit = int(horizon) if horizon is not None else int(num_days)
+    if limit < 1:
+        limit = int(num_days) if int(num_days) >= 1 else 1
+    occupancy: dict[int, int] = {}
+    for dt in all_slot_datetimes(row):
+        diff = (_aware(dt).date() - today).days
+        if 0 < diff <= limit:
+            occupancy[diff] = occupancy.get(diff, 0) + 1
+    return occupancy
+
+
 def day_offsets_from_today(
     row: dict[str, Any],
     *,
     today: date,
     num_days: int,
+    horizon: Optional[int] = None,
 ) -> set[int]:
     """1-based day offsets from ``today`` occupied by this upload."""
-    used: set[int] = set()
-    for d in slot_dates(row):
-        diff = (d - today).days
-        if 0 < diff <= num_days:
-            used.add(diff)
-    return used
+    return set(
+        day_occupancy_from_today(
+            row, today=today, num_days=num_days, horizon=horizon
+        )
+    )
 
 
 def slots_by_date(row: dict[str, Any]) -> dict[date, list[tuple[str, datetime]]]:
@@ -110,14 +134,33 @@ def compute_scheduled_stats(
     return {"pending": pending, "today": today, "week": week}
 
 
+def rows_for_day_occupancy(
+    rows: Iterable[dict[str, Any]],
+    *,
+    today: date,
+    num_days: int,
+    horizon: Optional[int] = None,
+) -> dict[int, int]:
+    """Merged occupancy map across rows (offset → slot count)."""
+    occupancy: dict[int, int] = {}
+    for row in rows:
+        for offset, count in day_occupancy_from_today(
+            row, today=today, num_days=num_days, horizon=horizon
+        ).items():
+            occupancy[offset] = occupancy.get(offset, 0) + count
+    return occupancy
+
+
 def rows_for_blocked_days(
     rows: Iterable[dict[str, Any]],
     *,
     today: date,
     num_days: int,
+    horizon: Optional[int] = None,
 ) -> set[int]:
-    """Union of day offsets occupied by rows."""
-    used: set[int] = set()
-    for row in rows:
-        used |= day_offsets_from_today(row, today=today, num_days=num_days)
-    return used
+    """Offsets with any occupancy (legacy set view)."""
+    return set(
+        rows_for_day_occupancy(
+            rows, today=today, num_days=num_days, horizon=horizon
+        )
+    )

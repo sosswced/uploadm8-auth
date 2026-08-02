@@ -1318,9 +1318,18 @@ async def publish_to_tiktok(
         )
 
     # TikTok Direct Post: `post_info.title` is the full caption (max 2200 UTF-16 runes).
+    # Rematch stale by_account keys (ghost target UUID / reconnect) via open_id.
+    _plat_acc = str(
+        token_data.get("_platform_account_id")
+        or token_data.get("open_id")
+        or token_data.get("union_id")
+        or ""
+    ).strip()
     tt_settings = resolve_tiktok_post_settings_for_account(
-        getattr(ctx, "tiktok_post_settings", None) or (ctx.user_settings or {}).get("tiktok_post_settings"),
+        getattr(ctx, "tiktok_post_settings", None)
+        or (ctx.user_settings or {}).get("tiktok_post_settings"),
         str(token_row_id or ""),
+        platform_account_id=_plat_acc or None,
     )
     if not tt_settings:
         return PlatformResult(

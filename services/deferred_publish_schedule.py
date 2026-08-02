@@ -86,17 +86,17 @@ def publish_target_key(platform: str, token_row_id: Any = None) -> str:
 
 def expected_publish_targets(upload_record: dict[str, Any]) -> list[tuple[str, Optional[str]]]:
     """
-    Return (platform, token_row_id) pairs the publish stage would attempt.
-    Mirrors publish_stage target resolution at a high level.
+    Platform-only targets ``(platform, None)`` from ``uploads.platforms``.
+
+    Does **not** map ``target_accounts`` to token IDs (needs a DB lookup of
+    ``platform_tokens``). Callers with resolved ``(platform, token_id)`` pairs
+    must use ``expected_publish_targets_resolved`` (see stuck_recovery).
     """
-    platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
-    target_accounts = upload_record.get("target_accounts") or []
-    if isinstance(target_accounts, str):
-        target_accounts = [target_accounts]
-    token_ids = [str(t).strip() for t in target_accounts if str(t).strip()]
-    if token_ids:
-        # Token -> platform mapping requires DB; callers with tokens pass resolved pairs.
-        return [(p, None) for p in platforms]
+    platforms = [
+        str(p).strip().lower()
+        for p in (upload_record.get("platforms") or [])
+        if str(p).strip()
+    ]
     return [(p, None) for p in platforms]
 
 

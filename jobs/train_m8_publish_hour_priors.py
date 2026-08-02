@@ -8,6 +8,7 @@ Usage (from repo root, with DATABASE_URL set):
 Optional env:
     M8_TRAIN_LOOKBACK_DAYS           default 420
     M8_TRAIN_PCI_ONLY                default 1 (require pci.published_at; 0 = COALESCE with upload times)
+    M8_TRAIN_AUTO_WIDEN_PCI          default 1 (if PCI-only < blend floor, refetch PCI+uploads once)
     M8_TRAIN_SOURCE_ALLOWLIST        e.g. uploadm8,linked (comma-separated, lower)
     M8_TRAIN_CONTENT_KIND_ALLOWLIST  e.g. reel,short (optional)
     M8_RELATED_OPS_INCIDENT_IDS     comma-separated UUIDs stored on m8_model_runs (postmortems)

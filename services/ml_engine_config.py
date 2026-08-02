@@ -34,6 +34,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class MLEngineConfig:
     enabled: bool
@@ -66,6 +73,13 @@ class MLEngineConfig:
     seed_bootstrap: bool
     seed_rows: int
     publish_min_roc_auc: float
+    # Content near-miss: ROC within epsilon of floor + ranking quality → allow Hub promote
+    publish_near_miss_epsilon: float
+    publish_min_ndcg_at_10: float
+    # Promo small-n / overfit protection (blocks Hub when AUC looks too good on few groups)
+    publish_min_user_groups: int
+    publish_overfit_roc_auc: float
+    publish_overfit_max_user_groups: int
 
     @property
     def hf_token_ok(self) -> bool:
@@ -146,7 +160,22 @@ def get_ml_engine_config() -> MLEngineConfig:
         ),
         seed_bootstrap=_env_bool("UM8_ML_ENGINE_SEED_BOOTSTRAP", default=False),
         seed_rows=max(8, _env_int("UM8_ML_ENGINE_SEED_ROWS", 60)),
-        publish_min_roc_auc=float(_env("UM8_ML_ENGINE_PUBLISH_MIN_ROC_AUC", "0.55") or 0.55),
+        publish_min_roc_auc=_env_float("UM8_ML_ENGINE_PUBLISH_MIN_ROC_AUC", 0.55),
+        publish_near_miss_epsilon=max(
+            0.0, _env_float("UM8_ML_ENGINE_PUBLISH_NEAR_MISS_EPS", 0.005)
+        ),
+        publish_min_ndcg_at_10=max(
+            0.0, min(1.0, _env_float("UM8_ML_ENGINE_PUBLISH_MIN_NDCG_AT_10", 0.55))
+        ),
+        publish_min_user_groups=max(
+            0, _env_int("UM8_ML_ENGINE_PUBLISH_MIN_USER_GROUPS", 80)
+        ),
+        publish_overfit_roc_auc=max(
+            0.5, min(1.0, _env_float("UM8_ML_ENGINE_PUBLISH_OVERFIT_ROC_AUC", 0.97))
+        ),
+        publish_overfit_max_user_groups=max(
+            0, _env_int("UM8_ML_ENGINE_PUBLISH_OVERFIT_MAX_GROUPS", 150)
+        ),
     )
 
 
@@ -172,6 +201,11 @@ def ml_engine_public_dict(cfg: Optional[MLEngineConfig] = None) -> Dict[str, Any
         "cold_start_max_lookback_days": c.cold_start_max_lookback_days,
         "seed_bootstrap": c.seed_bootstrap,
         "publish_min_roc_auc": c.publish_min_roc_auc,
+        "publish_near_miss_epsilon": c.publish_near_miss_epsilon,
+        "publish_min_ndcg_at_10": c.publish_min_ndcg_at_10,
+        "publish_min_user_groups": c.publish_min_user_groups,
+        "publish_overfit_roc_auc": c.publish_overfit_roc_auc,
+        "publish_overfit_max_user_groups": c.publish_overfit_max_user_groups,
         "use_hf_jobs": c.use_hf_jobs,
         "jobs_flavor": c.jobs_flavor,
         "jobs_timeout": c.jobs_timeout,

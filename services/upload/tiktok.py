@@ -52,6 +52,17 @@ def _validate_tiktok_post_settings_for_upload(data: Any, tiktok_account_ids: Lis
 
 
 def _validate_tiktok_by_account_settings(raw: Any, tiktok_account_ids: List[str]) -> None:
+    if not tiktok_account_ids:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "tiktok_account_required",
+                "message": (
+                    "No valid TikTok account selected. Reconnect TikTok or refresh "
+                    "the page and re-select the account before uploading."
+                ),
+            },
+        )
     if not isinstance(raw, dict) or not raw:
         raise HTTPException(
             400,

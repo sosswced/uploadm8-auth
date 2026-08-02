@@ -207,6 +207,8 @@ def evaluate_render_event_alerts(
         if et in seen_types:
             continue
         seen_types.add(et)
+        ev_id = str(ev.get("id") or "").strip()
+        ev_ts = str(ev.get("timestamp") or "").strip()
         alerts.append(
             FleetAlert(
                 incident_type=f"render_event_{et}"[:120],
@@ -215,7 +217,12 @@ def evaluate_render_event_alerts(
                     f"Live Render API reported ``{et}`` at {ev.get('timestamp')} "
                     f"({int(age)}s ago). Early signal — do not wait for the crash email."
                 ),
-                details={"event": ev, "age_sec": int(age)},
+                details={
+                    "event": ev,
+                    "age_sec": int(age),
+                    # Stable identity for ops alert dedupe (avoid 10m re-pages).
+                    "event_dedupe_id": ev_id or ev_ts or et,
+                },
                 severity="critical",
             )
         )
@@ -329,12 +336,19 @@ async def run_fleet_watchdog_once(db_pool, redis_client=None) -> Dict[str, Any]:
         )
         # Bucket counts so a worse fleet state can re-page inside the window,
         # but 2↔3 oscillation does not spam a unique key each tick.
+        # Render platform events: key by event id/timestamp so the same
+        # server_failed row is not re-paged every WATCHDOG_ALERT_DEDUPE_SECONDS
+        # while still inside the lookback window.
         af = alert.details.get("fleet") if isinstance(alert.details.get("fleet"), dict) else fleet
         alive_n = int(af.get("alive_count") or 0)
         rd_n = int(af.get("recent_dead_count") or 0)
         a_bucket = "0" if alive_n == 0 else ("1" if alive_n == 1 else "2p")
         rd_bucket = "0" if rd_n == 0 else ("1" if rd_n == 1 else "2p")
-        dedupe_key = f"watchdog:{alert.incident_type}:a{a_bucket}:rd{rd_bucket}"
+        if str(alert.incident_type or "").startswith("render_event_"):
+            ev_key = str(alert.details.get("event_dedupe_id") or "").strip() or "unknown"
+            dedupe_key = f"watchdog:{alert.incident_type}:{ev_key}"
+        else:
+            dedupe_key = f"watchdog:{alert.incident_type}:a{a_bucket}:rd{rd_bucket}"
         inc_id = await record_operational_incident(
             db_pool,
             source="worker_fleet_watchdog",

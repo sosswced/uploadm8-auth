@@ -11,7 +11,13 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
-from core.scheduling import calculate_smart_schedule, static_hour_prior_24
+from core.scheduling import (
+    calculate_smart_schedule,
+    static_hour_prior_24,
+    utc_weights_as_local,
+    _resolve_tz,
+)
+from core.helpers import _now_utc
 
 logger = logging.getLogger("uploadm8.smart_schedule")
 
@@ -162,15 +168,20 @@ async def _fetch_hour_scores_batch(
         SELECT platform, hr, score, n FROM (
             SELECT
                 lower(trim(plat.raw::text)) AS platform,
-                EXTRACT(HOUR FROM timezone('UTC', COALESCE(u.completed_at, u.created_at)))::int AS hr,
+                EXTRACT(
+                    HOUR FROM timezone(
+                        'UTC',
+                        COALESCE(u.scheduled_time, u.completed_at, u.created_at)
+                    )
+                )::int AS hr,
                 SUM(LN(GREATEST(COALESCE(u.views, 0), 0) + 1.0))::double precision AS score,
                 COUNT(*)::bigint AS n
             FROM uploads u
             CROSS JOIN LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS plat(raw)
             WHERE lower(trim(plat.raw::text)) = ANY($1::text[])
               AND u.status IN ('completed', 'succeeded', 'partial')
-              AND COALESCE(u.completed_at, u.created_at) >= $2
-              AND COALESCE(u.completed_at, u.created_at) < $3
+              AND COALESCE(u.scheduled_time, u.completed_at, u.created_at) >= $2
+              AND COALESCE(u.scheduled_time, u.completed_at, u.created_at) < $3
               {user_clause}
             GROUP BY 1, 2
         ) t
@@ -193,8 +204,12 @@ async def build_hour_weights_for_platform(
     conn: Any,
     user_id: str,
     platform: str,
+    *,
+    user_timezone: str = "UTC",
 ) -> List[float]:
-    batch = await build_hour_weights_for_platforms_batch(conn, user_id, [platform])
+    batch = await build_hour_weights_for_platforms_batch(
+        conn, user_id, [platform], user_timezone=user_timezone
+    )
     return batch.get(platform.strip().lower(), static_hour_prior_24(platform))
 
 
@@ -202,12 +217,21 @@ async def build_hour_weights_for_platforms_batch(
     conn: Any,
     user_id: str,
     platforms: Sequence[str],
+    *,
+    user_timezone: str = "UTC",
 ) -> Dict[str, List[float]]:
+    """
+    Return per-platform **local-hour** priors for ``user_timezone``.
+
+    Fleet / user / M8 vectors are learned in UTC publish hours, remapped into
+    local bins, then blended with static research priors (already local).
+    """
     plats = sorted({p.strip().lower() for p in platforms if p and str(p).strip()})
     if not plats:
         return {}
 
-    now = datetime.now(timezone.utc)
+    tz = _resolve_tz(user_timezone)
+    now = _now_utc()
     g_start = now - timedelta(days=_LOOKBACK_GLOBAL_DAYS)
     u_start = now - timedelta(days=_LOOKBACK_USER_DAYS)
     recent_start = now - timedelta(days=_RECENT_DAYS)
@@ -230,15 +254,19 @@ async def build_hour_weights_for_platforms_batch(
     for plat in plats:
         static_w = static_hour_prior_24(plat)
         global_vec, _ = global_batch.get(plat, ([0.0] * 24, 0))
-        global_w = _normalize(global_vec)
-        fleet_w = m8_batch.get(plat) or global_w
+        global_utc = _normalize(global_vec)
+        fleet_utc = m8_batch.get(plat) or global_utc
+        fleet_w = utc_weights_as_local(fleet_utc, tz, now)
 
         user_vec, user_n = user_batch.get(plat, ([0.0] * 24, 0))
-        user_w = _normalize(user_vec)
+        user_w = utc_weights_as_local(_normalize(user_vec), tz, now)
 
         recent_vec, _ = recent_batch.get(plat, ([0.0] * 24, 0))
         baseline_vec, _ = baseline_batch.get(plat, ([0.0] * 24, 0))
-        momentum = _momentum_multipliers(_normalize(recent_vec), _normalize(baseline_vec))
+        momentum = _momentum_multipliers(
+            utc_weights_as_local(_normalize(recent_vec), tz, now),
+            utc_weights_as_local(_normalize(baseline_vec), tz, now),
+        )
 
         if sum(global_vec) <= 0 and sum(user_vec) <= 0 and plat not in m8_batch:
             out[plat] = static_w
@@ -284,7 +312,8 @@ async def calculate_smart_schedule_data_driven(
     platforms: List[str],
     *,
     num_days: int = 14,
-    blocked_day_offsets: Optional[set] = None,
+    blocked_day_offsets: Optional[Any] = None,
+    day_occupancy: Optional[Any] = None,
     user_timezone: str = "UTC",
     random_seed: Optional[str] = None,
 ) -> Dict[str, datetime]:
@@ -294,7 +323,9 @@ async def calculate_smart_schedule_data_driven(
 
     hour_weights_by_platform: Dict[str, List[float]] = {}
     try:
-        batch = await build_hour_weights_for_platforms_batch(conn, user_id, platforms)
+        batch = await build_hour_weights_for_platforms_batch(
+            conn, user_id, platforms, user_timezone=user_timezone
+        )
         for p in sorted({str(x).strip().lower() for x in platforms if str(x).strip()}):
             hour_weights_by_platform[p] = batch.get(p, static_hour_prior_24(p))
     except Exception as e:
@@ -307,6 +338,8 @@ async def calculate_smart_schedule_data_driven(
         num_days=num_days,
         user_timezone=user_timezone,
         hour_weights_by_platform=hour_weights_by_platform,
+        hour_weights_are_local=True,
         blocked_day_offsets=blocked_day_offsets,
+        day_occupancy=day_occupancy,
         random_seed=random_seed,
     )

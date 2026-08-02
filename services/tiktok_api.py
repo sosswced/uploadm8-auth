@@ -373,6 +373,14 @@ def normalize_tiktok_post_settings(raw: Any) -> dict:
         "title": str(raw.get("title") or "").strip(),
         "user_consent": _coerce_bool(raw.get("user_consent"), False),
     }
+    pac = str(
+        raw.get("platform_account_id") or raw.get("open_id") or raw.get("account_id") or ""
+    ).strip()
+    if pac:
+        out["platform_account_id"] = pac
+    token_row = str(raw.get("token_row_id") or "").strip()
+    if token_row:
+        out["token_row_id"] = token_row
     if not out["commercial_disclosure_enabled"]:
         out["brand_organic"] = False
         out["brand_content"] = False
@@ -406,15 +414,45 @@ def validate_tiktok_post_settings(settings: Mapping[str, Any]) -> list[str]:
 def resolve_tiktok_post_settings_for_account(
     raw_settings: Any,
     account_id: str,
+    *,
+    platform_account_id: str | None = None,
 ) -> Optional[dict]:
-    """Look up per-account TikTok export settings saved on the upload."""
+    """Look up per-account TikTok export settings saved on the upload.
+
+    Exact ``platform_tokens.id`` match first. After OAuth reconnect or a stale
+    ``target_accounts`` UUID, rematch by TikTok open_id (``platform_account_id``)
+    or — for single-account uploads — the sole ``by_account`` entry.
+    """
     if not isinstance(raw_settings, dict):
         return None
     by_account = raw_settings.get("by_account")
     if isinstance(by_account, dict):
-        entry = by_account.get(str(account_id))
-        if isinstance(entry, dict):
-            return normalize_tiktok_post_settings(entry)
+        aid = str(account_id or "").strip()
+        if aid:
+            entry = by_account.get(aid)
+            if isinstance(entry, dict):
+                return normalize_tiktok_post_settings(entry)
+        pac = str(platform_account_id or "").strip()
+        if pac:
+            for entry in by_account.values():
+                if not isinstance(entry, dict):
+                    continue
+                entry_pac = str(
+                    entry.get("platform_account_id")
+                    or entry.get("open_id")
+                    or entry.get("account_id")
+                    or ""
+                ).strip()
+                if entry_pac and entry_pac == pac:
+                    return normalize_tiktok_post_settings(entry)
+        usable = [
+            e
+            for e in by_account.values()
+            if isinstance(e, dict) and str(e.get("privacy_level") or "").strip()
+        ]
+        # Stale token UUID in by_account keys after reconnect / invalid target fallback.
+        if len(usable) == 1 and (not aid or aid not in by_account):
+            return normalize_tiktok_post_settings(usable[0])
     if raw_settings.get("privacy_level"):
         return normalize_tiktok_post_settings(raw_settings)
     return None

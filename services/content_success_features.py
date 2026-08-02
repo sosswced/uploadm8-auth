@@ -356,6 +356,30 @@ def _finite_round(v: Any, ndigits: int, *, default: float = 0.0) -> float:
     return round(f, ndigits)
 
 
+def _dim_label_usable(v: Any) -> bool:
+    """True when a ranking dimension can be shown to users (not null/empty/sentinel)."""
+    if v is None:
+        return False
+    try:
+        import math
+
+        if isinstance(v, float) and (math.isnan(v) or not math.isfinite(v)):
+            return False
+    except Exception:
+        pass
+    try:
+        import pandas as pd
+
+        if pd.isna(v):
+            return False
+    except Exception:
+        pass
+    s = str(v).strip()
+    if not s:
+        return False
+    return s.lower() not in ("none", "null", "nan", "<na>")
+
+
 def rank_dimension(df, by: List[str], *, min_samples: int = 3, limit: int = 15) -> List[Dict[str, Any]]:
     """Rank a content dimension by a hotness-weighted engagement score."""
     if df is None or df.empty or not set(by).issubset(df.columns):
@@ -381,6 +405,9 @@ def rank_dimension(df, by: List[str], *, min_samples: int = 3, limit: int = 15) 
     out: List[Dict[str, Any]] = []
     for _, r in agg.iterrows():
         rec: Dict[str, Any] = {col: _coerce(r[col]) for col in by}
+        # Skip buckets with no user-facing label (null category / "none" hashtag).
+        if not any(_dim_label_usable(rec.get(col)) for col in by):
+            continue
         rec.update(
             {
                 "samples": int(r["samples"]),

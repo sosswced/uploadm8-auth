@@ -529,6 +529,57 @@ def _widen_lookbacks(c: MLEngineConfig) -> list:
 _CHAMPION_EPSILON = 0.005
 
 
+def _passes_publish_quality(
+    c: MLEngineConfig, report: Dict[str, Any], task: str
+) -> tuple:
+    """
+    Hub promote quality gate.
+
+    - Floor: roc_auc >= publish_min_roc_auc
+    - Content near-miss: ROC within epsilon below floor + ndcg_at_10 >= floor
+      (closes 0.549 vs 0.55 when ranking quality is already good)
+    - Promo small-n / overfit: require enough user groups; reject near-perfect
+      ROC on tiny group counts (closes 0.99@69-row Hub risk)
+    """
+    roc = float(report.get("roc_auc") or 0.0)
+    min_roc = float(c.publish_min_roc_auc)
+    is_promo = task.startswith("promo")
+    is_content = task.startswith("content")
+
+    if is_promo:
+        groups = int(report.get("n_user_groups") or 0)
+        if c.publish_min_user_groups > 0 and groups < c.publish_min_user_groups:
+            return False, (
+                f"n_user_groups {groups} < publish min {c.publish_min_user_groups} "
+                "(small-n promo not promoted)"
+            )
+        if (
+            c.publish_overfit_max_user_groups > 0
+            and groups < c.publish_overfit_max_user_groups
+            and roc + 1e-9 >= float(c.publish_overfit_roc_auc)
+        ):
+            return False, (
+                f"roc_auc {roc:.3f} looks overfit on n_user_groups={groups} "
+                f"(<{c.publish_overfit_max_user_groups}); withhold Hub promote"
+            )
+
+    if roc + 1e-9 >= min_roc:
+        return True, None
+
+    near = float(c.publish_near_miss_epsilon or 0.0)
+    if is_content and near > 0 and roc + 1e-9 >= min_roc - near:
+        ndcg = float(report.get("ndcg_at_10") or 0.0)
+        min_ndcg = float(c.publish_min_ndcg_at_10)
+        if ndcg + 1e-9 >= min_ndcg:
+            return True, None
+        return False, (
+            f"roc_auc {roc:.3f} near miss (<{min_roc:.3f}) but "
+            f"ndcg_at_10 {ndcg:.3f} < {min_ndcg:.3f}"
+        )
+
+    return False, f"roc_auc {roc:.3f} < publish threshold {min_roc:.3f}"
+
+
 async def _passes_champion_gate(
     pool: Optional[asyncpg.Pool], report: Dict[str, Any], task: str
 ) -> tuple:
@@ -820,10 +871,13 @@ async def _finalize_publish(
         out["status"] = "trained_not_published"
         out["reason_not_published"] = "seeded model not promoted to real bucket"
         return
-    if roc < c.publish_min_roc_auc:
+    quality_ok, quality_reason = _passes_publish_quality(c, report, task)
+    if not quality_ok:
         out["ok"] = True
         out["status"] = "trained_not_published"
-        out["reason_not_published"] = f"roc_auc {roc:.3f} < publish threshold {c.publish_min_roc_auc:.3f}"
+        out["reason_not_published"] = quality_reason or (
+            f"roc_auc {roc:.3f} < publish threshold {c.publish_min_roc_auc:.3f}"
+        )
         return
 
     promote, champ_reason = await _passes_champion_gate(pool, report, task)
@@ -917,9 +971,14 @@ async def run_ml_engine_cycle(
                     lookback_days=training_lookback_days_from_env(),
                     emit_trackio=False,
                 )
+                m8 = m8_metrics or {}
                 result["steps"]["m8_publish_hour_priors"] = {
                     "ok": bool(m8_metrics),
-                    "rows": int((m8_metrics or {}).get("pci_rows") or 0),
+                    # train metrics use n_rows (pci_rows is legacy / absent)
+                    "rows": int(m8.get("pci_rows") or m8.get("n_rows") or 0),
+                    "model_version": m8.get("model_version"),
+                    "skipped": bool(m8.get("skipped")),
+                    "reason": m8.get("reason"),
                 }
             except Exception as m8_e:
                 result["steps"]["m8_publish_hour_priors"] = {"ok": False, "error": str(m8_e)[:300]}

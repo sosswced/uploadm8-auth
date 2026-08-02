@@ -39,6 +39,12 @@ Customer brand is **Smart** (`smart-insights.html`, `smart-coach.js`). Legacy **
 - Cold / insufficient data → `status=blocked_on_data` (cycle still `ok`).
 - **Seeded** bootstrap models → `trained_not_published` (never Hub promote).
 - ROC below `publish_min_roc_auc` or champion gate fail → `trained_not_published`.
+- **Content near-miss**: ROC within `publish_near_miss_epsilon` of the floor **and**
+  `ndcg_at_10 >= publish_min_ndcg_at_10` → allow Hub promote (ranking-quality rescue).
+- **Promo small-n / overfit**: require `n_user_groups >= publish_min_user_groups`;
+  withhold if ROC ≥ `publish_overfit_roc_auc` while groups &lt; `publish_overfit_max_user_groups`.
+- **Publish-hour priors**: full learn ≥800 rows; cold blend 120–799 (regularized + static mix);
+  static fallback below 120. Optional auto-widen PCI→PCI+uploads when thin.
 
 ### Dual-repo
 

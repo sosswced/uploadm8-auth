@@ -52,7 +52,7 @@ async def backfill_promo_outcome_labels(conn, *, lookback_days: int = 730) -> Di
         )
         LIMIT 5000
         """,
-        str(int(lookback_days)),
+        int(lookback_days),
     )
     inserted = 0
     for r in rows:

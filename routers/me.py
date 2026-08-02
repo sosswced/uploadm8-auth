@@ -277,6 +277,25 @@ async def get_me_coach(user: dict = Depends(get_current_user)):
             }
 
 
+@router.get("/api/me/best-posting-times")
+async def get_me_best_posting_times(user: dict = Depends(get_current_user)):
+    """Per-user best local hours + weekday×hour×platform combinations (ML + outcomes)."""
+    from services.best_posting_times import (
+        best_posting_times_fallback,
+        build_user_best_posting_times,
+    )
+
+    uid = str(user.get("billing_user_id") or user.get("id") or "")
+    pool = core.state.db_pool
+    if pool is None or not uid:
+        return best_posting_times_fallback(scope="user", error="database_unavailable")
+    try:
+        return await build_user_best_posting_times(pool, uid)
+    except Exception:
+        logger.exception("GET /api/me/best-posting-times failed user_id=%s", uid)
+        return best_posting_times_fallback(scope="user", error="best_times_unavailable")
+
+
 @router.get("/api/me/marketing-consent")
 async def get_marketing_consent(user: dict = Depends(get_current_user)):
     """User marketing opt-in flags (email / Discord). Missing row = opted out."""

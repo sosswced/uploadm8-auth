@@ -26,8 +26,12 @@ logger = logging.getLogger("uploadm8.m8_publish_hour")
 # Short-form platforms aligned with smart scheduling defaults.
 M8_PRIOR_PLATFORMS: frozenset[str] = frozenset({"tiktok", "youtube", "instagram", "facebook"})
 
+# Full learned priors when PCI (or PCI+uploads) reaches this scale.
 _MIN_TOTAL_ROWS = 800
 _MIN_PLATFORM_ROWS = 80
+# Below full scale but above this: fit a regularized model and blend with static priors.
+_MIN_BLEND_ROWS = 120
+_MIN_PLATFORM_BLEND_ROWS = 24
 
 
 def related_ops_incident_ids_from_env(*, limit: int = 32) -> List[uuid.UUID]:
@@ -223,14 +227,46 @@ def _build_frame(rows: Sequence[Any]):
     return pd.DataFrame.from_records(recs)
 
 
-def _fit_and_predict_hour_grid(df) -> Tuple[Dict[str, List[float]], Dict[str, Any]]:
+def _blend_hour_priors(
+    learned: Dict[str, List[float]],
+    *,
+    alpha: float,
+    static_fn,
+) -> Dict[str, List[float]]:
+    """Mix learned platform hour weights with static priors. alpha in [0, 1]."""
+    a = max(0.0, min(1.0, float(alpha)))
+    out: Dict[str, List[float]] = {}
+    for plat in sorted(M8_PRIOR_PLATFORMS):
+        static_w = list(static_fn(plat))
+        if plat not in learned or len(learned[plat]) != 24:
+            out[plat] = static_w
+            continue
+        mixed = [a * float(lw) + (1.0 - a) * float(sw) for lw, sw in zip(learned[plat], static_w)]
+        s = sum(max(0.0, x) for x in mixed)
+        if s <= 0:
+            out[plat] = static_w
+        else:
+            out[plat] = [max(0.0, x) / s for x in mixed]
+    return out
+
+
+def _fit_and_predict_hour_grid(
+    df,
+    *,
+    min_rows: Optional[int] = None,
+    min_platform_rows: Optional[int] = None,
+    cold: bool = False,
+) -> Tuple[Dict[str, List[float]], Dict[str, Any]]:
     """Returns (platform -> 24 prior weights, metrics including SHAP + calibration)."""
     import pandas as pd
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.metrics import mean_absolute_error
     from sklearn.model_selection import train_test_split
 
-    if df is None or len(df) < _MIN_TOTAL_ROWS:
+    row_floor = int(min_rows if min_rows is not None else _MIN_TOTAL_ROWS)
+    plat_floor = int(min_platform_rows if min_platform_rows is not None else _MIN_PLATFORM_ROWS)
+
+    if df is None or len(df) < row_floor:
         return {}, {"skipped": True, "reason": "insufficient_rows", "n_rows": 0 if df is None else len(df)}
 
     plat_d = pd.get_dummies(df["platform"], prefix="plat")
@@ -238,15 +274,17 @@ def _fit_and_predict_hour_grid(df) -> Tuple[Dict[str, List[float]], Dict[str, An
     y = df["y"].values
     feature_cols = list(X.columns)
 
+    test_size = 0.2 if cold else 0.15
     X_train, X_val, y_train, y_val = train_test_split(
-        X.values, y, test_size=0.15, random_state=42, shuffle=True
+        X.values, y, test_size=test_size, random_state=42, shuffle=True
     )
+    # Cold path: stronger leaf / L2 regularization to limit overfit on thin PCI.
     model = HistGradientBoostingRegressor(
-        max_depth=10,
-        learning_rate=0.07,
-        max_iter=280,
-        min_samples_leaf=25,
-        l2_regularization=1e-3,
+        max_depth=6 if cold else 10,
+        learning_rate=0.05 if cold else 0.07,
+        max_iter=180 if cold else 280,
+        min_samples_leaf=40 if cold else 25,
+        l2_regularization=5e-3 if cold else 1e-3,
         random_state=42,
     )
     model.fit(X_train, y_train)
@@ -259,8 +297,8 @@ def _fit_and_predict_hour_grid(df) -> Tuple[Dict[str, List[float]], Dict[str, An
     priors: Dict[str, List[float]] = {}
     for plat in sorted(M8_PRIOR_PLATFORMS):
         sub = df[df["platform"] == plat]
-        if len(sub) < _MIN_PLATFORM_ROWS:
-            logger.info("m8_train: skip platform=%s (n=%s)", plat, len(sub))
+        if len(sub) < plat_floor:
+            logger.info("m8_train: skip platform=%s (n=%s < %s)", plat, len(sub), plat_floor)
             continue
         med = sub.median(numeric_only=True)
         dow_med = int(round(float(med["dow"])))
@@ -289,6 +327,7 @@ def _fit_and_predict_hour_grid(df) -> Tuple[Dict[str, List[float]], Dict[str, An
         "n_rows": int(len(df)),
         "n_features": len(feature_cols),
         "platforms_written": sorted(priors.keys()),
+        "cold": bool(cold),
         **cal,
         **shap_info,
     }
@@ -308,10 +347,17 @@ async def train_m8_publish_hour_priors(
     Env:
       M8_TRAIN_PCI_ONLY (default true) — require ``pci.published_at``; if false, use
         COALESCE(pci.published_at, u.completed_at, u.created_at).
+      M8_TRAIN_AUTO_WIDEN_PCI (default true) — when PCI-only frame is below the blend
+        floor, refetch once with upload timestamps (PCI+uploads).
       M8_TRAIN_SOURCE_ALLOWLIST — e.g. ``uploadm8,linked`` (comma-separated, lower).
       M8_TRAIN_CONTENT_KIND_ALLOWLIST — e.g. ``reel,short`` (optional).
       M8_RELATED_OPS_INCIDENT_IDS — comma-separated UUIDs stored on the run row
         (``m8_model_runs.related_ops_incident_ids``) for postmortems beside ``training_run_id``.
+
+    Training modes by row count:
+      - >= 800: full ``hgb-v1`` learned priors
+      - 120–799: cold ``hgb-v1-blend`` (regularized fit mixed with static)
+      - < 120: ``static-fallback``
 
     ``emit_trackio`` should be ``False`` when nested under ``run_ml_engine_cycle``.
     """
@@ -330,6 +376,7 @@ async def train_m8_publish_hour_priors(
     source_allow = _parse_csv_lower("M8_TRAIN_SOURCE_ALLOWLIST")
     kind_allow = _parse_csv_lower("M8_TRAIN_CONTENT_KIND_ALLOWLIST")
     lookback = f"{max(30, int(lookback_days))} days"
+    auto_widen = _env_bool("M8_TRAIN_AUTO_WIDEN_PCI", True)
 
     sql, extra_params = _build_training_query(
         pci_only=pci_only,
@@ -342,13 +389,42 @@ async def train_m8_publish_hour_priors(
         rows = await conn.fetch(sql, *fetch_params)
 
     df = _build_frame(rows)
+    # Cold start: if PCI-only is thin, automatically widen to PCI+upload timestamps once.
+    widened_from_pci_only = False
+    if (
+        auto_widen
+        and pci_only
+        and len(df) < _MIN_BLEND_ROWS
+    ):
+        sql_w, extra_w = _build_training_query(
+            pci_only=False,
+            source_allow=source_allow,
+            kind_allow=kind_allow,
+        )
+        fetch_w: List[Any] = [lookback] + extra_w
+        async with pool.acquire() as conn:
+            rows_w = await conn.fetch(sql_w, *fetch_w)
+        df_w = _build_frame(rows_w)
+        if len(df_w) > len(df):
+            logger.info(
+                "m8_train: auto-widen PCI+uploads %s → %s rows",
+                len(df),
+                len(df_w),
+            )
+            rows, df = rows_w, df_w
+            pci_only = False
+            widened_from_pci_only = True
+
     train_config: Dict[str, Any] = {
         "lookback_days": int(lookback_days),
         "pci_only": pci_only,
+        "auto_widened_from_pci_only": widened_from_pci_only,
         "source_allowlist": source_allow,
         "content_kind_allowlist": kind_allow,
         "sql_row_count": len(rows),
         "frame_row_count": int(len(df)),
+        "min_total_rows": int(_MIN_TOTAL_ROWS),
+        "min_blend_rows": int(_MIN_BLEND_ROWS),
     }
     if related_ops_incident_ids is not None:
         inc_ids: List[uuid.UUID] = list(related_ops_incident_ids)[:32]
@@ -362,6 +438,7 @@ async def train_m8_publish_hour_priors(
                 "sql_row_count": len(rows),
                 "frame_row_count": int(len(df)),
                 "lookback_days": int(lookback_days),
+                "auto_widened_from_pci_only": widened_from_pci_only,
             }
         )
 
@@ -370,14 +447,81 @@ async def train_m8_publish_hour_priors(
     mae: Optional[float]
     run_metrics: Dict[str, Any]
 
-    if len(df) < _MIN_TOTAL_ROWS:
+    n_rows = int(len(df))
+    if n_rows >= _MIN_TOTAL_ROWS:
+        priors, run_metrics = _fit_and_predict_hour_grid(df)
+        model_version = "hgb-v1"
+        mae = run_metrics.get("val_mae_log1p_views")
+        for p in sorted(M8_PRIOR_PLATFORMS):
+            if p not in priors:
+                priors[p] = static_hour_prior_24(p)
+                run_metrics.setdefault("filled_static", []).append(p)
+        if track is not None:
+            track.log(
+                {
+                    "phase": "train",
+                    "skipped": 0,
+                    "mode": "full",
+                    "val_mae_log1p_views": float(mae) if mae is not None else None,
+                    "platforms_written_count": len(priors),
+                }
+            )
+    elif n_rows >= _MIN_BLEND_ROWS:
+        # Cold blend: regularized fit + mix with static priors (alpha = n / full floor).
+        learned, run_metrics = _fit_and_predict_hour_grid(
+            df,
+            min_rows=_MIN_BLEND_ROWS,
+            min_platform_rows=_MIN_PLATFORM_BLEND_ROWS,
+            cold=True,
+        )
+        alpha = min(1.0, float(n_rows) / float(_MIN_TOTAL_ROWS))
+        priors = _blend_hour_priors(learned, alpha=alpha, static_fn=static_hour_prior_24)
+        model_version = "hgb-v1-blend"
+        mae = run_metrics.get("val_mae_log1p_views")
+        run_metrics = dict(run_metrics)
+        run_metrics.update(
+            {
+                "skipped": False,
+                "reason": "cold_blend",
+                "blend_alpha": alpha,
+                "fallback": "static_blend",
+                "n_rows": n_rows,
+                "platforms_learned": sorted(learned.keys()),
+            }
+        )
+        logger.info(
+            "m8_train: cold blend n=%s alpha=%.3f learned_platforms=%s",
+            n_rows,
+            alpha,
+            sorted(learned.keys()),
+        )
+        if track is not None:
+            track.log(
+                {
+                    "phase": "train",
+                    "skipped": 0,
+                    "mode": "cold_blend",
+                    "blend_alpha": alpha,
+                    "val_mae_log1p_views": float(mae) if mae is not None else None,
+                    "platforms_written_count": len(priors),
+                }
+            )
+    else:
         logger.warning(
-            "m8_train: only %s rows (min %s) — writing static priors",
-            len(df),
+            "m8_train: only %s rows (min blend %s / full %s) — writing static priors",
+            n_rows,
+            _MIN_BLEND_ROWS,
             _MIN_TOTAL_ROWS,
         )
         priors = {p: static_hour_prior_24(p) for p in sorted(M8_PRIOR_PLATFORMS)}
-        run_metrics = {"skipped": True, "reason": "insufficient_rows", "n_rows": len(df), "fallback": "static"}
+        run_metrics = {
+            "skipped": True,
+            "reason": "insufficient_rows",
+            "n_rows": n_rows,
+            "fallback": "static",
+            "min_blend_rows": int(_MIN_BLEND_ROWS),
+            "min_required_rows": int(_MIN_TOTAL_ROWS),
+        }
         model_version = "static-fallback"
         mae = None
         if track is not None:
@@ -387,33 +531,17 @@ async def train_m8_publish_hour_priors(
                     "skipped": 1,
                     "reason": "insufficient_rows",
                     "min_required_rows": int(_MIN_TOTAL_ROWS),
-                    "train_rows": int(len(df)),
+                    "min_blend_rows": int(_MIN_BLEND_ROWS),
+                    "train_rows": n_rows,
                 }
             )
-    else:
-        priors, run_metrics = _fit_and_predict_hour_grid(df)
-        model_version = "hgb-v1"
-        mae = run_metrics.get("val_mae_log1p_views")
-        if track is not None:
-            track.log(
-                {
-                    "phase": "train",
-                    "skipped": 0,
-                    "val_mae_log1p_views": float(mae) if mae is not None else None,
-                    "platforms_written_count": len(priors),
-                }
-            )
-        for p in sorted(M8_PRIOR_PLATFORMS):
-            if p not in priors:
-                priors[p] = static_hour_prior_24(p)
-                run_metrics.setdefault("filled_static", []).append(p)
 
     run_id = uuid.uuid4()
     trained_at = datetime.now(timezone.utc)
 
     # Persist run (SHAP + calibration live under metrics JSONB).
     features_used: List[str] = []
-    if len(df) >= _MIN_TOTAL_ROWS:
+    if n_rows >= _MIN_BLEND_ROWS:
         import pandas as pd
 
         plat_d = pd.get_dummies(df["platform"], prefix="plat")

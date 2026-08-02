@@ -173,7 +173,7 @@ async def build_smart_schedule_for_upload(
 
     num_days = clamp_smart_schedule_days(num_days)
     tz = user_timezone or await _user_timezone(conn, user_id)
-    blocked = await get_existing_scheduled_days(
+    occupancy = await get_existing_scheduled_days(
         conn, user_id, num_days, exclude_upload_id=exclude_upload_id
     )
     schedule = await calculate_smart_schedule_data_driven(
@@ -181,7 +181,7 @@ async def build_smart_schedule_for_upload(
         user_id,
         plats,
         num_days=num_days,
-        blocked_day_offsets=blocked or None,
+        day_occupancy=occupancy or None,
         user_timezone=tz,
         random_seed=random_seed,
     )
@@ -195,7 +195,7 @@ async def build_smart_schedule_for_upload(
             plats,
             num_days=num_days,
             user_timezone=tz,
-            blocked_day_offsets=blocked or None,
+            day_occupancy=occupancy or None,
             random_seed=random_seed,
         )
 
@@ -222,7 +222,7 @@ async def build_smart_schedule_for_upload(
             missing,
             num_days=num_days,
             user_timezone=tz,
-            blocked_day_offsets=blocked or None,
+            day_occupancy=occupancy or None,
             random_seed=f"{random_seed or user_id}:fill",
         )
         for p in missing:

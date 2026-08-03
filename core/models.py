@@ -153,6 +153,40 @@ class UploadInit(BaseModel):
     thumbnail_source_job_id: Optional[str] = Field(default=None, alias="thumbnailSourceJobId")
     thumbnail_source_variant_id: Optional[str] = Field(default=None, alias="thumbnailSourceVariantId")
     thumbnail_studio_strict: Optional[bool] = Field(default=None, alias="thumbnailStudioStrict")
+    # Per-upload caption style × tone × voice randomize / combinatorial sweep
+    randomize_caption_creative: Optional[bool] = Field(
+        default=None,
+        alias="randomizeCaptionCreative",
+        description="When true, pick a random style/tone/voice for this upload",
+    )
+    caption_creative_pick_mode: Optional[str] = Field(
+        default=None,
+        alias="captionCreativePickMode",
+        description="off | random | cycle — cycle walks the full 378-combo matrix",
+    )
+    caption_creative_combo_index: Optional[int] = Field(
+        default=None,
+        alias="captionCreativeComboIndex",
+        description="0-based index into style×tone×voice product (cycle mode / batch offset)",
+    )
+    caption_creative_vary_style: Optional[bool] = Field(
+        default=None,
+        alias="captionCreativeVaryStyle",
+        description="When randomizing, vary style (False = lock to caption_style)",
+    )
+    caption_creative_vary_tone: Optional[bool] = Field(
+        default=None,
+        alias="captionCreativeVaryTone",
+        description="When randomizing, vary tone (False = lock to caption_tone)",
+    )
+    caption_creative_vary_voice: Optional[bool] = Field(
+        default=None,
+        alias="captionCreativeVaryVoice",
+        description="When randomizing, vary voice (False = lock to caption_voice)",
+    )
+    caption_style: Optional[str] = Field(default=None, alias="captionStyle")
+    caption_tone: Optional[str] = Field(default=None, alias="captionTone")
+    caption_voice: Optional[str] = Field(default=None, alias="captionVoice")
     # TikTok Content Posting API export settings (required when tiktok in platforms)
     tiktok_post_settings: Optional[dict] = Field(default=None, alias="tiktokPostSettings")
 

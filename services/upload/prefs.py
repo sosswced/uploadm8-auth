@@ -25,6 +25,15 @@ _UPLOAD_PREF_MIRROR_PAIRS = [
     ("youtube_shorts_copyright_trim", "youtubeShortsCopyrightTrim"),
     ("use_audio_context", "useAudioContext"),
     ("ai_service_music_detection", "aiServiceMusicDetection"),
+    ("randomize_caption_creative", "randomizeCaptionCreative"),
+    ("caption_creative_pick_mode", "captionCreativePickMode"),
+    ("caption_creative_combo_index", "captionCreativeComboIndex"),
+    ("caption_creative_vary_style", "captionCreativeVaryStyle"),
+    ("caption_creative_vary_tone", "captionCreativeVaryTone"),
+    ("caption_creative_vary_voice", "captionCreativeVaryVoice"),
+    ("caption_style", "captionStyle"),
+    ("caption_tone", "captionTone"),
+    ("caption_voice", "captionVoice"),
 ]
 
 
@@ -134,6 +143,103 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
     if strict is not None:
         user_prefs["thumbnail_studio_strict"] = bool(strict)
         user_prefs["thumbnailStudioStrict"] = bool(strict)
+
+
+def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) -> None:
+    """Overlay per-upload caption style/tone/voice randomize, locks, and fixed values."""
+    from core.caption_creative import (
+        normalize_caption_creative_pick_mode,
+        normalize_caption_style,
+        normalize_caption_tone,
+        normalize_caption_voice,
+    )
+
+    mode_raw = getattr(data, "caption_creative_pick_mode", None)
+    if mode_raw is None:
+        mode_raw = getattr(data, "captionCreativePickMode", None)
+    rand_raw = getattr(data, "randomize_caption_creative", None)
+    if rand_raw is None:
+        rand_raw = getattr(data, "randomizeCaptionCreative", None)
+
+    if mode_raw is not None and str(mode_raw).strip() != "":
+        mode = normalize_caption_creative_pick_mode(mode_raw)
+    elif rand_raw is not None:
+        mode = normalize_caption_creative_pick_mode(rand_raw)
+    else:
+        mode = None
+
+    if mode is not None:
+        user_prefs["caption_creative_pick_mode"] = mode
+        user_prefs["captionCreativePickMode"] = mode
+        on = mode != "off"
+        user_prefs["randomize_caption_creative"] = on
+        user_prefs["randomizeCaptionCreative"] = on
+
+    idx = getattr(data, "caption_creative_combo_index", None)
+    if idx is None:
+        idx = getattr(data, "captionCreativeComboIndex", None)
+    if idx is not None and str(idx).strip() != "":
+        try:
+            v = int(idx)
+        except (TypeError, ValueError):
+            v = None
+        if v is not None:
+            user_prefs["caption_creative_combo_index"] = v
+            user_prefs["captionCreativeComboIndex"] = v
+
+    def _merge_vary(attr_snake: str, attr_camel: str, out_snake: str, out_camel: str) -> None:
+        raw = getattr(data, attr_snake, None)
+        if raw is None:
+            raw = getattr(data, attr_camel, None)
+        if raw is None:
+            return
+        b = bool(raw)
+        user_prefs[out_snake] = b
+        user_prefs[out_camel] = b
+
+    _merge_vary(
+        "caption_creative_vary_style",
+        "captionCreativeVaryStyle",
+        "caption_creative_vary_style",
+        "captionCreativeVaryStyle",
+    )
+    _merge_vary(
+        "caption_creative_vary_tone",
+        "captionCreativeVaryTone",
+        "caption_creative_vary_tone",
+        "captionCreativeVaryTone",
+    )
+    _merge_vary(
+        "caption_creative_vary_voice",
+        "captionCreativeVaryVoice",
+        "caption_creative_vary_voice",
+        "captionCreativeVaryVoice",
+    )
+
+    # Locked-axis fixed values (and optional batch overrides of Settings defaults).
+    style_raw = getattr(data, "caption_style", None)
+    if style_raw is None:
+        style_raw = getattr(data, "captionStyle", None)
+    if style_raw is not None and str(style_raw).strip() != "":
+        s = normalize_caption_style(style_raw)
+        user_prefs["caption_style"] = s
+        user_prefs["captionStyle"] = s
+
+    tone_raw = getattr(data, "caption_tone", None)
+    if tone_raw is None:
+        tone_raw = getattr(data, "captionTone", None)
+    if tone_raw is not None and str(tone_raw).strip() != "":
+        t = normalize_caption_tone(tone_raw)
+        user_prefs["caption_tone"] = t
+        user_prefs["captionTone"] = t
+
+    voice_raw = getattr(data, "caption_voice", None)
+    if voice_raw is None:
+        voice_raw = getattr(data, "captionVoice", None)
+    if voice_raw is not None and str(voice_raw).strip() != "":
+        v = normalize_caption_voice(voice_raw)
+        user_prefs["caption_voice"] = v
+        user_prefs["captionVoice"] = v
 
 
 def merge_upload_init_tiktok_post_settings(user_prefs: Dict[str, Any], data: Any) -> None:

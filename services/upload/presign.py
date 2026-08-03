@@ -25,6 +25,7 @@ from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 
 from services.upload.hashtags import _to_hash_tags
 from services.upload.prefs import (
+    merge_upload_init_caption_creative,
     merge_upload_init_thumbnail_preferences,
     merge_upload_init_tiktok_post_settings,
     normalize_user_prefs_snapshot,
@@ -162,6 +163,7 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
     user_prefs = await get_user_prefs_for_upload(conn, bill_id)
     normalize_user_prefs_snapshot(user_prefs)
     merge_upload_init_thumbnail_preferences(user_prefs, data)
+    merge_upload_init_caption_creative(user_prefs, data)
     merge_upload_init_tiktok_post_settings(user_prefs, data)
 
     tiktok_account_ids = await _tiktok_target_account_ids(conn, bill_id, data)

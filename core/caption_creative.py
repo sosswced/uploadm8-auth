@@ -9,6 +9,8 @@ import from this module — do not hardcode parallel tuples elsewhere.
 
 from __future__ import annotations
 
+import hashlib
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 # Caption STYLE = structural architecture of the line.
@@ -480,6 +482,216 @@ def combination_index(style_ui: str, tone_ui: str, voice_ui: str) -> int:
     return si * len(CAPTION_TONES) * len(CAPTION_VOICES) + ti * len(CAPTION_VOICES) + vi + 1
 
 
+CAPTION_CREATIVE_PICK_MODES: Tuple[str, ...] = ("off", "random", "cycle")
+DEFAULT_CAPTION_CREATIVE_PICK_MODE = "off"
+
+
+def normalize_caption_creative_pick_mode(value: Any) -> str:
+    """Normalize pick mode: off | random | cycle."""
+    if value is True or value == 1:
+        return "random"
+    s = str(value or "").strip().lower().replace("-", "_")
+    if s in ("1", "true", "yes", "on", "randomize", "random"):
+        return "random"
+    if s in ("cycle", "sweep", "combinatorial", "all", "sequential"):
+        return "cycle"
+    if s in ("0", "false", "no", "off", "none", ""):
+        return "off"
+    return DEFAULT_CAPTION_CREATIVE_PICK_MODE
+
+
+def _pref_bool(us: Dict[str, Any], camel: str, snake: str, *, default: bool) -> bool:
+    if camel in us:
+        return bool(us.get(camel))
+    if snake in us:
+        return bool(us.get(snake))
+    return default
+
+
+def parse_caption_creative_vary_flags(prefs: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+    """Per-axis vary flags. Missing keys default to True (vary all when randomize is on).
+
+    Prefer positive ``vary*`` keys; ``lock*`` / ``lockCaption*`` invert when present.
+    """
+    us = prefs if isinstance(prefs, dict) else {}
+
+    def _axis(vary_camel: str, vary_snake: str, lock_camel: str, lock_snake: str) -> bool:
+        if vary_camel in us or vary_snake in us:
+            return _pref_bool(us, vary_camel, vary_snake, default=True)
+        if lock_camel in us or lock_snake in us:
+            return not _pref_bool(us, lock_camel, lock_snake, default=False)
+        return True
+
+    return {
+        "style": _axis(
+            "captionCreativeVaryStyle",
+            "caption_creative_vary_style",
+            "captionCreativeLockStyle",
+            "caption_creative_lock_style",
+        ),
+        "tone": _axis(
+            "captionCreativeVaryTone",
+            "caption_creative_vary_tone",
+            "captionCreativeLockTone",
+            "caption_creative_lock_tone",
+        ),
+        "voice": _axis(
+            "captionCreativeVaryVoice",
+            "caption_creative_vary_voice",
+            "captionCreativeLockVoice",
+            "caption_creative_lock_voice",
+        ),
+    }
+
+
+def combination_at(index: int) -> Tuple[str, str, str]:
+    """Return (style, tone, voice) for a 0-based index into the full product space."""
+    return combination_at_axes(
+        index,
+        styles=CAPTION_STYLES,
+        tones=CAPTION_TONES,
+        voices=CAPTION_VOICES,
+    )
+
+
+def combination_at_axes(
+    index: int,
+    *,
+    styles: Tuple[str, ...],
+    tones: Tuple[str, ...],
+    voices: Tuple[str, ...],
+) -> Tuple[str, str, str]:
+    """0-based pick inside a (possibly locked) style×tone×voice product."""
+    n_s = max(1, len(styles))
+    n_t = max(1, len(tones))
+    n_v = max(1, len(voices))
+    n = n_s * n_t * n_v
+    i = int(index) % n
+    si = i // (n_t * n_v)
+    rem = i % (n_t * n_v)
+    ti = rem // n_v
+    vi = rem % n_v
+    return (styles[si % n_s], tones[ti % n_t], voices[vi % n_v])
+
+
+def pick_random_combination(
+    rng: Optional[random.Random] = None,
+) -> Tuple[str, str, str]:
+    """Pick one uniform random style×tone×voice triple from the registry."""
+    return pick_random_combination_axes(
+        rng=rng,
+        styles=CAPTION_STYLES,
+        tones=CAPTION_TONES,
+        voices=CAPTION_VOICES,
+    )
+
+
+def pick_random_combination_axes(
+    *,
+    styles: Tuple[str, ...],
+    tones: Tuple[str, ...],
+    voices: Tuple[str, ...],
+    rng: Optional[random.Random] = None,
+) -> Tuple[str, str, str]:
+    r = rng if rng is not None else random
+    n = max(1, len(styles) * len(tones) * len(voices))
+    return combination_at_axes(int(r.randrange(n)), styles=styles, tones=tones, voices=voices)
+
+
+def _stable_combo_index_from_upload_id(upload_id: Any, *, modulus: int) -> int:
+    raw = str(upload_id or "").encode("utf-8", errors="ignore")
+    digest = hashlib.sha256(raw).hexdigest()
+    return int(digest[:12], 16) % max(1, int(modulus))
+
+
+def resolve_caption_creative_knobs(
+    prefs: Optional[Dict[str, Any]],
+    *,
+    upload_id: Any = None,
+    combo_index: Optional[int] = None,
+    rng: Optional[random.Random] = None,
+) -> Dict[str, Any]:
+    """Resolve style/tone/voice with optional per-axis vary/lock.
+
+    Pref keys (snake or camel):
+      - randomizeCaptionCreative / captionCreativePickMode (off|random|cycle)
+      - captionCreativeComboIndex (0-based; cycle)
+      - captionCreativeVaryStyle|Tone|Voice (bool; default True when randomizing)
+      - captionCreativeLockStyle|Tone|Voice (bool; invert of vary when set)
+      - captionStyle / captionTone / captionVoice (locked-axis values)
+
+    Returns: style, tone, voice, pick_mode, combo_index (1-based in full matrix),
+    randomized, vary (dict), subspace_size.
+    """
+    us = prefs if isinstance(prefs, dict) else {}
+    mode_raw = (
+        us.get("captionCreativePickMode")
+        if "captionCreativePickMode" in us
+        else us.get("caption_creative_pick_mode")
+    )
+    if mode_raw is None:
+        mode_raw = (
+            us.get("randomizeCaptionCreative")
+            if "randomizeCaptionCreative" in us
+            else us.get("randomize_caption_creative")
+        )
+    mode = normalize_caption_creative_pick_mode(mode_raw)
+
+    base_style = normalize_caption_style(us.get("captionStyle") or us.get("caption_style"))
+    base_tone = normalize_caption_tone(us.get("captionTone") or us.get("caption_tone"))
+    base_voice = normalize_caption_voice(us.get("captionVoice") or us.get("caption_voice"))
+    vary = parse_caption_creative_vary_flags(us)
+
+    if mode == "off" or not any(vary.values()):
+        return {
+            "style": base_style,
+            "tone": base_tone,
+            "voice": base_voice,
+            "pick_mode": "off" if mode == "off" else mode,
+            "combo_index": combination_index(base_style, base_tone, base_voice),
+            "randomized": False,
+            "vary": {"style": False, "tone": False, "voice": False},
+            "subspace_size": 1,
+        }
+
+    styles: Tuple[str, ...] = CAPTION_STYLES if vary["style"] else (base_style,)
+    tones: Tuple[str, ...] = CAPTION_TONES if vary["tone"] else (base_tone,)
+    voices: Tuple[str, ...] = CAPTION_VOICES if vary["voice"] else (base_voice,)
+    subspace = max(1, len(styles) * len(tones) * len(voices))
+
+    if mode == "cycle":
+        idx0: Optional[int] = combo_index
+        if idx0 is None:
+            raw_idx = (
+                us.get("captionCreativeComboIndex")
+                if "captionCreativeComboIndex" in us
+                else us.get("caption_creative_combo_index")
+            )
+            if raw_idx is not None and str(raw_idx).strip() != "":
+                try:
+                    idx0 = int(raw_idx)
+                except (TypeError, ValueError):
+                    idx0 = None
+        if idx0 is None:
+            idx0 = _stable_combo_index_from_upload_id(upload_id, modulus=subspace)
+        style, tone, voice = combination_at_axes(idx0, styles=styles, tones=tones, voices=voices)
+    else:
+        style, tone, voice = pick_random_combination_axes(
+            styles=styles, tones=tones, voices=voices, rng=rng
+        )
+
+    return {
+        "style": style,
+        "tone": tone,
+        "voice": voice,
+        "pick_mode": mode,
+        "combo_index": combination_index(style, tone, voice),
+        "randomized": True,
+        "vary": dict(vary),
+        "subspace_size": subspace,
+    }
+
+
 def _interaction_rules(style_key: str, tone_key: str, voice_key: str) -> List[str]:
     """Deterministic tension-resolution rules derived from the facets.
 
@@ -783,6 +995,15 @@ __all__ = [
     "voice_directive",
     "total_combinations",
     "combination_index",
+    "combination_at",
+    "combination_at_axes",
+    "pick_random_combination",
+    "pick_random_combination_axes",
+    "parse_caption_creative_vary_flags",
+    "normalize_caption_creative_pick_mode",
+    "resolve_caption_creative_knobs",
+    "CAPTION_CREATIVE_PICK_MODES",
+    "DEFAULT_CAPTION_CREATIVE_PICK_MODE",
     "compose_creative_directive",
     "interaction_contract",
     "cell_micro_brief",

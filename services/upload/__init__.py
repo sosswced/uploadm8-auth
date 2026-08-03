@@ -18,6 +18,7 @@ from services.upload.list_detail import (
     youtube_copyright_shorts_notice_from_artifacts,
 )
 from services.upload.prefs import (
+    merge_upload_init_caption_creative,
     merge_upload_init_thumbnail_preferences,
     merge_upload_init_tiktok_post_settings,
     normalize_user_prefs_snapshot,
@@ -99,6 +100,7 @@ __all__ = [
     "fetch_upload_queue_stats",
     "fetch_user_uploads_list",
     "geo_location_hint_for_upload",
+    "merge_upload_init_caption_creative",
     "merge_upload_init_thumbnail_preferences",
     "merge_upload_init_tiktok_post_settings",
     "merged_platform_thumbnail_urls",

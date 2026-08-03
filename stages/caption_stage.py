@@ -1492,15 +1492,45 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         generate_caption = True
 
     # ── Style/tone preferences ───────────────────────────────────────────────
-    from core.caption_creative import (
-        normalize_caption_style,
-        normalize_caption_tone,
-        normalize_caption_voice,
-    )
+    from core.caption_creative import resolve_caption_creative_knobs, total_combinations
 
-    caption_style = normalize_caption_style(us.get("captionStyle") or us.get("caption_style"))
-    caption_tone = normalize_caption_tone(us.get("captionTone") or us.get("caption_tone"))
-    caption_voice = normalize_caption_voice(us.get("captionVoice") or us.get("caption_voice"))
+    creative = resolve_caption_creative_knobs(
+        us,
+        upload_id=getattr(ctx, "upload_id", None),
+    )
+    caption_style = creative["style"]
+    caption_tone = creative["tone"]
+    caption_voice = creative["voice"]
+    if creative.get("randomized"):
+        # Persist the resolved triple onto the job prefs so artifacts / reclaim
+        # see what actually ran (not the account default). Clear the randomize
+        # flag so retries do not pick a different combo.
+        us["captionStyle"] = us["caption_style"] = caption_style
+        us["captionTone"] = us["caption_tone"] = caption_tone
+        us["captionVoice"] = us["caption_voice"] = caption_voice
+        us["captionCreativeResolvedFrom"] = us["caption_creative_resolved_from"] = creative[
+            "pick_mode"
+        ]
+        us["captionCreativeComboIndex"] = us["caption_creative_combo_index"] = int(
+            creative["combo_index"]
+        )
+        us["captionCreativePickMode"] = us["caption_creative_pick_mode"] = "off"
+        us["randomizeCaptionCreative"] = us["randomize_caption_creative"] = False
+        logger.info(
+            "caption_creative_randomized upload_id=%s mode=%s combo=%s/%s subspace=%s "
+            "vary_style=%s vary_tone=%s vary_voice=%s style=%s tone=%s voice=%s",
+            getattr(ctx, "upload_id", None),
+            creative["pick_mode"],
+            creative["combo_index"],
+            total_combinations(),
+            creative.get("subspace_size"),
+            (creative.get("vary") or {}).get("style"),
+            (creative.get("vary") or {}).get("tone"),
+            (creative.get("vary") or {}).get("voice"),
+            caption_style,
+            caption_tone,
+            caption_voice,
+        )
 
     hashtag_style = str(us.get("aiHashtagStyle") or us.get("ai_hashtag_style") or "mixed").lower()
     if hashtag_style not in (

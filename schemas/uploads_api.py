@@ -33,6 +33,15 @@ class UploadInit(BaseModel):
     thumbnail_use_persona: Optional[bool] = None
     thumbnail_persona_id: Optional[str] = None
     thumbnail_persona_strength: Optional[int] = Field(default=None, ge=0, le=100)
+    randomize_caption_creative: Optional[bool] = Field(default=None, alias="randomizeCaptionCreative")
+    caption_creative_pick_mode: Optional[str] = Field(default=None, alias="captionCreativePickMode")
+    caption_creative_combo_index: Optional[int] = Field(default=None, alias="captionCreativeComboIndex")
+    caption_creative_vary_style: Optional[bool] = Field(default=None, alias="captionCreativeVaryStyle")
+    caption_creative_vary_tone: Optional[bool] = Field(default=None, alias="captionCreativeVaryTone")
+    caption_creative_vary_voice: Optional[bool] = Field(default=None, alias="captionCreativeVaryVoice")
+    caption_style: Optional[str] = Field(default=None, alias="captionStyle")
+    caption_tone: Optional[str] = Field(default=None, alias="captionTone")
+    caption_voice: Optional[str] = Field(default=None, alias="captionVoice")
 
 
 class SmartScheduleOnlyUpdate(BaseModel):

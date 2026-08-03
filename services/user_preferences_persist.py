@@ -494,8 +494,28 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             trill_enabled,
         )
 
-        caption_keys = ("captionStyle", "captionTone", "captionVoice", "captionFrameCount")
-        caption_snake = ("caption_style", "caption_tone", "caption_voice", "caption_frame_count")
+        caption_keys = (
+            "captionStyle",
+            "captionTone",
+            "captionVoice",
+            "captionFrameCount",
+            "randomizeCaptionCreative",
+            "captionCreativePickMode",
+            "captionCreativeVaryStyle",
+            "captionCreativeVaryTone",
+            "captionCreativeVaryVoice",
+        )
+        caption_snake = (
+            "caption_style",
+            "caption_tone",
+            "caption_voice",
+            "caption_frame_count",
+            "randomize_caption_creative",
+            "caption_creative_pick_mode",
+            "caption_creative_vary_style",
+            "caption_creative_vary_tone",
+            "caption_creative_vary_voice",
+        )
         thumb_keys = ("thumbnailSelectionMode", "thumbnailRenderPipeline")
         thumb_snake = ("thumbnail_selection_mode", "thumbnail_render_pipeline")
         upload_ai_keys = (
@@ -564,6 +584,35 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                     users_prefs["captionVoice"] = users_prefs["caption_voice"] = normalize_caption_voice(
                         p.get("captionVoice") or p.get("caption_voice")
                     )
+                if "randomizeCaptionCreative" in p or "randomize_caption_creative" in p or (
+                    "captionCreativePickMode" in p or "caption_creative_pick_mode" in p
+                ):
+                    from core.caption_creative import normalize_caption_creative_pick_mode
+
+                    mode_raw = (
+                        p.get("captionCreativePickMode")
+                        if "captionCreativePickMode" in p
+                        else p.get("caption_creative_pick_mode")
+                    )
+                    if mode_raw is None:
+                        mode_raw = (
+                            p.get("randomizeCaptionCreative")
+                            if "randomizeCaptionCreative" in p
+                            else p.get("randomize_caption_creative")
+                        )
+                    mode = normalize_caption_creative_pick_mode(mode_raw)
+                    users_prefs["captionCreativePickMode"] = users_prefs["caption_creative_pick_mode"] = mode
+                    on = mode != "off"
+                    users_prefs["randomizeCaptionCreative"] = users_prefs["randomize_caption_creative"] = on
+                for camel, snake in (
+                    ("captionCreativeVaryStyle", "caption_creative_vary_style"),
+                    ("captionCreativeVaryTone", "caption_creative_vary_tone"),
+                    ("captionCreativeVaryVoice", "caption_creative_vary_voice"),
+                ):
+                    if camel in p or snake in p:
+                        raw = p.get(camel) if camel in p else p.get(snake)
+                        b = bool(raw)
+                        users_prefs[camel] = users_prefs[snake] = b
                 if "captionFrameCount" in p or "caption_frame_count" in p:
                     try:
                         ent = get_entitlements_for_tier(user.get("subscription_tier", "free"))

@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from services.deferred_publish_schedule import (
+    expected_publish_targets,
+    expected_publish_targets_resolved,
     handled_target_keys,
     hydrate_platform_results_into_ctx,
     next_due_scheduled_time,
@@ -26,6 +28,25 @@ def test_parse_schedule_metadata():
     assert "tiktok" in sm
     assert "youtube" in sm
     assert sm["youtube"].day == 17
+
+
+def test_expected_publish_targets_platform_only_ignores_unresolved_accounts():
+    """Without DB resolution, target_accounts must not invent (platform, token) pairs."""
+    upload = {
+        "platforms": ["TikTok", "youtube", ""],
+        "target_accounts": ["710dd785-fcf1-472f-9b27-8e2e348047ca"],
+    }
+    assert expected_publish_targets(upload) == [("tiktok", None), ("youtube", None)]
+
+
+def test_expected_publish_targets_resolved_prefers_token_pairs():
+    resolved = expected_publish_targets_resolved(
+        ["tiktok", "youtube"],
+        [("tiktok", "aaa"), ("youtube", "bbb")],
+    )
+    assert resolved == [("tiktok", "aaa"), ("youtube", "bbb")]
+    fallback = expected_publish_targets_resolved(["tiktok", "youtube"], [])
+    assert fallback == [("tiktok", None), ("youtube", None)]
 
 
 def test_platforms_due_smart_only_publishes_due_platform():

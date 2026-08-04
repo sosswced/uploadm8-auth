@@ -169,6 +169,7 @@ def test_trill_and_drive_keys_mapped():
     for camel, snake in (
         ("trillEnabled", "trill_enabled"),
         ("trillMinScore", "trill_min_score"),
+        ("trillSkipLowScore", "trill_skip_low_score"),
         ("trillAiEnhance", "trill_ai_enhance"),
         ("trillOpenaiModel", "trill_openai_model"),
         ("trillLeaderboardOptIn", "trill_leaderboard_opt_in"),

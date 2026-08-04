@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from services.schedule_slots import (
     all_slot_datetimes,
     compute_scheduled_stats,
+    day_occupancy_from_today,
     day_offsets_from_today,
     rows_for_blocked_days,
 )
@@ -58,10 +59,42 @@ def test_day_offsets_blocks_friday():
     }
     offsets = day_offsets_from_today(row, today=today, num_days=7)
     assert 3 in offsets
+    occ = day_occupancy_from_today(row, today=today, num_days=7)
+    assert occ.get(3) == 1
+
+
+def test_day_occupancy_counts_spill_through_expand_horizon():
+    """Spill day 20 is invisible at num_days=14 but visible when horizon=28."""
+    today = _utc(2026, 6, 10).date()
+    row = {
+        "schedule_mode": "smart",
+        "schedule_metadata": {
+            "tiktok": "2026-06-30T12:00:00+00:00",  # offset 20
+        },
+        "scheduled_time": _utc(2026, 6, 30, 12),
+    }
+    assert day_occupancy_from_today(row, today=today, num_days=14) == {}
+    occ = day_occupancy_from_today(row, today=today, num_days=14, horizon=28)
+    assert occ.get(20) == 1
+    assert 20 in day_offsets_from_today(row, today=today, num_days=14, horizon=28)
+
+
+def test_day_occupancy_counts_multiple_platform_slots_same_day():
+    today = _utc(2026, 6, 10).date()
+    row = {
+        "schedule_mode": "smart",
+        "schedule_metadata": {
+            "tiktok": "2026-06-12T12:00:00+00:00",
+            "youtube": "2026-06-12T18:00:00+00:00",
+        },
+        "scheduled_time": _utc(2026, 6, 12, 12),
+    }
+    occ = day_occupancy_from_today(row, today=today, num_days=7)
+    assert occ.get(2) == 2
 
 
 def test_get_existing_scheduled_days_uses_friday_metadata():
-    """Blocked-day offsets match schedule_metadata, not just scheduled_time."""
+    """Occupancy offsets match schedule_metadata, not just scheduled_time."""
     import asyncio
 
     from core.scheduling import get_existing_scheduled_days
@@ -89,5 +122,5 @@ def test_get_existing_scheduled_days_uses_friday_metadata():
     finally:
         sched._now_utc = old_now
 
-    assert 1 in used
-    assert 3 in used
+    assert used.get(1) == 1
+    assert used.get(3) == 1

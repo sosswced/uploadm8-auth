@@ -197,6 +197,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "hashtagPosition":  "hashtag_position",
                         "trillOpenaiModel": "trill_openai_model",
                         "trillMinScore": "trill_min_score",
+                        "trillSkipLowScore": "trill_skip_low_score",
                         "trillAiEnhance": "trill_ai_enhance",
                         "trillEnabled": "trill_enabled",
                         "useAudioContext":  "use_audio_context",
@@ -794,7 +795,13 @@ async def mark_processing_failed(
         )
 
 
-async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
+async def mark_cancelled(
+    pool: asyncpg.Pool,
+    upload_id: str,
+    *,
+    error_code: Optional[str] = None,
+    error_detail: Optional[str] = None,
+):
     """Mark upload as cancelled.
 
     NOTE: Token refunds are NOT done here. The worker's ``CancelRequested``
@@ -802,17 +809,26 @@ async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
     of all wallet/ledger writes for cancellations and failures. Touching the
     wallet here too would either double-decrement ``put_reserved`` (relying
     on ``GREATEST(0, …)`` to mask the bug) or skip the ledger entry entirely.
+
+    Optional ``error_code`` / ``error_detail`` surface in the queue (e.g. Trill
+    min-score skip) without inventing a separate upload status.
     """
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE uploads
             SET status = 'cancelled',
+                error_code = COALESCE($2, error_code),
+                error_detail = COALESCE($3, error_detail),
                 processing_finished_at = NOW(),
+                processing_stage = 'done',
+                processing_progress = 100,
                 updated_at = NOW()
             WHERE id = $1
             """,
             upload_id,
+            (error_code or None),
+            (error_detail or None),
         )
 
 

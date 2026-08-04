@@ -21,6 +21,11 @@ logger = logging.getLogger("uploadm8-worker.trill_scenic")
 _SCENIC_MAX_BOOST = float(os.environ.get("TRILL_SCENIC_MAX_BOOST", "28") or "28")
 _SCENIC_MAX_BOOST = max(0.0, min(_SCENIC_MAX_BOOST, 40.0))
 
+
+def scenic_max_boost() -> float:
+    """Upper bound applied by :func:`apply_scenic_trill_boost` (for early Trill gates)."""
+    return float(_SCENIC_MAX_BOOST)
+
 # Per-factor caps (weighted scale; sum clamped by _SCENIC_MAX_BOOST).
 _WEIGHTS: Dict[str, float] = {
     "state_crossing": float(os.environ.get("TRILL_SCENIC_WEIGHT_STATE_CROSSING", "8") or 8),

@@ -31,6 +31,9 @@ _UPLOAD_PREF_MIRROR_PAIRS = [
     ("caption_creative_vary_style", "captionCreativeVaryStyle"),
     ("caption_creative_vary_tone", "captionCreativeVaryTone"),
     ("caption_creative_vary_voice", "captionCreativeVaryVoice"),
+    ("caption_creative_shuffle_seed", "captionCreativeShuffleSeed"),
+    ("caption_creative_deck_cursor", "captionCreativeDeckCursor"),
+    ("caption_creative_deck_fingerprint", "captionCreativeDeckFingerprint"),
     ("caption_style", "captionStyle"),
     ("caption_tone", "captionTone"),
     ("caption_voice", "captionVoice"),
@@ -146,8 +149,14 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
 
 
 def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) -> None:
-    """Overlay per-upload caption style/tone/voice randomize, locks, and fixed values."""
+    """Overlay per-upload caption style/tone/voice randomize, locks, and fixed values.
+
+    For cycle/shuffle mode, allocates the next shuffled-deck combo on the upload
+    prefs (not file order). Account deck cursor/seed are advanced in-place so the
+    caller can persist them back to ``users.preferences``.
+    """
     from core.caption_creative import (
+        allocate_shuffled_cycle_draw,
         normalize_caption_creative_pick_mode,
         normalize_caption_style,
         normalize_caption_tone,
@@ -174,18 +183,6 @@ def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) ->
         on = mode != "off"
         user_prefs["randomize_caption_creative"] = on
         user_prefs["randomizeCaptionCreative"] = on
-
-    idx = getattr(data, "caption_creative_combo_index", None)
-    if idx is None:
-        idx = getattr(data, "captionCreativeComboIndex", None)
-    if idx is not None and str(idx).strip() != "":
-        try:
-            v = int(idx)
-        except (TypeError, ValueError):
-            v = None
-        if v is not None:
-            user_prefs["caption_creative_combo_index"] = v
-            user_prefs["captionCreativeComboIndex"] = v
 
     def _merge_vary(attr_snake: str, attr_camel: str, out_snake: str, out_camel: str) -> None:
         raw = getattr(data, attr_snake, None)
@@ -240,6 +237,66 @@ def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) ->
         v = normalize_caption_voice(voice_raw)
         user_prefs["caption_voice"] = v
         user_prefs["captionVoice"] = v
+
+    effective = normalize_caption_creative_pick_mode(
+        user_prefs.get("captionCreativePickMode") or user_prefs.get("caption_creative_pick_mode")
+    )
+    if effective == "cycle":
+        # Ignore any client-sent combo index — deck draw must not depend on file order.
+        user_prefs.pop("caption_creative_combo_index", None)
+        user_prefs.pop("captionCreativeComboIndex", None)
+        allocate_shuffled_cycle_draw(user_prefs)
+
+
+async def persist_caption_creative_deck_state(conn: Any, user_id: Any, user_prefs: Dict[str, Any]) -> None:
+    """Write shuffled-deck cursor/seed back to ``users.preferences`` after a cycle draw."""
+    import json
+
+    from core.caption_creative import normalize_caption_creative_pick_mode
+
+    mode = normalize_caption_creative_pick_mode(
+        user_prefs.get("captionCreativePickMode") or user_prefs.get("caption_creative_pick_mode")
+    )
+    if mode != "cycle":
+        return
+    seed = user_prefs.get("captionCreativeShuffleSeed") or user_prefs.get("caption_creative_shuffle_seed")
+    cursor = user_prefs.get("captionCreativeDeckCursor")
+    if cursor is None:
+        cursor = user_prefs.get("caption_creative_deck_cursor")
+    fingerprint = user_prefs.get("captionCreativeDeckFingerprint") or user_prefs.get(
+        "caption_creative_deck_fingerprint"
+    )
+    if seed is None and cursor is None:
+        return
+    try:
+        raw = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user_id)
+    except Exception:
+        return
+    prefs: Dict[str, Any] = {}
+    if raw:
+        if isinstance(raw, str):
+            try:
+                prefs = json.loads(raw) or {}
+            except Exception:
+                prefs = {}
+        elif isinstance(raw, dict):
+            prefs = dict(raw)
+    if not isinstance(prefs, dict):
+        prefs = {}
+    if seed is not None:
+        prefs["captionCreativeShuffleSeed"] = prefs["caption_creative_shuffle_seed"] = seed
+    if cursor is not None:
+        prefs["captionCreativeDeckCursor"] = prefs["caption_creative_deck_cursor"] = int(cursor)
+    if fingerprint is not None:
+        prefs["captionCreativeDeckFingerprint"] = prefs["caption_creative_deck_fingerprint"] = fingerprint
+    try:
+        await conn.execute(
+            "UPDATE users SET preferences = $1::jsonb, updated_at = NOW() WHERE id = $2",
+            json.dumps(prefs, default=str),
+            user_id,
+        )
+    except Exception:
+        return
 
 
 def merge_upload_init_tiktok_post_settings(user_prefs: Dict[str, Any], data: Any) -> None:

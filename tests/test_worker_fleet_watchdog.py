@@ -242,13 +242,14 @@ def test_evaluate_render_event_alerts_dedupes_type():
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     alerts = evaluate_render_event_alerts(
         [
-            {"type": "server_failed", "severity": "critical", "timestamp": now},
-            {"type": "server_failed", "severity": "critical", "timestamp": now},
+            {"type": "server_failed", "severity": "critical", "timestamp": now, "id": "ev1"},
+            {"type": "server_failed", "severity": "critical", "timestamp": now, "id": "ev1"},
             {"type": "autoscaling_started", "severity": "info", "timestamp": now},
         ]
     )
     assert len(alerts) == 1
     assert alerts[0].incident_type == "render_event_server_failed"
+    assert alerts[0].details.get("event_dedupe_id") == "ev1"
 
 
 def test_evaluate_render_event_alerts_ignores_stale():

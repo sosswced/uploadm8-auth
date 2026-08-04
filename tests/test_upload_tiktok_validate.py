@@ -20,3 +20,13 @@ def test_tiktok_settings_incomplete_accounts():
         _validate_tiktok_by_account_settings({"by_account": {}}, ["acc-1", "acc-2"])
     detail = exc.value.detail
     assert detail.get("code") == "tiktok_settings_incomplete"
+
+
+def test_tiktok_rejects_empty_resolved_accounts():
+    """Ghost target_accounts UUIDs previously skipped validation (empty id list)."""
+    with pytest.raises(HTTPException) as exc:
+        _validate_tiktok_by_account_settings(
+            {"by_account": {"ghost": {"privacy_level": "PUBLIC_TO_EVERYONE", "user_consent": True}}},
+            [],
+        )
+    assert exc.value.detail.get("code") == "tiktok_account_required"

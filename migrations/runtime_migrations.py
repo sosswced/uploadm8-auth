@@ -2167,6 +2167,11 @@ async def run_migrations(db_pool):
                 ALTER TABLE user_preferences
                     ALTER COLUMN trill_openai_model SET DEFAULT 'gpt-4o';
             """),
+            # Opt-in: cancel publish when Trill score is below trill_min_score.
+            (1101, """
+                ALTER TABLE user_preferences
+                    ADD COLUMN IF NOT EXISTS trill_skip_low_score BOOLEAN NOT NULL DEFAULT FALSE;
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

@@ -29,6 +29,7 @@ from services.upload.prefs import (
     merge_upload_init_thumbnail_preferences,
     merge_upload_init_tiktok_post_settings,
     normalize_user_prefs_snapshot,
+    persist_caption_creative_deck_state,
 )
 from services.upload.tiktok import (
     _tiktok_target_account_ids,
@@ -165,6 +166,7 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
     merge_upload_init_thumbnail_preferences(user_prefs, data)
     merge_upload_init_caption_creative(user_prefs, data)
     merge_upload_init_tiktok_post_settings(user_prefs, data)
+    await persist_caption_creative_deck_state(conn, bill_id, user_prefs)
 
     tiktok_account_ids = await _tiktok_target_account_ids(conn, bill_id, data)
     _validate_tiktok_post_settings_for_upload(data, tiktok_account_ids)

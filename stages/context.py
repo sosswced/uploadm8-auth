@@ -1024,6 +1024,8 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             "captionFrameCount",
             "trill_min_score",
             "trillMinScore",
+            "trill_skip_low_score",
+            "trillSkipLowScore",
             "trill_ai_enhance",
             "trillAiEnhance",
             "trill_openai_model",

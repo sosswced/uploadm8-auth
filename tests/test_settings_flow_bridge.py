@@ -26,6 +26,7 @@ def test_create_context_uj_overlay_wins_for_studio_trim_burn_trill():
         "youtubeShortsCopyrightTrim": False,
         "tiktokBurnStyledCover": False,
         "trillMinScore": 10,
+        "trillSkipLowScore": False,
         "captionStyle": "factual",
         "speeding_mph": 40,
         "euphoria_mph": 60,
@@ -42,6 +43,7 @@ def test_create_context_uj_overlay_wins_for_studio_trim_burn_trill():
         "youtubeShortsCopyrightTrim": True,
         "tiktokBurnStyledCover": True,
         "trillMinScore": 55,
+        "trillSkipLowScore": True,
         "captionStyle": "punchy",
         "captionTone": "cinematic",
         "captionVoice": "teacher",
@@ -75,6 +77,7 @@ def test_create_context_uj_overlay_wins_for_studio_trim_burn_trill():
     assert us["youtubeShortsCopyrightTrim"] is True
     assert us["tiktokBurnStyledCover"] is True
     assert us["trillMinScore"] == 55
+    assert us["trillSkipLowScore"] is True
     assert us["captionStyle"] == "punchy"
     assert us["captionTone"] == "cinematic"
     assert us["captionVoice"] == "teacher"
@@ -92,6 +95,8 @@ def test_hydrate_includes_flow_critical_pairs():
         "thumbnail_apply_mode": "force",
         "speeding_mph": 50,
         "caption_style": "punchy",
+        "trill_skip_low_score": True,
+        "trill_min_score": 70,
     }
     _hydrate_snake_camel_mirror(d)
     assert d["youtubeShortsCopyrightTrim"] is True
@@ -99,6 +104,28 @@ def test_hydrate_includes_flow_critical_pairs():
     assert d["thumbnailApplyMode"] == "force"
     assert d["speedingMph"] == 50
     assert d["captionStyle"] == "punchy"
+    assert d["trillSkipLowScore"] is True
+    assert d["trillMinScore"] == 70
+
+
+def test_overlay_users_prefs_includes_trill_skip_gate():
+    """Mobile PUT /api/me/preferences JSON must win for Trill skip at presign."""
+    from routers.preferences import _overlay_users_prefs_on_result
+
+    result = {
+        "trill_skip_low_score": False,
+        "trillSkipLowScore": False,
+        "trill_min_score": 60,
+        "trillMinScore": 60,
+    }
+    _overlay_users_prefs_on_result(
+        result,
+        {"trillSkipLowScore": True, "trillMinScore": 75},
+    )
+    assert result["trillSkipLowScore"] is True
+    assert result["trill_skip_low_score"] is True
+    assert result["trillMinScore"] == 75
+    assert result["trill_min_score"] == 75
 
 
 def test_trill_content_prompt_includes_caption_prefs(monkeypatch):

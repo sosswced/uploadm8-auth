@@ -1534,4 +1534,65 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
                 discord_webhook,
                 user["id"],
             )
+        # Sync Trill gate keys into user_preferences columns so presign/worker
+        # match mobile PUT /api/me/preferences (JSON alone used to leave the
+        # column stale and skip the low-score abort).
+        _trill_keys = (
+            "trillSkipLowScore",
+            "trill_skip_low_score",
+            "trillMinScore",
+            "trill_min_score",
+            "trillEnabled",
+            "trill_enabled",
+            "trillAiEnhance",
+            "trill_ai_enhance",
+            "trillOpenaiModel",
+            "trill_openai_model",
+        )
+        if any(k in prefs for k in _trill_keys):
+            await conn.execute(
+                "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+                user["id"],
+            )
+            skip_raw = merged.get("trillSkipLowScore")
+            if skip_raw is None:
+                skip_raw = merged.get("trill_skip_low_score")
+            skip_b = bool(skip_raw) if skip_raw is not None else None
+            min_raw = merged.get("trillMinScore")
+            if min_raw is None:
+                min_raw = merged.get("trill_min_score")
+            min_i = None
+            if min_raw is not None:
+                try:
+                    min_i = max(0, min(100, int(min_raw)))
+                except (TypeError, ValueError):
+                    min_i = None
+            en_raw = merged.get("trillEnabled")
+            if en_raw is None:
+                en_raw = merged.get("trill_enabled")
+            en_b = bool(en_raw) if en_raw is not None else None
+            ai_raw = merged.get("trillAiEnhance")
+            if ai_raw is None:
+                ai_raw = merged.get("trill_ai_enhance")
+            ai_b = bool(ai_raw) if ai_raw is not None else None
+            model_raw = merged.get("trillOpenaiModel") or merged.get("trill_openai_model")
+            model_s = str(model_raw).strip()[:50] if model_raw else None
+            await conn.execute(
+                """
+                UPDATE user_preferences SET
+                    trill_skip_low_score = COALESCE($2, trill_skip_low_score),
+                    trill_min_score = COALESCE($3, trill_min_score),
+                    trill_enabled = COALESCE($4, trill_enabled),
+                    trill_ai_enhance = COALESCE($5, trill_ai_enhance),
+                    trill_openai_model = COALESCE($6, trill_openai_model),
+                    updated_at = NOW()
+                WHERE user_id = $1
+                """,
+                user["id"],
+                skip_b,
+                min_i,
+                en_b,
+                ai_b,
+                model_s,
+            )
     return {"status": "updated"}

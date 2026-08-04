@@ -53,6 +53,10 @@ UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
     "STALE_PROCESSING": (
         "Processing stalled and was stopped. Use Retry from Queue if you still need this upload."
     ),
+    "TRILL_BELOW_MIN": (
+        "Skipped: Trill score was below your minimum threshold. Tokens were refunded — "
+        "raise Skip low-Trill videos off in Settings, or lower Minimum Trill Score."
+    ),
 }
 
 

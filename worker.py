@@ -1226,11 +1226,9 @@ def _should_run_trill(ctx: JobContext) -> bool:
 
 
 def _trill_min_score(ctx: JobContext) -> int:
-    raw = ctx.user_settings.get("trill_min_score") or ctx.user_settings.get("trillMinScore") or 0
-    try:
-        return max(0, min(100, int(raw)))
-    except (TypeError, ValueError):
-        return 0
+    from services.trill_min_gate import trill_min_score
+
+    return trill_min_score(ctx.user_settings or {})
 
 
 def _apply_trill_caption_settings(ctx: JobContext) -> None:
@@ -1246,6 +1244,51 @@ def _apply_trill_caption_settings(ctx: JobContext) -> None:
         trill.hashtags = []
         ctx.trill_score = trill
         ctx.trill = trill
+
+
+async def _abort_if_trill_below_min(
+    ctx: JobContext,
+    *,
+    allow_scenic_headroom: bool = False,
+) -> None:
+    """Cancel publish when opt-in skip-low-Trill gate trips.
+
+    Tokens are refunded by the ``CancelRequested`` handler via ``_release_tokens``.
+    """
+    from services.trill_min_gate import should_skip_low_trill
+    from services.trill_scenic_boost import scenic_max_boost
+
+    trill = ctx.trill_score or getattr(ctx, "trill", None)
+    score = None
+    if trill is not None and getattr(trill, "score", None) is not None:
+        try:
+            score = float(trill.score)
+        except (TypeError, ValueError):
+            score = None
+    scenic = float(scenic_max_boost()) if allow_scenic_headroom else 0.0
+    skip, reason = should_skip_low_trill(
+        ctx.user_settings or {},
+        score,
+        allow_scenic_headroom=allow_scenic_headroom,
+        scenic_max_boost=scenic,
+    )
+    if not skip:
+        return
+    logger.info("[%s] %s — aborting before publish", ctx.upload_id, reason)
+    ctx.error_code = "TRILL_BELOW_MIN"
+    ctx.error_message = reason
+    ctx.state = "cancelled"
+    try:
+        await db_stage.save_trill_metadata(db_pool, ctx)
+    except Exception as e:
+        logger.debug("[%s] Trill metadata persist before skip failed: %s", ctx.upload_id, e)
+    await db_stage.mark_cancelled(
+        db_pool,
+        ctx.upload_id,
+        error_code="TRILL_BELOW_MIN",
+        error_detail=reason[:1000],
+    )
+    raise CancelRequested(ctx.upload_id)
 
 
 def _log_multimodal_pipeline_survey(upload_id: str, ctx: JobContext) -> None:
@@ -1559,6 +1602,8 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             try:
                 ctx = await run_telemetry_stage(ctx)
                 _apply_trill_caption_settings(ctx)
+                # Early abort only when scenic boost cannot possibly reach min.
+                await _abort_if_trill_below_min(ctx, allow_scenic_headroom=True)
                 tel = ctx.telemetry or ctx.telemetry_data
                 _ai_trace(ctx, upload_id, "telemetry", {
                     "status": "ok",
@@ -2167,9 +2212,15 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except Exception as _tsb_e:
             logger.debug(f"[{upload_id}] Trill scenic boost skipped: {_tsb_e}")
         try:
+            _apply_trill_caption_settings(ctx)
+        except Exception as _tcs_e:
+            logger.debug(f"[{upload_id}] Trill caption settings skipped: {_tcs_e}")
+        try:
             await db_stage.save_trill_metadata(db_pool, ctx)
         except Exception as e:
             logger.debug(f"[{upload_id}] OSD Trill metadata persist skipped: {e}")
+        # Final gate: after scenic boost — skip low scores when opted in.
+        await _abort_if_trill_below_min(ctx, allow_scenic_headroom=False)
         await maybe_cancel(ctx, "dashcam_osd")
 
         # ── Speed consensus (canonical publishable peak) ─────────────────────

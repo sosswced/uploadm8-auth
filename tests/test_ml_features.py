@@ -11,6 +11,7 @@ from services.content_success_features import (
     _base_features,
     build_records,
     label_hotness,
+    rank_dimension,
 )
 from services.ml_feature_registry import (
     active_cat,
@@ -44,6 +45,33 @@ def test_catalog_includes_both_loops():
     loops = {r["loop"] for r in rows}
     assert loops == {"promo", "content"}
     assert any(r["name"] == "views_per_day" and r["loop"] == "content" for r in rows)
+
+
+def test_rank_dimension_skips_null_and_none_labels():
+    """User-facing rankings must not lead with blank / sentinel buckets."""
+    df = pd.DataFrame(
+        [
+            {"content_category": None, "engagement_rate_pct": 5.0, "views": 100, "interactions": 5, "is_hot": 1},
+            {"content_category": None, "engagement_rate_pct": 4.0, "views": 90, "interactions": 4, "is_hot": 1},
+            {"content_category": None, "engagement_rate_pct": 3.0, "views": 80, "interactions": 3, "is_hot": 0},
+            {"content_category": "automotive", "engagement_rate_pct": 2.0, "views": 50, "interactions": 2, "is_hot": 0},
+            {"content_category": "automotive", "engagement_rate_pct": 2.5, "views": 55, "interactions": 2, "is_hot": 1},
+            {"content_category": "automotive", "engagement_rate_pct": 1.5, "views": 40, "interactions": 1, "is_hot": 0},
+            {"primary_hashtag": "none", "engagement_rate_pct": 9.0, "views": 200, "interactions": 9, "is_hot": 1},
+            {"primary_hashtag": "none", "engagement_rate_pct": 8.0, "views": 180, "interactions": 8, "is_hot": 1},
+            {"primary_hashtag": "none", "engagement_rate_pct": 7.0, "views": 160, "interactions": 7, "is_hot": 1},
+            {"primary_hashtag": "gloryboy", "engagement_rate_pct": 1.0, "views": 30, "interactions": 1, "is_hot": 0},
+            {"primary_hashtag": "gloryboy", "engagement_rate_pct": 1.2, "views": 35, "interactions": 1, "is_hot": 0},
+            {"primary_hashtag": "gloryboy", "engagement_rate_pct": 0.8, "views": 25, "interactions": 1, "is_hot": 0},
+        ]
+    )
+    topics = rank_dimension(df, ["content_category"], min_samples=3, limit=10)
+    assert topics and all(t.get("content_category") for t in topics)
+    assert topics[0]["content_category"] == "automotive"
+
+    tags = rank_dimension(df, ["primary_hashtag"], min_samples=3, limit=10)
+    assert tags and all(t.get("primary_hashtag") not in (None, "none") for t in tags)
+    assert tags[0]["primary_hashtag"] == "gloryboy"
 
 
 def test_admin_ml_observability_routes_do_not_shadow_catalog():
@@ -263,7 +291,12 @@ def test_ml_engine_finalize_blocks_seeded_and_cold_data():
             cfg,
             None,
             out,
-            {"status": "ok", "train_rows": max(cfg.min_train_rows, 100), "roc_auc": 0.99},
+            {
+                "status": "ok",
+                "train_rows": max(cfg.min_train_rows, 100),
+                "roc_auc": 0.99,
+                "n_user_groups": max(cfg.publish_min_user_groups, 200),
+            },
             True,
             task="promo_targeting_uplift_baseline",
             push_step=MagicMock(return_value={"ok": True}),
@@ -297,6 +330,7 @@ def test_ml_engine_finalize_blocks_seeded_and_cold_data():
                 "status": "ok",
                 "train_rows": max(cfg.min_train_rows, 100),
                 "roc_auc": max(0.0, cfg.publish_min_roc_auc - 0.2),
+                "n_user_groups": max(cfg.publish_min_user_groups, 200),
             },
             False,
             task="promo_targeting_uplift_baseline",
@@ -320,6 +354,97 @@ def test_ml_engine_finalize_blocks_seeded_and_cold_data():
     assert "roc_auc" in low["reason_not_published"]
 
 
+def test_publish_quality_content_near_miss_and_promo_overfit():
+    """Close the three watch gaps: content near-miss, promo small-n / overfit."""
+    from services.ml_engine import _passes_publish_quality
+    from services.ml_engine_config import get_ml_engine_config
+
+    cfg = get_ml_engine_config()
+    min_roc = cfg.publish_min_roc_auc
+
+    # Content: 0.549-style near miss with healthy NDCG → promote
+    ok, reason = _passes_publish_quality(
+        cfg,
+        {
+            "roc_auc": min_roc - (cfg.publish_near_miss_epsilon * 0.5),
+            "ndcg_at_10": max(cfg.publish_min_ndcg_at_10, 0.65),
+            "train_rows": 50,
+        },
+        "content_success_hotness",
+    )
+    assert ok is True and reason is None
+
+    # Content: near miss but weak rankings → withhold
+    ok, reason = _passes_publish_quality(
+        cfg,
+        {
+            "roc_auc": min_roc - (cfg.publish_near_miss_epsilon * 0.5),
+            "ndcg_at_10": max(0.0, cfg.publish_min_ndcg_at_10 - 0.2),
+            "train_rows": 50,
+        },
+        "content_success_hotness",
+    )
+    assert ok is False
+    assert reason and "ndcg" in reason
+
+    # Promo: 69 groups below min → withhold (small-n)
+    ok, reason = _passes_publish_quality(
+        cfg,
+        {
+            "roc_auc": 0.99,
+            "n_user_groups": max(1, cfg.publish_min_user_groups - 1),
+            "train_rows": 69,
+        },
+        "promo_targeting_uplift_baseline",
+    )
+    assert ok is False
+    assert reason and "n_user_groups" in reason
+
+    # Promo: enough for min groups but still under overfit floor with sky-high AUC
+    mid_groups = max(cfg.publish_min_user_groups, 1)
+    if mid_groups < cfg.publish_overfit_max_user_groups:
+        ok, reason = _passes_publish_quality(
+            cfg,
+            {
+                "roc_auc": max(cfg.publish_overfit_roc_auc, 0.99),
+                "n_user_groups": mid_groups,
+                "train_rows": 200,
+            },
+            "promo_targeting_uplift_baseline",
+        )
+        assert ok is False
+        assert reason and "overfit" in reason
+
+    # Promo: healthy sample + honest ROC → pass quality
+    ok, reason = _passes_publish_quality(
+        cfg,
+        {
+            "roc_auc": max(min_roc, 0.62),
+            "n_user_groups": max(cfg.publish_overfit_max_user_groups, 200),
+            "train_rows": 500,
+        },
+        "promo_targeting_uplift_baseline",
+    )
+    assert ok is True and reason is None
+
+
+def test_m8_blend_hour_priors_mixes_static_and_learned():
+    from core.scheduling import static_hour_prior_24
+    from services.m8_publish_hour_model import M8_PRIOR_PLATFORMS, _blend_hour_priors
+
+    learned = {
+        "youtube": [0.0] * 23 + [1.0],
+    }
+    blended = _blend_hour_priors(learned, alpha=0.5, static_fn=static_hour_prior_24)
+    assert set(blended.keys()) == set(M8_PRIOR_PLATFORMS)
+    assert abs(sum(blended["youtube"]) - 1.0) < 1e-6
+    # Peak hour should move toward 23 vs pure static
+    static_yt = static_hour_prior_24("youtube")
+    assert blended["youtube"][23] > static_yt[23]
+    # Platforms without learned weights stay static
+    assert blended["tiktok"] == list(static_hour_prior_24("tiktok"))
+
+
 def test_smart_schedule_blend_prefers_user_when_enough_samples():
     from services.smart_schedule_insights import _blend_vectors, _normalize
 
@@ -333,6 +458,75 @@ def test_smart_schedule_blend_prefers_user_when_enough_samples():
     assert abs(sum(low) - 1.0) < 1e-6
     assert abs(sum(high) - 1.0) < 1e-6
     assert high[18] > low[18]
+
+
+def test_finalize_publishes_content_near_miss_with_ndcg():
+    """Content ROC just under floor + healthy NDCG must reach Hub push."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from services.ml_engine import _finalize_publish
+    from services.ml_engine_config import get_ml_engine_config
+
+    async def _run():
+        out: dict = {}
+        cfg = get_ml_engine_config()
+        push = MagicMock(return_value={"ok": True})
+        await _finalize_publish(
+            cfg,
+            None,
+            out,
+            {
+                "status": "ok",
+                "train_rows": 50,
+                "roc_auc": cfg.publish_min_roc_auc - (cfg.publish_near_miss_epsilon * 0.4),
+                "ndcg_at_10": 0.65,
+            },
+            False,
+            task="content_success_hotness",
+            push_step=push,
+            record_run=MagicMock(return_value="run-1"),
+        )
+        return out, push
+
+    out, push = asyncio.run(_run())
+    assert out.get("status") == "published"
+    assert out.get("ok") is True
+    push.assert_called_once()
+
+
+def test_finalize_withholds_promo_small_n_overfit():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from services.ml_engine import _finalize_publish
+    from services.ml_engine_config import get_ml_engine_config
+
+    async def _run():
+        out: dict = {}
+        cfg = get_ml_engine_config()
+        push = MagicMock(side_effect=AssertionError("must not push overfit promo"))
+        await _finalize_publish(
+            cfg,
+            None,
+            out,
+            {
+                "status": "ok",
+                "train_rows": 69,
+                "roc_auc": 0.9949,
+                "n_user_groups": 69,
+            },
+            False,
+            task="promo_targeting_uplift_baseline",
+            push_step=push,
+            record_run=MagicMock(),
+        )
+        return out
+
+    out = asyncio.run(_run())
+    assert out.get("ok") is True
+    assert out.get("status") == "trained_not_published"
+    assert "n_user_groups" in (out.get("reason_not_published") or "")
 
 
 def test_architecture_doc_restored():

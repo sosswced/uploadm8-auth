@@ -198,10 +198,22 @@ def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
         ("hashtagPosition", "hashtag_position"), ("autoCaptions", "auto_captions"),
         ("autoThumbnails", "auto_thumbnails"), ("styledThumbnails", "styled_thumbnails"),
         ("defaultPrivacy", "default_privacy"), ("thumbnailInterval", "thumbnail_interval"),
+        ("trillEnabled", "trill_enabled"), ("trillAiEnhance", "trill_ai_enhance"),
+        ("trillOpenaiModel", "trill_openai_model"),
+        ("trillSkipLowScore", "trill_skip_low_score"),
     ]:
         v = up.get(camel) if up.get(camel) is not None else up.get(snake)
         if v is not None:
             result[camel] = result[snake] = v
+
+    # Min score needs int clamp (mobile PUT may send string)
+    _min_raw = up.get("trillMinScore") if up.get("trillMinScore") is not None else up.get("trill_min_score")
+    if _min_raw is not None:
+        try:
+            _min_i = max(0, min(100, int(_min_raw)))
+            result["trillMinScore"] = result["trill_min_score"] = _min_i
+        except (TypeError, ValueError):
+            pass
 
     _overlay_upload_ai_audio_studio_prefs(result, up)
 
@@ -223,6 +235,7 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("discord_webhook", "discordWebhook"),
         ("trill_enabled", "trillEnabled"),
         ("trill_min_score", "trillMinScore"),
+        ("trill_skip_low_score", "trillSkipLowScore"),
         ("trill_ai_enhance", "trillAiEnhance"),
         ("trill_openai_model", "trillOpenaiModel"),
         ("trill_leaderboard_opt_in", "trillLeaderboardOptIn"),
@@ -565,6 +578,7 @@ async def get_user_preferences(
                 "trillMinScore": (
                     60 if d.get("trill_min_score") is None else int(d.get("trill_min_score") or 60)
                 ),
+                "trillSkipLowScore": bool(d.get("trill_skip_low_score", False)),
                 "trillAiEnhance": (
                     True if d.get("trill_ai_enhance") is None else bool(d.get("trill_ai_enhance"))
                 ),
@@ -674,7 +688,7 @@ async def get_user_preferences(
             "alwaysHashtags": [], "blockedHashtags": [],
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": True, "discordWebhook": None,
-            "trillEnabled": True, "trillMinScore": 60,
+            "trillEnabled": True, "trillMinScore": 60, "trillSkipLowScore": False,
             "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o",
             "trillLeaderboardOptIn": False, "trillMapSharingOptIn": False,
             "styledThumbnails": True,

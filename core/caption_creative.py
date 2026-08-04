@@ -493,7 +493,7 @@ def normalize_caption_creative_pick_mode(value: Any) -> str:
     s = str(value or "").strip().lower().replace("-", "_")
     if s in ("1", "true", "yes", "on", "randomize", "random"):
         return "random"
-    if s in ("cycle", "sweep", "combinatorial", "all", "sequential"):
+    if s in ("cycle", "sweep", "combinatorial", "all", "sequential", "shuffle", "deck"):
         return "cycle"
     if s in ("0", "false", "no", "off", "none", ""):
         return "off"
@@ -604,6 +604,120 @@ def _stable_combo_index_from_upload_id(upload_id: Any, *, modulus: int) -> int:
     return int(digest[:12], 16) % max(1, int(modulus))
 
 
+def subspace_axes_from_prefs(prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the unlocked style/tone/voice product for the current lock state."""
+    us = prefs if isinstance(prefs, dict) else {}
+    base_style = normalize_caption_style(us.get("captionStyle") or us.get("caption_style"))
+    base_tone = normalize_caption_tone(us.get("captionTone") or us.get("caption_tone"))
+    base_voice = normalize_caption_voice(us.get("captionVoice") or us.get("caption_voice"))
+    vary = parse_caption_creative_vary_flags(us)
+    styles: Tuple[str, ...] = CAPTION_STYLES if vary["style"] else (base_style,)
+    tones: Tuple[str, ...] = CAPTION_TONES if vary["tone"] else (base_tone,)
+    voices: Tuple[str, ...] = CAPTION_VOICES if vary["voice"] else (base_voice,)
+    size = max(1, len(styles) * len(tones) * len(voices))
+    fingerprint = "|".join(
+        [
+            "1" if vary["style"] else f"S:{base_style}",
+            "1" if vary["tone"] else f"T:{base_tone}",
+            "1" if vary["voice"] else f"V:{base_voice}",
+            f"n={size}",
+        ]
+    )
+    return {
+        "styles": styles,
+        "tones": tones,
+        "voices": voices,
+        "vary": vary,
+        "size": size,
+        "fingerprint": fingerprint,
+        "base_style": base_style,
+        "base_tone": base_tone,
+        "base_voice": base_voice,
+    }
+
+
+def shuffled_deck_order(seed: str, n: int) -> List[int]:
+    """Deterministic Fisher–Yates shuffle of 0..n-1 from a string seed."""
+    order = list(range(max(1, int(n))))
+    random.Random(str(seed)).shuffle(order)
+    return order
+
+
+def allocate_shuffled_cycle_draw(prefs: Dict[str, Any]) -> Dict[str, Any]:
+    """Draw the next combo from a shuffled deck (no file-order, no repeats until reset).
+
+    Mutates ``prefs`` with:
+      - captionCreativeComboIndex / caption_creative_combo_index (0-based subspace idx)
+      - captionCreativeShuffleSeed / deck cursor / fingerprint (advanced)
+
+    Returns the deck fields that should be persisted on the account for the next draw.
+    """
+    space = subspace_axes_from_prefs(prefs)
+    size = int(space["size"])
+    fingerprint = str(space["fingerprint"])
+
+    prev_fp = str(
+        prefs.get("captionCreativeDeckFingerprint")
+        or prefs.get("caption_creative_deck_fingerprint")
+        or ""
+    )
+    try:
+        cursor = int(
+            prefs.get("captionCreativeDeckCursor")
+            if "captionCreativeDeckCursor" in prefs
+            else prefs.get("caption_creative_deck_cursor")
+            or 0
+        )
+    except (TypeError, ValueError):
+        cursor = 0
+
+    seed = str(
+        prefs.get("captionCreativeShuffleSeed")
+        or prefs.get("caption_creative_shuffle_seed")
+        or ""
+    ).strip()
+
+    # New deck when locks change, seed missing, or deck exhausted.
+    if (not seed) or prev_fp != fingerprint or cursor < 0 or cursor >= size:
+        seed = hashlib.sha256(
+            f"{fingerprint}:{cursor}:{random.randrange(1 << 30)}".encode("utf-8")
+        ).hexdigest()[:16]
+        cursor = 0
+
+    order = shuffled_deck_order(seed, size)
+    raw_idx = int(order[cursor % size])
+    next_cursor = cursor + 1
+    # When the deck empties, next draw will reshuffle (new seed).
+    if next_cursor >= size:
+        next_seed = hashlib.sha256(f"{seed}:reshuffle:{fingerprint}".encode("utf-8")).hexdigest()[:16]
+        persist_seed = next_seed
+        persist_cursor = 0
+    else:
+        persist_seed = seed
+        persist_cursor = next_cursor
+
+    prefs["caption_creative_combo_index"] = prefs["captionCreativeComboIndex"] = raw_idx
+    prefs["caption_creative_shuffle_seed"] = prefs["captionCreativeShuffleSeed"] = persist_seed
+    prefs["caption_creative_deck_cursor"] = prefs["captionCreativeDeckCursor"] = persist_cursor
+    prefs["caption_creative_deck_fingerprint"] = prefs["captionCreativeDeckFingerprint"] = fingerprint
+    # Keep the seed that produced THIS draw for artifacts/debug (pre-advance).
+    prefs["caption_creative_draw_seed"] = prefs["captionCreativeDrawSeed"] = seed
+    prefs["caption_creative_draw_cursor"] = prefs["captionCreativeDrawCursor"] = cursor
+
+    return {
+        "captionCreativeShuffleSeed": persist_seed,
+        "caption_creative_shuffle_seed": persist_seed,
+        "captionCreativeDeckCursor": persist_cursor,
+        "caption_creative_deck_cursor": persist_cursor,
+        "captionCreativeDeckFingerprint": fingerprint,
+        "caption_creative_deck_fingerprint": fingerprint,
+        "drawn_subspace_index": raw_idx,
+        "draw_seed": seed,
+        "draw_cursor": cursor,
+        "subspace_size": size,
+    }
+
+
 def resolve_caption_creative_knobs(
     prefs: Optional[Dict[str, Any]],
     *,
@@ -615,11 +729,12 @@ def resolve_caption_creative_knobs(
 
     Pref keys (snake or camel):
       - randomizeCaptionCreative / captionCreativePickMode (off|random|cycle)
-      - captionCreativeComboIndex (0-based; cycle)
+      - captionCreativeComboIndex (0-based subspace index; cycle/shuffle deck)
       - captionCreativeVaryStyle|Tone|Voice (bool; default True when randomizing)
       - captionCreativeLockStyle|Tone|Voice (bool; invert of vary when set)
       - captionStyle / captionTone / captionVoice (locked-axis values)
 
+    Cycle mode expects a server-allocated shuffled deck index (presign), not file order.
     Returns: style, tone, voice, pick_mode, combo_index (1-based in full matrix),
     randomized, vary (dict), subspace_size.
     """
@@ -637,10 +752,11 @@ def resolve_caption_creative_knobs(
         )
     mode = normalize_caption_creative_pick_mode(mode_raw)
 
-    base_style = normalize_caption_style(us.get("captionStyle") or us.get("caption_style"))
-    base_tone = normalize_caption_tone(us.get("captionTone") or us.get("caption_tone"))
-    base_voice = normalize_caption_voice(us.get("captionVoice") or us.get("caption_voice"))
-    vary = parse_caption_creative_vary_flags(us)
+    space = subspace_axes_from_prefs(us)
+    base_style = space["base_style"]
+    base_tone = space["base_tone"]
+    base_voice = space["base_voice"]
+    vary = space["vary"]
 
     if mode == "off" or not any(vary.values()):
         return {
@@ -654,10 +770,10 @@ def resolve_caption_creative_knobs(
             "subspace_size": 1,
         }
 
-    styles: Tuple[str, ...] = CAPTION_STYLES if vary["style"] else (base_style,)
-    tones: Tuple[str, ...] = CAPTION_TONES if vary["tone"] else (base_tone,)
-    voices: Tuple[str, ...] = CAPTION_VOICES if vary["voice"] else (base_voice,)
-    subspace = max(1, len(styles) * len(tones) * len(voices))
+    styles: Tuple[str, ...] = space["styles"]
+    tones: Tuple[str, ...] = space["tones"]
+    voices: Tuple[str, ...] = space["voices"]
+    subspace = int(space["size"])
 
     if mode == "cycle":
         idx0: Optional[int] = combo_index
@@ -673,6 +789,7 @@ def resolve_caption_creative_knobs(
                 except (TypeError, ValueError):
                     idx0 = None
         if idx0 is None:
+            # Fallback if presign forgot to allocate: stable hash (not file order).
             idx0 = _stable_combo_index_from_upload_id(upload_id, modulus=subspace)
         style, tone, voice = combination_at_axes(idx0, styles=styles, tones=tones, voices=voices)
     else:
@@ -1000,6 +1117,9 @@ __all__ = [
     "pick_random_combination",
     "pick_random_combination_axes",
     "parse_caption_creative_vary_flags",
+    "subspace_axes_from_prefs",
+    "shuffled_deck_order",
+    "allocate_shuffled_cycle_draw",
     "normalize_caption_creative_pick_mode",
     "resolve_caption_creative_knobs",
     "CAPTION_CREATIVE_PICK_MODES",

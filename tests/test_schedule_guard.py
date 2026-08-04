@@ -264,7 +264,7 @@ def test_calculate_smart_schedule_covers_all_four_platforms():
     schedule = calculate_smart_schedule(plats, num_days=14, user_timezone="America/Chicago", random_seed="test-all")
     assert set(schedule.keys()) == {"tiktok", "youtube", "instagram", "facebook"}
     assert all(isinstance(v, datetime) for v in schedule.values())
-    # Distinct day slots preferred (used_days) — times should differ across platforms
+    # Soft-spread prefers distinct times across platforms when the window is open
     assert len({v.isoformat() for v in schedule.values()}) >= 3
 
 

@@ -38,6 +38,7 @@ _CAMEL_TO_SNAKE: dict[str, str] = {
     "discordWebhook": "discord_webhook",
     "trillEnabled": "trill_enabled",
     "trillMinScore": "trill_min_score",
+    "trillSkipLowScore": "trill_skip_low_score",
     "trillAiEnhance": "trill_ai_enhance",
     "trillOpenaiModel": "trill_openai_model",
     "trillLeaderboardOptIn": "trill_leaderboard_opt_in",
@@ -297,6 +298,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
         trill_min_score = max(0, min(100, trill_min_score))
     except (TypeError, ValueError):
         trill_min_score = 60
+    trill_skip_low_score = _coerce_bool(p.get("trill_skip_low_score"), False)
     trill_ai_enhance = _coerce_bool(p.get("trill_ai_enhance"), True)
     from core.openai_caption_model import normalize_openai_caption_model
 
@@ -430,8 +432,9 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 trill_leaderboard_opt_in = $37,
                 trill_map_sharing_opt_in = $38,
                 trill_welcome_modal_seen_at = $39,
+                trill_skip_low_score = $40,
                 updated_at = NOW()
-            WHERE user_id = $40
+            WHERE user_id = $41
             """,
             auto_captions,
             auto_thumbnails,
@@ -477,6 +480,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             trill_leaderboard_opt_in,
             trill_map_sharing_opt_in,
             trill_welcome_modal_seen_at,
+            trill_skip_low_score,
             uid,
         )
 
@@ -751,6 +755,31 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             except Exception as _cap_err:
                 log.warning("Caption sync to users.preferences failed (column may not exist): %s", _cap_err)
 
+        # Always mirror Trill gate prefs into users.preferences so mobile GET/PUT
+        # and get_user_prefs_for_upload JSON overlay stay aligned with columns.
+        try:
+            users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", uid)
+            users_prefs: dict[str, Any] = {}
+            if users_prefs_row:
+                users_prefs = (
+                    json.loads(users_prefs_row) if isinstance(users_prefs_row, str) else (users_prefs_row or {})
+                )
+            if not isinstance(users_prefs, dict):
+                users_prefs = {}
+            users_prefs["trillEnabled"] = users_prefs["trill_enabled"] = trill_enabled
+            users_prefs["trillMinScore"] = users_prefs["trill_min_score"] = trill_min_score
+            users_prefs["trillSkipLowScore"] = users_prefs["trill_skip_low_score"] = trill_skip_low_score
+            users_prefs["trillAiEnhance"] = users_prefs["trill_ai_enhance"] = trill_ai_enhance
+            users_prefs["trillOpenaiModel"] = users_prefs["trill_openai_model"] = trill_openai_model
+            normalize_preferences_dict(users_prefs)
+            await conn.execute(
+                "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+                users_prefs,
+                uid,
+            )
+        except Exception as _trill_json_err:
+            log.warning("Trill prefs sync to users.preferences failed: %s", _trill_json_err)
+
         row = await conn.fetchrow("SELECT updated_at FROM user_preferences WHERE user_id = $1", uid)
 
         return {
@@ -795,6 +824,58 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 discord_webhook,
                 uid,
             )
+            # Best-effort Trill columns (may fail if migration 1101 not applied yet).
+            try:
+                await conn.execute(
+                    """
+                    UPDATE user_preferences SET
+                        trill_enabled = $2,
+                        trill_min_score = $3,
+                        trill_skip_low_score = $4,
+                        trill_ai_enhance = $5,
+                        trill_openai_model = $6,
+                        updated_at = NOW()
+                    WHERE user_id = $1
+                    """,
+                    uid,
+                    trill_enabled,
+                    trill_min_score,
+                    trill_skip_low_score,
+                    trill_ai_enhance,
+                    trill_openai_model,
+                )
+            except Exception as _trill_fb_err:
+                log.warning(
+                    "Fallback Trill column save skipped (migration may be pending): %s",
+                    _trill_fb_err,
+                )
+            # Always keep JSON mirror so overlay path works even without the column.
+            try:
+                users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", uid)
+                users_prefs: dict[str, Any] = {}
+                if users_prefs_row:
+                    users_prefs = (
+                        json.loads(users_prefs_row)
+                        if isinstance(users_prefs_row, str)
+                        else (users_prefs_row or {})
+                    )
+                if not isinstance(users_prefs, dict):
+                    users_prefs = {}
+                users_prefs["trillEnabled"] = users_prefs["trill_enabled"] = trill_enabled
+                users_prefs["trillMinScore"] = users_prefs["trill_min_score"] = trill_min_score
+                users_prefs["trillSkipLowScore"] = users_prefs["trill_skip_low_score"] = (
+                    trill_skip_low_score
+                )
+                users_prefs["trillAiEnhance"] = users_prefs["trill_ai_enhance"] = trill_ai_enhance
+                users_prefs["trillOpenaiModel"] = users_prefs["trill_openai_model"] = trill_openai_model
+                normalize_preferences_dict(users_prefs)
+                await conn.execute(
+                    "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+                    users_prefs,
+                    uid,
+                )
+            except Exception as _trill_json_fb_err:
+                log.warning("Fallback Trill JSON sync failed: %s", _trill_json_fb_err)
             row = await conn.fetchrow("SELECT updated_at FROM user_preferences WHERE user_id=$1", uid)
             return {
                 "ok": True,

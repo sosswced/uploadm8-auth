@@ -105,6 +105,8 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "trillEnabled": True,
     "trill_min_score": 60,
     "trillMinScore": 60,
+    "trill_skip_low_score": False,
+    "trillSkipLowScore": False,
     "trill_ai_enhance": True,
     "trillAiEnhance": True,
     "trill_openai_model": "gpt-4o",

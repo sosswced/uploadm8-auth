@@ -81,8 +81,58 @@ def _backoff_s(attempt: int) -> float:
     return min(8.0, 0.35 * (2 ** (attempt - 1)))
 
 
+def _connect_attempts() -> int:
+    """Standalone asyncpg.connect retry budget (ML dataset scripts, one-shot tools)."""
+    try:
+        return max(1, int(os.environ.get("DB_CONNECT_ATTEMPTS", "5")))
+    except ValueError:
+        return 5
+
+
+def _connect_timeout_s() -> float:
+    try:
+        return max(2.0, float(os.environ.get("DB_CONNECT_TIMEOUT_S", "30")))
+    except ValueError:
+        return 30.0
+
+
 def _is_timeout_exc(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+
+
+async def connect_with_retry(
+    dsn: str,
+    *,
+    attempts: int | None = None,
+    timeout: float | None = None,
+    **connect_kwargs,
+) -> asyncpg.Connection:
+    """``asyncpg.connect`` with backoff for transient DNS / cluster wake failures.
+
+    Covers ``socket.gaierror`` (subclass of ``OSError``) which surfaces as
+    ``getaddrinfo`` failures in ML dataset build subprocesses.
+    """
+    max_attempts = attempts if attempts is not None else _connect_attempts()
+    connect_timeout = timeout if timeout is not None else _connect_timeout_s()
+    last_err: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await asyncpg.connect(dsn, timeout=connect_timeout, **connect_kwargs)
+        except _TRANSIENT_DB_ERRORS as e:
+            last_err = e
+            if attempt >= max_attempts:
+                break
+            delay = _backoff_s(attempt)
+            logger.warning(
+                "db connect transient error (attempt %s/%s, sleep %.2fs): %s",
+                attempt,
+                max_attempts,
+                delay,
+                e,
+            )
+            await asyncio.sleep(delay)
+    assert last_err is not None
+    raise last_err
 
 
 async def _discard_bad_conn(pool, conn) -> None:

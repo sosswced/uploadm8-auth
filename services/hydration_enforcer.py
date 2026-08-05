@@ -515,10 +515,13 @@ def _vision_ocr_peak_mph(ocr: str) -> float:
     """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD).
 
     Only unit-labeled speeds (mph / kmh after the digits) on HUD-anchored lines
-    count — bare integers and roadside SPEED LIMIT copy never become peaks.
+    count — bare integers, lat/lon degrees, headings, and SPEED LIMIT copy never
+    become peaks.
     """
     if not ocr:
         return 0.0
+    from core.speed_units import looks_like_coordinate_or_degree
+
     if re.search(r"speed\s*limit|maximum\s*speed|school\s*zone|work\s*zone", ocr, re.I):
         # Still allow HUD-like lines elsewhere in the blob; strip limit lines.
         ocr = re.sub(
@@ -534,9 +537,18 @@ def _vision_ocr_peak_mph(ocr: str) -> float:
         chunks = [line.strip() for line in ocr.splitlines() if line.strip()]
     vals: List[float] = []
     for chunk in chunks:
+        # Coordinate / heading-only lines are never speeds.
+        if looks_like_coordinate_or_degree(chunk):
+            continue
         rec = parse_osd_line(chunk, require_hud_anchor_for_speed=True)
         mph = rec.get("speed_mph")
+        unit = str(rec.get("speed_unit") or "").strip()
         if mph is None:
+            continue
+        # Fail closed unless the parser recorded an MPH/KMH unit.
+        from core.speed_units import is_speed_unit
+
+        if not unit or not is_speed_unit(unit):
             continue
         try:
             v = float(mph)
@@ -588,9 +600,16 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         except (TypeError, ValueError):
             osd_avg = 0.0
 
-    from core.speed_consensus import consensus_peak_mph, get_speed_consensus
+    from core.speed_consensus import (
+        consensus_peak_mph,
+        get_speed_consensus,
+        publishable_peak_mph,
+    )
 
-    peak = consensus_peak_mph(ctx)
+    # Hard publish (titles/anchors/hashtag MPH) requires high confidence.
+    # Candidate peak still drives wrong-MPH scrub via consensus_peak_mph.
+    peak = publishable_peak_mph(ctx)
+    candidate = consensus_peak_mph(ctx)
     cons = get_speed_consensus(ctx)
     src = str((cons or {}).get("source") or "")
     if peak >= 5:
@@ -600,6 +619,9 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             else (osd_avg if src.startswith("osd") and osd_avg > 0 else peak)
         )
         pool.speed_source = src or "consensus"
+    elif candidate >= 5:
+        # Keep source label for diagnostics; do not force MPH into anchors.
+        pool.speed_source = f"{src or 'consensus'}:{cons.get('confidence') or 'low'}"
 
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         drv = osd.get("driver_name")
@@ -1123,30 +1145,29 @@ def _closing_restates_anchor(closing: str, bits: List[str], place: str) -> bool:
 
 
 def _compact_timeline_title(pool: EvidencePool) -> str:
-    """Canonical speed · road/place · music headline from EvidencePool (trusted peak)."""
-    parts: List[str] = []
+    """Spoken evidence title for empty fallbacks — not a bare · noun stack."""
+    speed = ""
     if pool.max_speed_mph and pool.max_speed_mph >= 5:
-        parts.append(f"{int(round(pool.max_speed_mph))} MPH")
+        speed = f"{int(round(pool.max_speed_mph))} MPH"
 
     road_disp = primary_road_display(pool.road)
     place = _format_place(pool)
-    geo_bits: List[str] = []
+    # Prefer road when present (dashcam specificity); else city/sign/landmark.
+    geo = ""
     if road_disp:
-        geo_bits.append(road_disp)
-    if place and (not road_disp or place.lower() not in road_disp.lower()):
-        geo_bits.append(place)
-    elif not road_disp and pool.place_sign:
-        geo_bits.append(str(pool.place_sign).strip())
-    elif not road_disp and pool.location_start_display:
-        geo_bits.append(str(pool.location_start_display).strip())
-    elif not road_disp and pool.vision_highways:
-        hwy = primary_road_display(pool.vision_highways[0]) or str(pool.vision_highways[0]).strip()
-        if hwy:
-            geo_bits.append(hwy)
-    elif not road_disp and pool.vision_landmarks:
+        geo = road_disp
+    elif place:
+        geo = place
+    elif pool.place_sign:
+        geo = str(pool.place_sign).strip()
+    elif pool.location_start_display:
+        geo = str(pool.location_start_display).strip()
+    elif pool.vision_highways:
+        geo = primary_road_display(pool.vision_highways[0]) or str(pool.vision_highways[0]).strip()
+    elif pool.vision_landmarks:
         lm = str(pool.vision_landmarks[0]).strip()
         if lm and not is_generic_vision_label(lm):
-            geo_bits.append(lm)
+            geo = lm
 
     music_bit = ""
     if pool.music_artist:
@@ -1154,56 +1175,64 @@ def _compact_timeline_title(pool: EvidencePool) -> str:
     elif pool.music_title:
         music_bit = str(pool.music_title).strip()
 
-    # Keep room for music: speed + place (prefer city over road) + music.
-    # Without music: speed + road + place (both geos are useful).
-    if music_bit:
-        preferred_geo = ""
-        if place:
-            preferred_geo = place
-        elif geo_bits:
-            preferred_geo = geo_bits[0]
-        if preferred_geo:
-            parts.append(preferred_geo)
-        parts.append(music_bit)
-    else:
-        parts.extend(geo_bits[:2])
+    # With music, city/place often reads better than a long road string.
+    if music_bit and place:
+        geo = place
 
-    if len(parts) >= 2:
-        return _sanitize_anchor_fragment(" · ".join(parts[:3]), max_chars=90)
-    if len(parts) == 1:
-        if place and road_disp and road_disp.lower() not in place.lower():
-            return _sanitize_anchor_fragment(f"{place} · {road_disp}", max_chars=90)
-        return _sanitize_anchor_fragment(parts[0], max_chars=90)
-    return ""
+    if speed and geo:
+        core = f"{speed} through {geo}"
+        # Keep city when the leading geo is a highway/road string.
+        if (
+            place
+            and road_disp
+            and geo == road_disp
+            and place.lower() not in geo.lower()
+        ):
+            core = f"{speed} through {geo} near {place}"
+    elif speed:
+        core = f"{speed} run"
+    elif geo:
+        core = f"Through {geo}"
+    else:
+        core = ""
+    if music_bit and core:
+        core = f"{core} — with {music_bit}"
+    elif music_bit:
+        core = music_bit
+    if not core:
+        return ""
+    return _sanitize_anchor_fragment(core, max_chars=90)
 
 
 def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) -> str:
     """Short title filler from timeline evidence — never caption prose or VI dumps.
 
-    Prefer compact ``title_suggestion`` only when it agrees with trusted peak speed,
-    else build speed · place · music from the EvidencePool (welcome-sign / OSD start
-    when city missing). Never emit caption-style ``Captured at…`` prose.
+    Prefer spoken compact evidence (``110 MPH through Place``) when empty.
+    Fusion ``title_suggestion`` may win only when it agrees with trusted peak
+    and is not a bare · checklist. Never emit caption-style ``Captured at…`` prose.
     """
-    # Always prefer the evidence-backed compact form when we have ≥2 timeline beats.
     compact = _compact_timeline_title(pool)
-    if compact and " · " in compact:
-        # TL/fusion suggestion may win only if it matches trusted peak and is richer.
-        # When a trusted peak exists it must actually appear in the suggestion —
-        # a longer no-MPH suggestion must never beat a compact form carrying speed.
+    if compact:
         if ctx is not None:
             vu = getattr(ctx, "video_understanding", None) or {}
             if isinstance(vu, dict):
                 sug = scrub_machine_publish_dump(str(vu.get("title_suggestion") or "")).strip()
                 has_peak = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
-                # Tolerance agreement is enforced by _title_suggestion_matches_trusted_peak;
-                # here we only require that SOME speed token is present at all.
                 sug_has_peak = bool(has_peak and re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
+                checklist = bool(
+                    " · " in sug
+                    and not re.search(
+                        r"\b(through|near|on|at|with|into|under|over|from|while|when)\b",
+                        sug,
+                        re.I,
+                    )
+                )
                 if (
                     sug
                     and len(sug) >= 8
+                    and not checklist
                     and "captured at" not in sug.lower()
                     and _title_suggestion_matches_trusted_peak(sug, pool)
-                    and (" · " in sug or re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
                     and (sug_has_peak or not has_peak)
                     and len(sug) >= len(compact)
                 ):
@@ -1214,17 +1243,22 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
         vu = getattr(ctx, "video_understanding", None) or {}
         if isinstance(vu, dict):
             sug = scrub_machine_publish_dump(str(vu.get("title_suggestion") or "")).strip()
+            checklist = bool(
+                " · " in sug
+                and not re.search(
+                    r"\b(through|near|on|at|with|into|under|over|from|while|when)\b",
+                    sug,
+                    re.I,
+                )
+            )
             if (
                 sug
                 and len(sug) >= 8
+                and not checklist
                 and "captured at" not in sug.lower()
                 and _title_suggestion_matches_trusted_peak(sug, pool)
-                and (" · " in sug or re.search(r"\b\d{2,3}\s*mph\b", sug, re.I))
             ):
                 return _sanitize_anchor_fragment(sug, max_chars=90)
-
-    if compact:
-        return compact
 
     scene = _publishable_closing(pool.video_understanding_phrase)
     if scene and len(scene) >= 12:
@@ -1232,7 +1266,7 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
         if pool.max_speed_mph and pool.max_speed_mph >= 5:
             mph = f"{int(round(pool.max_speed_mph))} MPH"
             if mph.lower() not in scene.lower():
-                return _sanitize_anchor_fragment(f"{mph} · {scene}", max_chars=90)
+                return _sanitize_anchor_fragment(f"{mph} — {scene}", max_chars=90)
         return _sanitize_anchor_fragment(scene, max_chars=90)
 
     if pool.vision_landmarks:
@@ -1341,6 +1375,14 @@ def _caption_has_grounded_voice(caption: str, pool: EvidencePool) -> bool:
     c = scrub_machine_publish_dump(caption or "").strip()
     if not c or len(c) < 40:
         return False
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(c):
+            return False
+    except Exception:
+        if re.match(r"(?i)^\s*anchored\s+in\b", c):
+            return False
     if not _title_mentions_trusted_speed(c, pool):
         return False
     return _title_mentions_place_or_music(c, pool)
@@ -1777,6 +1819,14 @@ def _caption_uses_evidence(caption: str, pool: EvidencePool) -> bool:
 def _is_generic_caption(caption: str) -> bool:
     if not caption or len(caption.strip()) < 12:
         return True
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(caption):
+            return True
+    except Exception:
+        if re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()):
+            return True
     if is_vague_taxonomy_copy(caption):
         return True
     hit = any(pat.search(caption) for pat in _GENERIC_CAPTION_PATTERNS)
@@ -1819,10 +1869,25 @@ def _hydrate_title(title: str, anchor: str, *, max_chars: int = 100) -> str:
         return t[:max_chars]
     if not t:
         return a[:max_chars]
+    # Keep creative voice titles — only wipe empty / formula / label dumps.
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        stub = is_formula_stub_caption(t)
+    except Exception:
+        stub = bool(re.match(r"(?i)^\s*anchored\s+in\b", t))
+    checklist = bool(
+        " · " in t
+        and not re.search(
+            r"\b(through|near|on|at|with|into|under|over|from|while|when|along|past)\b",
+            t,
+            re.I,
+        )
+    )
     # Long or subtitle-style headlines must not be replaced by a thin anchor.
-    if len(t) >= 36 or (":" in t and len(t) >= 18):
+    if not stub and not checklist and (len(t) >= 28 or (":" in t and len(t) >= 18)):
         return t[:max_chars]
-    if _is_generic_caption(t) or _is_machine_label_dump(title or ""):
+    if stub or checklist or _is_generic_caption(t) or _is_machine_label_dump(title or ""):
         return a[:max_chars]
     return t[:max_chars]
 

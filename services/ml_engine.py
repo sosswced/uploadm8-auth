@@ -121,6 +121,78 @@ def _subprocess_detail(step: Optional[Dict[str, Any]], *, limit: int = 800) -> s
     return ""
 
 
+def _root_exception_line(text: str) -> str:
+    """Prefer the final exception message over a mid-traceback caret dump."""
+    if not text:
+        return ""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    for ln in reversed(lines):
+        s = ln.strip()
+        if s.startswith("^") or set(s) <= {"^", "~", " ", "\t"}:
+            continue
+        if s.startswith("File ") or s.startswith('File "'):
+            continue
+        return s[-400:]
+    return text[-400:]
+
+
+_TRANSIENT_BUILD_MARKERS = (
+    "getaddrinfo",
+    "gaierror",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname",
+    "failed to resolve",
+    "connection refused",
+    "network is unreachable",
+    "connection reset",
+    "timed out",
+    "timeout",
+    "cannot connect now",
+    "the database system is starting up",
+    "the database system is not yet accepting connections",
+    "could not translate host name",
+)
+
+
+def _is_transient_build_failure(step: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(step, dict) or step.get("ok"):
+        return False
+    blob = (_subprocess_detail(step, limit=4000) or "").lower()
+    return any(m in blob for m in _TRANSIENT_BUILD_MARKERS)
+
+
+async def _run_build_with_retries(
+    step_fn,
+    *args,
+    attempts: int = 3,
+    label: str = "dataset",
+) -> Dict[str, Any]:
+    """Re-run dataset build subprocess on transient DNS/connect failures."""
+    last: Dict[str, Any] = {"ok": False, "error": "build not attempted"}
+    for i in range(max(1, attempts)):
+        last = await asyncio.to_thread(step_fn, *args)
+        if last.get("ok"):
+            if i > 0:
+                last = dict(last)
+                last["transient_retries"] = i
+            return last
+        if not _is_transient_build_failure(last) or i + 1 >= attempts:
+            return last
+        delay = min(8.0, 1.0 * (2**i))
+        root = _root_exception_line(_subprocess_detail(last, limit=2000))
+        logger.warning(
+            "ml engine %s build transient failure (attempt %s/%s, sleep %.1fs): %s",
+            label,
+            i + 1,
+            attempts,
+            delay,
+            root or "unknown",
+        )
+        await asyncio.sleep(delay)
+    return last
+
+
 def _seed_on_train_fail_enabled(cfg: MLEngineConfig) -> bool:
     """Default ON so train crashes recover via seed instead of paging Discord forever."""
     import os
@@ -159,6 +231,8 @@ async def _alert_ml_engine_failure(
         train = steps.get("train_local") or {}
         build_tail = _subprocess_detail(build)
         train_tail = _subprocess_detail(train) or str(result.get("train_detail") or "")[-600:]
+        build_root = _root_exception_line(build_tail)
+        train_root = _root_exception_line(train_tail)
         seeded = bool(result.get("seeded"))
         subject = "ML engine cycle failed (API service — not upload worker)"
         if err == "local training failed":
@@ -168,6 +242,8 @@ async def _alert_ml_engine_failure(
             "Does not affect upload worker health or publish capacity.\n"
             f"error={err}\n"
             f"seed_recovery_attempted={seeded}\n"
+            f"train_root={train_root}\n"
+            f"build_root={build_root}\n"
             f"train_tail={train_tail}\n"
             f"build_tail={build_tail}"
         )
@@ -186,6 +262,9 @@ async def _alert_ml_engine_failure(
                 "steps": list(steps.keys()),
                 "train_detail": train_tail[:800],
                 "build_detail": build_tail[:800],
+                "train_root": train_root[:400],
+                "build_root": build_root[:400],
+                "transient_build": _is_transient_build_failure(build),
                 "script_cmd_mode": (__import__("os").environ.get("UM8_ML_USE_UV") or "auto"),
                 "finished_at": result.get("finished_at"),
                 "severity": "warning",
@@ -630,13 +709,14 @@ async def _run_promo_loop(
 
     # HF Jobs path stays single-shot (async training elsewhere).
     if c.use_hf_jobs:
-        build = await asyncio.to_thread(_step_build_dataset, c)
+        build = await _run_build_with_retries(_step_build_dataset, c, label="promo")
         result["steps"]["build_dataset"] = build
         if not build.get("ok"):
             result["error"] = "dataset build failed"
             detail = (build.get("stderr_tail") or build.get("stdout_tail") or "").strip()
             if detail:
                 result["build_detail"] = detail[-800:]
+                result["build_root"] = _root_exception_line(detail)
             return
         job = await asyncio.to_thread(_step_submit_hf_job, c)
         result["steps"]["hf_jobs_train"] = job
@@ -657,13 +737,14 @@ async def _run_promo_loop(
     used_lookback = c.dataset_lookback_days
 
     for lb in _widen_lookbacks(c):
-        last_build = await asyncio.to_thread(_step_build_dataset, c, lb)
+        last_build = await _run_build_with_retries(_step_build_dataset, c, lb, label="promo")
         if not last_build.get("ok"):
             result["steps"]["build_dataset"] = last_build
             result["error"] = "dataset build failed"
             detail = (last_build.get("stderr_tail") or last_build.get("stdout_tail") or "").strip()
             if detail:
                 result["build_detail"] = detail[-800:]
+                result["build_root"] = _root_exception_line(detail)
                 logger.warning("ml engine promo build failed (rc=%s): %s", last_build.get("returncode"), detail[-1200:])
             return
         last_train = await asyncio.to_thread(_step_train_local, c)
@@ -759,13 +840,16 @@ async def _run_content_loop(
         used_lookback = c.dataset_lookback_days
 
         for lb in _widen_lookbacks(c):
-            last_build = await asyncio.to_thread(_step_build_content_dataset, c, lb)
+            last_build = await _run_build_with_retries(
+                _step_build_content_dataset, c, lb, label="content"
+            )
             if not last_build.get("ok"):
                 content["build_dataset"] = last_build
                 content["error"] = "content dataset build failed"
                 detail = (last_build.get("stderr_tail") or last_build.get("stdout_tail") or "").strip()
                 if detail:
                     content["build_detail"] = detail[-800:]
+                    content["build_root"] = _root_exception_line(detail)
                 return content
             last_train = await asyncio.to_thread(_step_train_content, c)
             if not last_train.get("ok"):

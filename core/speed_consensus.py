@@ -99,11 +99,31 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
     agreeing = [n for n, v in sources.items() if peak >= 5 and abs(v - peak) <= tol]
     outliers = [n for n, v in sources.items() if peak >= 5 and abs(v - peak) > tol]
 
+    # Provider *families* — osd + osd_series are the same HUD pipeline and must
+    # not inflate confidence to "high" without an independent corroborator.
+    family_of = {
+        "telemetry": "telemetry",
+        "osd": "hud",
+        "osd_series": "hud",
+        "vision_ocr": "vision",
+        "gps_implied": "gps",
+    }
+    agreeing_families = sorted(
+        {family_of[n] for n in agreeing if n in family_of}
+    )
+
     if peak < 5:
         confidence = "none"
-    elif source == "telemetry" or len(agreeing) >= 2:
+    elif source == "telemetry":
         confidence = "high"
-    elif not outliers:
+    elif len(agreeing_families) >= 2:
+        # Independent families agree (e.g. HUD + GPS, HUD + vision).
+        confidence = "high"
+    elif source.startswith("osd") or source == "osd+series_cap":
+        # Single-family HUD. Aggregate may be a poisoned outlier while series
+        # (or series-capped peak) is still a fair medium candidate for prompts.
+        confidence = "medium"
+    elif not outliers and source in ("vision_ocr", "osd_series"):
         confidence = "medium"
     else:
         confidence = "low"
@@ -116,6 +136,7 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
         "tolerance_mph": round(tol, 1),
         "sources": sources,
         "agreeing": agreeing,
+        "agreeing_families": agreeing_families,
         "outliers": outliers,
     }
 
@@ -134,9 +155,37 @@ def get_speed_consensus(ctx: Any) -> Dict[str, Any]:
 
 
 def consensus_peak_mph(ctx: Any) -> float:
-    """Canonical publishable peak MPH (0.0 when no trusted source)."""
+    """Candidate peak MPH from consensus (may be medium/low — not always publishable)."""
     return _f(get_speed_consensus(ctx).get("peak_mph"))
 
+
+def publishable_peak_mph(ctx: Any) -> float:
+    """Peak MPH safe for titles / must_use / forced anchors (high confidence only).
+
+    Medium/low HUD-only candidates stay available via ``prompt_peak_mph`` for
+    stories/timelines and via ``consensus_peak_mph`` for scrubbing wrong invented
+    speeds, but must not be forced into published copy.
+    """
+    cons = get_speed_consensus(ctx)
+    if str(cons.get("confidence") or "") != "high":
+        return 0.0
+    return _f(cons.get("peak_mph"))
+
+
+def prompt_peak_mph(ctx: Any) -> float:
+    """Peak MPH safe to *mention* in prompts / hydration stories / timelines.
+
+    Includes high + medium confidence (HUD-only samples are fair soft evidence).
+    Does not force title injects — use ``publishable_peak_mph`` for those.
+    """
+    cons = get_speed_consensus(ctx)
+    if str(cons.get("confidence") or "") not in ("high", "medium"):
+        return 0.0
+    return _f(cons.get("peak_mph"))
+
+
+def consensus_confidence(ctx: Any) -> str:
+    return str(get_speed_consensus(ctx).get("confidence") or "none")
 
 def scrub_untrusted_speed_claims(
     text: str,
@@ -239,6 +288,8 @@ __all__ = [
     "build_speed_consensus",
     "get_speed_consensus",
     "consensus_peak_mph",
+    "publishable_peak_mph",
+    "consensus_confidence",
     "scrub_untrusted_speed_claims",
     "ensure_video_understanding_speed_scrubbed",
     "speed_tolerance_mph",

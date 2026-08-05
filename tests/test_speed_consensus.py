@@ -85,7 +85,10 @@ def test_consensus_flags_outlier_sources():
     assert "osd_series" in c["agreeing"]
 
 
-def test_consensus_two_agreeing_sources_high_confidence():
+def test_consensus_hud_only_is_medium_not_high():
+    """osd + osd_series are one HUD family — must not inflate to high."""
+    from core.speed_consensus import publishable_peak_mph
+
     ctx = _ctx(
         dashcam_osd_context={
             "max_speed_mph": 122.0,
@@ -93,8 +96,27 @@ def test_consensus_two_agreeing_sources_high_confidence():
         },
     )
     c = build_speed_consensus(ctx)
-    assert c["confidence"] == "high"
+    assert c["confidence"] == "medium"
     assert set(c["agreeing"]) >= {"osd", "osd_series"}
+    assert c.get("agreeing_families") == ["hud"]
+    assert publishable_peak_mph(ctx) == 0.0
+    assert consensus_peak_mph(ctx) >= 120.0
+
+
+def test_consensus_hud_plus_gps_is_high():
+    from core.speed_consensus import publishable_peak_mph
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 100.0,
+            "speed_series": [{"mph": 98.0, "t_s": 5.0}],
+            "speed_quality": {"gps_implied_peak_mph": 99.0},
+        },
+    )
+    c = build_speed_consensus(ctx)
+    assert c["confidence"] == "high"
+    assert set(c.get("agreeing_families") or []) >= {"hud", "gps"}
+    assert publishable_peak_mph(ctx) >= 98.0
 
 
 def test_consensus_none_when_no_speed():
@@ -421,6 +443,12 @@ def test_m8_brief_has_speed_contract_and_diverse_spine():
     brief = _build_hydration_timeline_brief(
         {
             "hydration_story": "154 MPH run through Logandale.",
+            "speed_consensus": {
+                "peak_mph": 154.0,
+                "candidate_peak_mph": 154.0,
+                "source": "telemetry",
+                "confidence": "high",
+            },
             "dashcam_osd": {
                 "max_speed_mph": 154.0,
                 "speed_series": [{"mph": 150.0, "t_s": 3.0}, {"mph": 154.0, "t_s": 8.0}],
@@ -440,11 +468,31 @@ def test_m8_brief_has_speed_contract_and_diverse_spine():
         }
     )
     assert "SPEED CONTRACT" in brief
-    assert "154 MPH" in brief
+    assert "154" in brief
     # Non-speed providers must survive in the spine.
     assert "Welcome to Logandale" in brief
     assert "Fetty Wap" in brief
     assert "Look at this stretch of road" in brief
+
+
+def test_m8_brief_soft_labels_medium_hud_consensus():
+    from stages.m8_engine import _build_hydration_timeline_brief
+
+    brief = _build_hydration_timeline_brief(
+        {
+            "speed_consensus": {
+                "peak_mph": 0.0,
+                "candidate_peak_mph": 88.0,
+                "source": "osd",
+                "confidence": "medium",
+            },
+            "dashcam_osd": {"max_speed_mph": 88.0},
+            "geo": {"road": "Garlock Road"},
+        }
+    )
+    assert "unverified" in brief.lower() or "SPEED HINT" in brief
+    assert "only publishable speed is 88" not in brief.lower()
+    assert "Garlock" in brief
 
 
 def test_collect_place_signs_cached_once(monkeypatch):
@@ -469,9 +517,9 @@ def test_collect_place_signs_cached_once(monkeypatch):
 def test_signal_hashtags_speed_bucket_uses_consensus():
     from services.signal_hashtags import build_signal_hashtags
 
-    # OSD aggregate is a 200 MPH OCR spike; trusted series says 68 → the
-    # bucket must come from the consensus (68), not the spike.
+    # Telemetry 68 beats OSD 200 spike → high-confidence publishable peak.
     ctx = _ctx(
+        telemetry=_tel(68.0),
         dashcam_osd_context={
             "max_speed_mph": 200.0,
             "speed_series": [{"mph": 66.0, "t_s": 2.0}, {"mph": 68.0, "t_s": 6.0}],
@@ -482,6 +530,22 @@ def test_signal_hashtags_speed_bucket_uses_consensus():
     # 68 MPH → FreewayDrive bucket; the 200 spike would have hit TopSpeed.
     assert "topspeed" not in blob
     assert "freewaydrive" in blob
+
+
+def test_signal_hashtags_omit_speed_bucket_for_medium_hud():
+    from services.signal_hashtags import build_signal_hashtags
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 122.0,
+            "speed_series": [{"mph": 120.0, "t_s": 5.0}],
+        },
+    )
+    tags = build_signal_hashtags(ctx)
+    blob = " ".join(tags).lower()
+    assert "topspeed" not in blob
+    assert "freewaydrive" not in blob
+    assert "speeddemon" not in blob
 
 
 def test_speed_tolerance_floor_and_pct():
@@ -562,7 +626,7 @@ def test_m8_prompt_never_sees_twelve_labs_wrong_speeds():
 
 def test_anchor_and_title_speed_use_consensus_block():
     """Anchor/title builders must read scene_graph.speed_consensus, not raw OSD/geo peaks."""
-    from stages.m8_engine import _best_hydration_anchor
+    from stages.m8_engine import _best_hydration_anchor, build_must_use_shortlist
 
     sg = {
         "speed_consensus": {"peak_mph": 55.0, "source": "telemetry"},
@@ -574,6 +638,10 @@ def test_anchor_and_title_speed_use_consensus_block():
     assert "55 MPH" in anchor
     assert "88" not in anchor and "91" not in anchor
 
+    must = build_must_use_shortlist(sg)
+    assert "55 MPH" in must
+    assert not any("88" in t or "91" in t for t in must)
+
     # No consensus peak → fail closed (no MPH in the anchor at all).
     sg_none = {
         "speed_consensus": {},
@@ -581,3 +649,4 @@ def test_anchor_and_title_speed_use_consensus_block():
         "geo": {"road": "I-5"},
     }
     assert "MPH" not in _best_hydration_anchor(sg_none)
+    assert not any("MPH" in t for t in build_must_use_shortlist(sg_none))

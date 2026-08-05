@@ -4,17 +4,33 @@ Synthetic scene understanding when Twelve Labs is missing.
 Fuses Google Video Intelligence, Cloud Vision OCR (welcome/highway signs),
 dashcam OSD GPS/speed, ACR music, and Whisper into ``ctx.video_understanding``
 so every AI upload still has a publishable scene narrative 24/7.
+
+When the deterministic fusion prose is thin (<~80 chars) and OpenAI is
+available, ``enrich_thin_fusion_scene`` optionally expands it with one
+fail-soft LLM call over the multimodal digest (same scrub / publishable-speed
+rules as Twelve Labs).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
 
 from stages.context import JobContext, build_hydration_story_text, build_video_story_timeline
 
 logger = logging.getLogger("uploadm8-worker")
+
+FUSION_THIN_CHARS = int(os.environ.get("SCENE_FUSION_THIN_CHARS", "80") or 80)
+FUSION_ENRICH_MODEL = os.environ.get("OPENAI_SCENE_FUSION_MODEL") or os.environ.get(
+    "OPENAI_IDENTITY_MODEL", "gpt-4o-mini"
+)
+FUSION_ENRICH_TIMEOUT_SEC = float(os.environ.get("SCENE_FUSION_ENRICH_TIMEOUT_SEC", "12") or 12)
+FUSION_ENRICH_MAX_TOKENS = 280
 
 _WELCOME_PATTERNS = (
     re.compile(
@@ -140,32 +156,31 @@ def has_scene_understanding(ctx: JobContext) -> bool:
 
 
 def _speed_mph(ctx: JobContext) -> float:
-    """Canonical consensus peak (single source of truth for fusion copy).
+    """Publishable consensus peak for fusion titles/prose (high confidence only).
 
     Builds fresh (no artifact caching): fusion can run before all speed
-    sources are extracted on some recovery paths, and caching a premature
-    peak here would poison every later consumer.
+    sources are extracted on some recovery paths. Medium/low HUD-only peaks
+    are omitted so fusion cannot mint uncorroborated MPH into VU.
     """
     try:
         from core.speed_consensus import build_speed_consensus
 
-        return float(build_speed_consensus(ctx).get("peak_mph") or 0.0)
+        cons = build_speed_consensus(ctx)
+        if str(cons.get("confidence") or "") == "high":
+            return float(cons.get("peak_mph") or 0.0)
+        return 0.0
     except Exception:
         pass
+    # Fail closed without a consensus helper — never invent from raw OSD alone.
     tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-    osd = getattr(ctx, "dashcam_osd_context", None) or {}
-    tel_max = osd_max = 0.0
     if tel is not None:
         try:
             tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
+            if tel_max >= 5:
+                return tel_max
         except (TypeError, ValueError):
-            tel_max = 0.0
-    if isinstance(osd, dict):
-        try:
-            osd_max = float(osd.get("max_speed_mph") or 0)
-        except (TypeError, ValueError):
-            osd_max = 0.0
-    return max(tel_max, osd_max)
+            pass
+    return 0.0
 
 
 def _place_bits(ctx: JobContext, place_signs: List[str]) -> Tuple[str, str]:
@@ -318,10 +333,22 @@ def build_fusion_scene(ctx: JobContext) -> Dict[str, Any]:
     else:
         title_suggestion = (hook[:90] if hook else "")
 
+    custom_queries = _build_native_custom_queries(
+        ctx,
+        place=place,
+        place_signs=place_signs,
+        artist=artist,
+        track=track,
+        speed=speed,
+        beats=beats,
+    )
+
     return {
         "scene_description": scene[:1200],
+        "description": scene[:1200],  # TL-parity alias
         "title_suggestion": title_suggestion[:100],
         "source": "fusion",
+        "custom_queries": custom_queries,
         "place_signs": place_signs,
         "start_display": start_display or None,
         "providers": {
@@ -331,8 +358,73 @@ def build_fusion_scene(ctx: JobContext) -> Dict[str, Any]:
             "place": place or None,
             "music": bool(artist or track),
             "welcome_signs": len(place_signs),
+            "custom_query_keys": list(custom_queries.keys()),
         },
     }
+
+
+def _build_native_custom_queries(
+    ctx: JobContext,
+    *,
+    place: str,
+    place_signs: List[str],
+    artist: str,
+    track: str,
+    speed: float,
+    beats: List[str],
+) -> Dict[str, str]:
+    """TL-shaped custom_queries from native signals (no Twelve Labs index)."""
+    out: Dict[str, str] = {}
+    vc = getattr(ctx, "vision_context", None) or {}
+    logos: List[str] = []
+    if isinstance(vc, dict):
+        for lg in (vc.get("logo_names") or vc.get("logos") or [])[:6]:
+            if isinstance(lg, dict):
+                t = str(lg.get("description") or lg.get("name") or "").strip()
+            else:
+                t = str(lg or "").strip()
+            if t:
+                logos.append(t)
+    for vi_attr in ("video_intelligence", "video_intelligence_context"):
+        vi = getattr(ctx, vi_attr, None) or {}
+        if not isinstance(vi, dict):
+            continue
+        for lg in (vi.get("logos") or [])[:4]:
+            if isinstance(lg, dict):
+                t = str(lg.get("description") or "").strip()
+            else:
+                t = str(lg or "").strip()
+            if t and t not in logos:
+                logos.append(t)
+    if logos:
+        out["brands_visible"] = ", ".join(logos[:4])
+    loc_bits = [b for b in (place, *(place_signs or [])) if b]
+    if loc_bits:
+        out["location_clue"] = ", ".join(list(dict.fromkeys(loc_bits))[:3])
+    if artist or track:
+        out["music_id"] = " — ".join(p for p in (artist, track) if p)
+    # Publishable speed only (high confidence) in native queries.
+    try:
+        from core.speed_consensus import publishable_peak_mph
+
+        pub = float(publishable_peak_mph(ctx) or 0)
+    except Exception:
+        pub = 0.0
+    if pub >= 5:
+        out["peak_speed"] = f"{int(round(pub))} MPH"
+    tx = (getattr(ctx, "ai_transcript", None) or "").strip()
+    if not tx:
+        ac = getattr(ctx, "audio_context", None) or {}
+        if isinstance(ac, dict):
+            tx = str(ac.get("transcript") or "").strip()
+    if tx:
+        # First usable phrase, not full dump.
+        phrase = re.split(r"[.!?]\s+", tx, maxsplit=1)[0].strip()[:120]
+        if len(phrase) >= 8:
+            out["speech_hook"] = phrase
+    if beats and "timeline_hook" not in out:
+        out["timeline_hook"] = "; ".join(beats[:2])[:160]
+    return out
 
 
 def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any]:
@@ -365,9 +457,18 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
         ensure_video_understanding_speed_scrubbed(ctx)
         return {"skipped": True, "reason": "no_evidence"}
 
-    vu["scene_description"] = fused["scene_description"]
+    scene_txt = str(fused.get("scene_description") or "")
+    vu["scene_description"] = scene_txt
+    vu["description"] = scene_txt  # TL-parity alias for all consumers
     if fused.get("title_suggestion") and not str(vu.get("title_suggestion") or "").strip():
         vu["title_suggestion"] = fused["title_suggestion"]
+    cq = fused.get("custom_queries") if isinstance(fused.get("custom_queries"), dict) else {}
+    if cq:
+        # Merge — never clobber richer TL custom_queries if somehow present.
+        existing_cq = vu.get("custom_queries") if isinstance(vu.get("custom_queries"), dict) else {}
+        merged_cq = dict(cq)
+        merged_cq.update({k: v for k, v in existing_cq.items() if v})
+        vu["custom_queries"] = merged_cq
     vu["source"] = "fusion"
     vu["fusion"] = {
         "place_signs": fused.get("place_signs") or [],
@@ -385,6 +486,7 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
             "title_suggestion": vu.get("title_suggestion") or "",
             "providers": fused.get("providers") or {},
             "place_signs": fused.get("place_signs") or [],
+            "custom_queries": list((vu.get("custom_queries") or {}).keys()),
         }
 
     logger.info(
@@ -394,3 +496,202 @@ def apply_scene_fusion(ctx: JobContext, *, force: bool = False) -> Dict[str, Any
         fused.get("place_signs") or [],
     )
     return fused
+
+
+def fusion_scene_is_thin(ctx: JobContext, *, min_chars: int = 0) -> bool:
+    """True when VU prose is missing or shorter than the enrich threshold."""
+    threshold = min_chars or FUSION_THIN_CHARS
+    vu = getattr(ctx, "video_understanding", None) or {}
+    if not isinstance(vu, dict):
+        return True
+    scene = str(vu.get("scene_description") or vu.get("description") or "").strip()
+    return len(scene) < max(20, int(threshold))
+
+
+def _fusion_speed_contract(ctx: JobContext) -> str:
+    try:
+        from core.speed_consensus import get_speed_consensus, publishable_peak_mph
+
+        pub = float(publishable_peak_mph(ctx) or 0)
+        cons = get_speed_consensus(ctx)
+        conf = str(cons.get("confidence") or "none")
+    except Exception:
+        pub, conf = 0.0, "none"
+    if pub >= 5 and conf == "high":
+        return (
+            f"SPEED CONTRACT: the only publishable speed is {int(round(pub))} MPH "
+            "(verified). Never invent other MPH/KMH numbers. Never treat lat/lon "
+            "degrees, headings, or bare integers as speed."
+        )
+    return (
+        "SPEED CONTRACT: there is NO verified speed. Never state any MPH/KMH number. "
+        "Never treat GPS coordinates, degree headings, or bare integers as speed."
+    )
+
+
+def _parse_enrich_response(raw: str) -> Optional[Dict[str, str]]:
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    scene = str(data.get("scene_description") or data.get("description") or "").strip()
+    title = str(data.get("title_suggestion") or "").strip()
+    if len(scene) < 40:
+        return None
+    return {
+        "scene_description": scene[:1200],
+        "title_suggestion": title[:100],
+    }
+
+
+async def enrich_thin_fusion_scene(ctx: JobContext) -> Dict[str, Any]:
+    """Fail-soft OpenAI enrich when fusion (or empty TL) left thin VU prose.
+
+    Never blocks the pipeline. Requires OPENAI_API_KEY. Skips when prose is
+    already long enough or when the digest has no usable evidence.
+    """
+    from core.speed_consensus import ensure_video_understanding_speed_scrubbed
+
+    report: Dict[str, Any] = {"attempted": False, "enriched": False}
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        report["reason"] = "no_openai_key"
+        return report
+    if os.environ.get("SCENE_FUSION_ENRICH", "1").strip().lower() in ("0", "false", "no", "off"):
+        report["reason"] = "disabled"
+        return report
+
+    vu = getattr(ctx, "video_understanding", None)
+    if not isinstance(vu, dict):
+        vu = {}
+        ctx.video_understanding = vu
+    src = str(vu.get("source") or "")
+    # Never overwrite a rich Twelve Labs narrative.
+    if src == "twelve_labs" and not fusion_scene_is_thin(ctx):
+        report["reason"] = "twelve_labs_present"
+        return report
+    if not fusion_scene_is_thin(ctx):
+        report["reason"] = "scene_already_rich"
+        return report
+
+    try:
+        from stages.context import build_multimodal_scene_digest
+
+        digest = (build_multimodal_scene_digest(ctx, max_chars=3500) or "").strip()
+    except Exception as e:
+        report["reason"] = f"digest_failed:{e}"
+        return report
+    if len(digest) < 40:
+        report["reason"] = "digest_too_thin"
+        return report
+
+    floor = str(vu.get("scene_description") or vu.get("description") or "").strip()
+    prompt = f"""You expand a thin machine-fused scene summary into a short factual video description.
+
+EVIDENCE DIGEST (only source of facts — do not invent):
+{digest[:3200]}
+
+EXISTING FLOOR (keep every concrete fact it already has):
+{floor or "(empty)"}
+
+{_fusion_speed_contract(ctx)}
+
+Return STRICT JSON:
+{{
+  "scene_description": "2-4 factual sentences, 120-400 chars, grounded only in the digest",
+  "title_suggestion": "≤10 words, concrete, no hype filler"
+}}
+
+Rules:
+- Weave place, music, speech, and verified speed when present.
+- No checklist stubs like "110 MPH, Road Name" alone.
+- No lat/lon coordinates, degree headings, or bare integers as "speed".
+- No emojis. No invented brands, people, or places."""
+
+    report["attempted"] = True
+    payload = {
+        "model": FUSION_ENRICH_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": FUSION_ENRICH_MAX_TOKENS,
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        from stages.outbound_rl import outbound_slot
+
+        async with outbound_slot("openai"):
+            async with httpx.AsyncClient(timeout=FUSION_ENRICH_TIMEOUT_SEC) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+        if resp.status_code != 200:
+            body = (resp.text or "")[:240]
+            report["reason"] = f"http_{resp.status_code}"
+            logger.warning(
+                "[scene_fusion] enrich HTTP %s upload=%s: %s",
+                resp.status_code,
+                getattr(ctx, "upload_id", "?"),
+                body,
+            )
+            return report
+        content = (
+            (resp.json().get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        )
+        parsed = _parse_enrich_response(content)
+        if not parsed:
+            report["reason"] = "unparseable"
+            return report
+    except Exception as e:
+        report["reason"] = f"error:{type(e).__name__}"
+        logger.warning(
+            "[scene_fusion] enrich failed (non-fatal) upload=%s: %s",
+            getattr(ctx, "upload_id", "?"),
+            e,
+        )
+        return report
+
+    scene = parsed["scene_description"]
+    # Keep floor facts if the model somehow dropped them.
+    if floor and len(scene) < len(floor):
+        report["reason"] = "enrich_shorter_than_floor"
+        return report
+
+    vu["scene_description"] = scene
+    vu["description"] = scene
+    if parsed.get("title_suggestion"):
+        vu["title_suggestion"] = parsed["title_suggestion"]
+    vu["source"] = "fusion_llm" if src in ("", "fusion") else src
+    fusion_meta = vu.get("fusion") if isinstance(vu.get("fusion"), dict) else {}
+    fusion_meta = dict(fusion_meta)
+    fusion_meta["enriched"] = True
+    fusion_meta["enrich_model"] = FUSION_ENRICH_MODEL
+    vu["fusion"] = fusion_meta
+    ctx.video_understanding = vu
+    ensure_video_understanding_speed_scrubbed(ctx)
+
+    arts = getattr(ctx, "output_artifacts", None)
+    if isinstance(arts, dict):
+        prev = arts.get("scene_fusion") if isinstance(arts.get("scene_fusion"), dict) else {}
+        arts["scene_fusion"] = {
+            **prev,
+            "source": vu.get("source"),
+            "enriched": True,
+            "scene_chars": len(str(vu.get("scene_description") or "")),
+            "title_suggestion": vu.get("title_suggestion") or "",
+        }
+
+    report["enriched"] = True
+    report["scene_chars"] = len(str(vu.get("scene_description") or ""))
+    logger.info(
+        "[scene_fusion] enriched thin scene upload=%s chars=%s",
+        getattr(ctx, "upload_id", "?"),
+        report["scene_chars"],
+    )
+    return report

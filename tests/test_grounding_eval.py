@@ -11,6 +11,7 @@ from services.m8_grounding_pass import (
     apply_grounding_pass2_to_ranked,
     build_evidence_catalog,
     ensure_must_use_coverage,
+    is_formula_stub_caption,
     m8_grounding_pass2_enabled,
     synthesize_claims_from_text,
 )
@@ -201,6 +202,55 @@ def test_ensure_must_use_injects():
     )
     assert injected is True
     assert "46 MPH" in text or "Guadalupe" in text
+    assert "Anchored in" not in text
+    assert "Cruise under vast skies" in text
+
+
+def test_ensure_must_use_preserves_persona_voice():
+    voice = (
+        "Kodak Black rattles the cabin while the needle climbs past triple digits "
+        "on a black stretch of Susanville Road."
+    )
+    text, injected = ensure_must_use_coverage(
+        voice,
+        ["110 MPH", "Susanville Road"],
+        min_required=2,
+    )
+    assert injected is True
+    assert "Kodak Black" in text
+    assert "110 MPH" in text
+    assert "Anchored in" not in text
+
+
+def test_formula_stub_detection():
+    from services.m8_grounding_pass import is_formula_stub_caption
+
+    assert is_formula_stub_caption("Anchored in 88 MPH, Garlock Road")
+    assert is_formula_stub_caption("110 MPH, Susanville Road")
+    assert not is_formula_stub_caption(
+        "Kodak Black rattles the cabin at 110 MPH near Susanville Road — send it."
+    )
+
+
+def test_strip_preserves_voice_when_gutting():
+    from services.m8_grounding_pass import strip_ungrounded_sentences
+
+    catalog = {
+        "e1": {"text": "110 MPH", "lane": "must_use"},
+        "e2": {"text": "Susanville Road", "lane": "geo"},
+    }
+    claims = [
+        {"text": "110 MPH", "evidence_ids": ["e1"], "confidence": 0.9},
+        {"text": "Susanville Road", "evidence_ids": ["e2"], "confidence": 0.9},
+    ]
+    caption = (
+        "Kodak Black rattles the cabin while vibes stay reckless. "
+        "The run hits 110 MPH on Susanville Road."
+    )
+    # First sentence has no claim tokens — old strip would drop it and leave a thin stub.
+    out, n = strip_ungrounded_sentences(caption, claims, catalog)
+    assert "Kodak Black" in out
+    assert n == 0 or "Kodak Black" in out
 
 
 def test_apply_grounding_pass2_to_ranked():
@@ -226,8 +276,79 @@ def test_apply_grounding_pass2_to_ranked():
     out = apply_grounding_pass2_to_ranked(ranked, scene)
     winner = out["platforms"]["tiktok"]["winner"]
     assert "Guadalupe" in winner["caption"] or "46" in winner["caption"]
+    assert "Anchored in" not in winner["caption"]
     assert out["grounding_pass2"]["must_use_injected"] >= 1
     assert out["evidence_catalog"]
+
+
+def test_grounding_voice_repair_from_variants():
+    scene = {
+        "geo": {"road": "Susanville Road", "city": "Bieber"},
+        "vision": {"landmarks": [], "logos": []},
+        "place_evidence": {},
+    }
+    ranked = {
+        "must_use": ["110 MPH", "Susanville Road"],
+        "platforms": {
+            "instagram": {
+                "winner": {
+                    "title": None,
+                    "caption": "",
+                    "hashtags": [],
+                    "claims": [],
+                },
+                "variants_ranked": [
+                    {
+                        "caption": "Anchored in 110 MPH, Susanville Road",
+                        "title": None,
+                        "hashtags": [],
+                    },
+                    {
+                        "caption": (
+                            "Kodak Black rattles the cabin while the needle climbs "
+                            "past triple digits on a black stretch of desert asphalt."
+                        ),
+                        "title": None,
+                        "hashtags": [],
+                    },
+                ],
+            }
+        },
+    }
+    out = apply_grounding_pass2_to_ranked(ranked, scene)
+    winner = out["platforms"]["instagram"]["winner"]
+    assert "Kodak Black" in winner["caption"]
+    assert "110 MPH" in winner["caption"] or "Susanville" in winner["caption"]
+    assert not is_formula_stub_caption(winner["caption"])
+    assert out["grounding_pass2"]["platforms"]["instagram"]["voice_repaired"] is True
+
+
+def test_must_use_prefers_speed_consensus_over_osd():
+    from stages.m8_engine import build_must_use_shortlist
+
+    must = build_must_use_shortlist(
+        {
+            "speed_consensus": {"peak_mph": 110.0, "source": "telemetry"},
+            "dashcam_osd": {"max_speed_mph": 88.0},
+            "geo": {"road": "Garlock Road", "max_speed_mph": 91.0},
+        }
+    )
+    mph_tokens = [t for t in must if "MPH" in t]
+    assert mph_tokens == ["110 MPH"]
+    assert not any("88" in t for t in must)
+
+
+def test_must_use_empty_consensus_fails_closed():
+    from stages.m8_engine import build_must_use_shortlist
+
+    must = build_must_use_shortlist(
+        {
+            "speed_consensus": {},
+            "dashcam_osd": {"max_speed_mph": 88.0},
+            "geo": {"road": "Garlock Road"},
+        }
+    )
+    assert not any("MPH" in t for t in must)
 
 
 def test_gold_set_fixture_grounding_gate():

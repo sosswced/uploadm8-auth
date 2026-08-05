@@ -605,16 +605,15 @@ class JobContext:
         """
         trill = self.trill or self.trill_score
         telemetry = self.telemetry or self.telemetry_data
-        # Consensus only — raw telemetry/OSD peaks must never reach the
-        # thumbnail brief prompt (they can disagree with the published speed).
+        # High-confidence publishable peak only — HUD-only medium must not
+        # mint MPH into thumbnail briefs.
         max_mph = 0.0
         try:
-            from core.speed_consensus import consensus_peak_mph
+            from core.speed_consensus import publishable_peak_mph
 
-            max_mph = consensus_peak_mph(self)
+            max_mph = publishable_peak_mph(self)
         except Exception:
-            if telemetry:
-                max_mph = getattr(telemetry, "max_speed_mph", 0) or 0
+            max_mph = 0.0
         platforms = [str(p).lower() for p in (self.platforms or [])]
         platforms_csv = ",".join(platforms) if platforms else "youtube,instagram,facebook,tiktok"
         fusion_summary = build_fusion_summary_text(self)
@@ -1449,11 +1448,11 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if place_bits:
         clauses.append("Location context: " + " near ".join(place_bits[:2]) + (f" ({place_bits[-1]})" if len(place_bits) > 2 else "") + ".")
 
-    # Motion/vehicle/person facts — peak uses canonical speed consensus.
+    # Motion/vehicle/person facts — high/medium peak for story (prompt_peak).
     motion_bits: List[str] = []
-    from core.speed_consensus import consensus_peak_mph
+    from core.speed_consensus import prompt_peak_mph
 
-    max_speed = consensus_peak_mph(ctx)
+    max_speed = prompt_peak_mph(ctx)
     if max_speed >= 5:
         motion_bits.append(f"peak speed about {int(round(max_speed))} MPH")
     # Surface trusted HUD sample speeds so captions don't only see a single
@@ -1857,21 +1856,11 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                 f"HUD end {str(ls.get('date') or '').strip()} {str(ls.get('time') or '').strip()}".strip(),
             )
         try:
-            from core.speed_consensus import consensus_peak_mph
+            from core.speed_consensus import prompt_peak_mph
 
-            max_mph_osd = consensus_peak_mph(ctx)
+            max_mph_osd = prompt_peak_mph(ctx)
         except Exception:
             max_mph_osd = 0.0
-            try:
-                raw_osd_peak = float(osd.get("max_speed_mph") or 0)
-            except (TypeError, ValueError):
-                raw_osd_peak = 0.0
-            from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
-
-            max_mph_osd, _ = trusted_peak_speed_mph(
-                osd_max=raw_osd_peak,
-                series_peak=osd_series_peak_mph(osd),
-            )
         peak_t = osd.get("max_speed_at_s")
         if peak_t is None:
             peak_t = osd.get("max_speed_t_s")
@@ -1955,14 +1944,11 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             t_start = (clip_dur * 0.05) if clip_dur > 0 else 0.0
             _add(t_start, "geo_start", f"Run starts near {start_disp}")
         try:
-            from core.speed_consensus import consensus_peak_mph
+            from core.speed_consensus import publishable_peak_mph
 
-            max_mph_tel = consensus_peak_mph(ctx)
+            max_mph_tel = publishable_peak_mph(ctx)
         except Exception:
-            try:
-                max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
-            except (TypeError, ValueError):
-                max_mph_tel = 0.0
+            max_mph_tel = 0.0
         if max_mph_tel >= 5:
             # Prefer OSD peak time; else mid-clip so the beat isn't stuck at 0:00.
             peak_t = None
@@ -2293,16 +2279,27 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
             except (TypeError, ValueError):
                 pass
         peak = None
+        conf = "none"
         try:
-            from core.speed_consensus import consensus_peak_mph
+            from core.speed_consensus import get_speed_consensus, publishable_peak_mph
 
-            peak = consensus_peak_mph(ctx) or None
+            pub = publishable_peak_mph(ctx)
+            cons = get_speed_consensus(ctx)
+            conf = str(cons.get("confidence") or "none")
+            if pub >= 5:
+                peak = pub
+            elif conf == "medium" and float(cons.get("peak_mph") or 0) >= 5:
+                peak = float(cons.get("peak_mph") or 0)
         except Exception:
-            peak = osd.get("max_speed_mph")
-        if peak:
+            peak = None
+        if peak and conf == "high":
             at_s = osd.get("max_speed_at_s")
             tail = f" at ~{float(at_s):.0f}s into clip" if at_s is not None else ""
-            osd_lines.append(f"Peak speed (HUD): {int(round(float(peak)))} mph{tail}")
+            osd_lines.append(f"Peak speed (verified): {int(round(float(peak)))} mph{tail}")
+        elif peak and conf == "medium":
+            osd_lines.append(
+                f"HUD speed hint (unverified): ~{int(round(float(peak)))} mph — do not treat as verified peak"
+            )
         avg = osd.get("avg_speed_mph")
         if avg:
             osd_lines.append(f"Average speed (HUD): {avg} mph")
@@ -2380,13 +2377,13 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
             if isinstance(th, list) and th:
                 loc_bits.append("Trill hashtag ideas: " + ", ".join(str(x).lstrip("#") for x in th[:14]))
         if tel:
-            # Consensus only — raw telemetry peak may be outranked (or absent).
+            # High-confidence publishable peak only.
             try:
-                from core.speed_consensus import consensus_peak_mph
+                from core.speed_consensus import publishable_peak_mph
 
-                mph = consensus_peak_mph(ctx)
+                mph = publishable_peak_mph(ctx)
             except Exception:
-                mph = float(getattr(tel, "max_speed_mph", 0) or 0)
+                mph = 0.0
             if mph and mph >= 5:
                 loc_bits.append(f"Peak speed: {mph:.0f} mph")
             dist = getattr(tel, "total_distance_miles", None)

@@ -38,7 +38,6 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
-import asyncpg
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -85,7 +84,9 @@ def _require_database_url() -> str:
 
 
 async def _fetch(dsn: str, lookback_days: int, limit: int) -> List[Dict[str, Any]]:
-    conn = await asyncpg.connect(dsn)
+    from core.db_pool import connect_with_retry
+
+    conn = await connect_with_retry(dsn)
     try:
         rows = await conn.fetch(UPLOADS_SQL, int(lookback_days), int(limit))
     finally:
@@ -107,7 +108,9 @@ async def _merge_base_features(dsn: str, df: pd.DataFrame) -> pd.DataFrame:
     upload_ids = [str(x) for x in df["upload_id"].dropna().unique().tolist()]
     if not upload_ids:
         return df
-    conn = await asyncpg.connect(dsn)
+    from core.db_pool import connect_with_retry
+
+    conn = await connect_with_retry(dsn)
     try:
         rows = await conn.fetch(CONTENT_BASE_SQL, upload_ids)
     except Exception as e:  # noqa: BLE001 - view may not exist yet; keep base df

@@ -627,11 +627,11 @@ def _build_trill_beat(ctx: JobContext) -> Optional[str]:
 
     if td:
         try:
-            from core.speed_consensus import consensus_peak_mph
+            from core.speed_consensus import publishable_peak_mph
 
-            _peak = consensus_peak_mph(ctx)
+            _peak = publishable_peak_mph(ctx)
         except Exception:
-            _peak = float(getattr(td, "max_speed_mph", 0) or 0)
+            _peak = 0.0
         if _peak and _peak > 0:
             lines.append(f"Peak speed: {_peak:.0f} mph")
         if td.avg_speed_mph and td.avg_speed_mph > 0:
@@ -1389,11 +1389,11 @@ def _context_engine_caption_fallback(ctx: JobContext, category: str) -> str:
     if tel and getattr(tel, "location_display", None):
         bits.append(f"near {str(tel.location_display).strip()[:80]}")
     try:
-        from core.speed_consensus import consensus_peak_mph
+        from core.speed_consensus import publishable_peak_mph
 
-        _peak = consensus_peak_mph(ctx)
+        _peak = publishable_peak_mph(ctx)
     except Exception:
-        _peak = float(getattr(tel, "max_speed_mph", 0.0) or 0) if tel else 0.0
+        _peak = 0.0
     if _peak > 0:
         bits.append(f"peak {_peak:.0f} mph")
     if category and category != "general":

@@ -322,19 +322,15 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
         _take(_TRILL_TAGS[bucket], 3)
 
     # ── Speed-bucket tags (works even with no Trill score) ───────────────
-    # Canonical consensus peak — never raw tel/OSD reads that can disagree.
+    # High-confidence publishable peak only — HUD-only medium must not mint
+    # #speeddemon / triple-digit tags from an uncorroborated OCR spike.
     max_speed = 0.0
     try:
-        from core.speed_consensus import consensus_peak_mph
+        from core.speed_consensus import publishable_peak_mph
 
-        max_speed = consensus_peak_mph(ctx)
+        max_speed = publishable_peak_mph(ctx)
     except Exception:
         max_speed = 0.0
-    if max_speed <= 0.0 and tel is not None:
-        try:
-            max_speed = float(getattr(tel, "max_speed_mph", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            max_speed = 0.0
     for thresh, sb_tags in _SPEED_BUCKETS:
         if max_speed >= thresh:
             _take(sb_tags, 2)

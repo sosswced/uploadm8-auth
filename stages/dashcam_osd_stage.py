@@ -292,10 +292,15 @@ def _speed_match_to_mph(m: re.Match) -> Tuple[Optional[float], Optional[str]]:
         v = float(m.group(1))
     except ValueError:
         return None, None
-    unit_raw = m.group(2).upper().replace("/", "")
-    if unit_raw in ("MPH", "MIH"):
+    unit_raw = (m.group(2) or "").strip()
+    from core.speed_units import is_speed_unit, normalize_speed_unit
+
+    if not is_speed_unit(unit_raw):
+        return None, None
+    norm = normalize_speed_unit(unit_raw)
+    if norm == "mph":
         return v, "mph"
-    if unit_raw in ("KMH", "KPH"):
+    if norm == "kph":
         return v * 0.621371, "kph"
     return None, None
 
@@ -322,6 +327,12 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     if not line or _SPEED_LIMIT_CONTEXT_RE.search(line):
         return None, None
 
+    from core.speed_units import looks_like_coordinate_or_degree
+
+    # Pure coordinate / heading lines never yield a speed.
+    if looks_like_coordinate_or_degree(line):
+        return None, None
+
     line = _normalize_speed_unit_text(line)
     matches = list(_SPEED_RE.finditer(line))
     if not matches:
@@ -331,6 +342,10 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     ranked: List[Tuple[int, float, str, re.Match]] = []
     hi = _max_plausible_mph()
     for m in matches:
+        # Never treat a match that sits inside the lat/lon span as speed
+        # (e.g. mangled "115°" fragments near longitude).
+        if gps_span is not None and gps_span[0] <= m.start() < gps_span[1]:
+            continue
         mph, unit = _speed_match_to_mph(m)
         if mph is None or unit is None:
             continue

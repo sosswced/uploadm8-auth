@@ -8,6 +8,9 @@ from services.scene_fusion import (
     apply_scene_fusion,
     extract_place_signs,
     build_fusion_scene,
+    enrich_thin_fusion_scene,
+    fusion_scene_is_thin,
+    _parse_enrich_response,
 )
 from services.hydration_enforcer import (
     build_title_anchor_phrase,
@@ -46,7 +49,7 @@ def test_fusion_fills_scene_when_twelvelabs_empty():
         ),
         telemetry_data=None,
         dashcam_osd_context={"max_speed_mph": 154.0},
-        vision_context={"ocr_text": "Welcome to Logandale"},
+        vision_context={"ocr_text": "Welcome to Logandale", "logo_names": ["Nike"]},
         audio_context={
             "music_detected": True,
             "music_artist": "Fetty Wap",
@@ -55,7 +58,7 @@ def test_fusion_fills_scene_when_twelvelabs_empty():
         video_intelligence={"on_screen_text": [{"text": "Westside Freeway"}]},
         video_intelligence_context={},
         video_understanding={},
-        ai_transcript="",
+        ai_transcript="Keep it moving through the night.",
         thumbnail_category="automotive",
         filename="run.mp4",
         output_artifacts={},
@@ -67,10 +70,16 @@ def test_fusion_fills_scene_when_twelvelabs_empty():
     vu = ctx.video_understanding
     assert vu.get("source") == "fusion"
     assert vu.get("scene_description")
+    assert vu.get("description") == vu.get("scene_description")
     assert "154" in vu["scene_description"] or "Logandale" in vu["scene_description"]
     assert vu.get("title_suggestion")
     assert "154 MPH" in vu["title_suggestion"]
     assert "Logandale" in vu["title_suggestion"]
+    cq = vu.get("custom_queries") or {}
+    assert cq.get("music_id") and "Fetty" in cq["music_id"]
+    assert cq.get("location_clue")
+    assert cq.get("peak_speed") == "154 MPH"
+    assert cq.get("brands_visible") and "Nike" in cq["brands_visible"]
 
 
 def test_fusion_skips_when_twelve_labs_present():
@@ -357,7 +366,7 @@ def test_collect_evidence_survives_non_dict_vision_context():
 
 
 def test_m8_deterministic_title_speed_first_with_place_sign():
-    from stages.m8_engine import _deterministic_evidence_title
+    from stages.m8_engine import _deterministic_evidence_title, _validate_title
 
     sg = {
         "geo": {
@@ -374,3 +383,69 @@ def test_m8_deterministic_title_speed_first_with_place_sign():
     assert title
     assert title.startswith("88 MPH")
     assert "Ashland" in title
+    assert " · " not in title
+    assert "through" in title.lower()
+    ok, reason = _validate_title(title, sg, platform="youtube")
+    assert ok, reason
+
+
+def test_m8_rejects_checklist_dot_stack_titles():
+    from stages.m8_engine import _validate_title
+
+    sg = {"geo": {}, "transcript": {}}
+    ok, reason = _validate_title("Garlock Road · The Eagles · Spirited", sg, platform="instagram")
+    assert not ok
+    assert reason == "checklist_dot_stack"
+    ok2, reason2 = _validate_title("110 MPH · Garlock Road", sg, platform="instagram")
+    assert not ok2
+    assert reason2 in ("formula_stub", "checklist_dot_stack")
+
+
+def test_m8_title_from_caption_voice():
+    from stages.m8_engine import _platform_title_from_caption
+
+    cap = (
+        "Night air locks in at 110 MPH through Garlock Road while the cabin stays quiet. "
+        "Another beat follows."
+    )
+    yt = _platform_title_from_caption("youtube", cap)
+    ig = _platform_title_from_caption("instagram", cap)
+    assert yt and "110 MPH" in yt and "Garlock" in yt
+    assert ig and "Garlock" in ig
+    assert " · " not in (yt or "")
+
+def test_parse_enrich_response_requires_substance():
+    assert _parse_enrich_response("not json") is None
+    assert _parse_enrich_response('{"scene_description":"too short"}') is None
+    ok = _parse_enrich_response(
+        '{"scene_description":"Night dashcam run near Bieber with Kodak Black on the speakers while the cabin stays locked in.",'
+        '"title_suggestion":"Bieber night run"}'
+    )
+    assert ok and "Bieber" in ok["scene_description"]
+
+
+def test_fusion_scene_is_thin_threshold():
+    ctx = SimpleNamespace(
+        video_understanding={"scene_description": "Fast run.", "source": "fusion"}
+    )
+    assert fusion_scene_is_thin(ctx) is True
+    ctx.video_understanding["scene_description"] = (
+        "A longer fused scene description that already clears the thin threshold "
+        "with place music and motion context baked in."
+    )
+    assert fusion_scene_is_thin(ctx) is False
+
+
+import asyncio
+
+
+def test_enrich_thin_fusion_skips_without_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ctx = SimpleNamespace(
+        upload_id="enrich-1",
+        video_understanding={"scene_description": "Fast run.", "source": "fusion"},
+        output_artifacts={},
+    )
+    report = asyncio.run(enrich_thin_fusion_scene(ctx))
+    assert report.get("enriched") is False
+    assert report.get("reason") == "no_openai_key"

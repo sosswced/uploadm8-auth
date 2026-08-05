@@ -2307,7 +2307,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # 24/7 scene understanding floor: when Twelve Labs skipped/failed, fuse
         # VI + Vision OCR + OSD + ACR + Whisper into video_understanding.
         try:
-            from services.scene_fusion import apply_scene_fusion
+            from services.scene_fusion import apply_scene_fusion, enrich_thin_fusion_scene
 
             _fusion = apply_scene_fusion(ctx)
             if _fusion and not _fusion.get("skipped"):
@@ -2325,6 +2325,22 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "reason": (_fusion or {}).get("reason"),
                     "source": (_fusion or {}).get("source"),
                 })
+            # Fail-soft LLM expand when fusion/TL left thin prose (TL-parity floor).
+            try:
+                _enrich = await enrich_thin_fusion_scene(ctx)
+                if _enrich.get("enriched"):
+                    _ai_trace(ctx, upload_id, "scene_fusion_enrich", {
+                        "status": "ok",
+                        "scene_chars": _enrich.get("scene_chars"),
+                    })
+                    await _persist_diag_artifacts_now("scene_fusion")
+                elif _enrich.get("attempted"):
+                    _ai_trace(ctx, upload_id, "scene_fusion_enrich", {
+                        "status": "skipped",
+                        "reason": _enrich.get("reason"),
+                    })
+            except Exception as _enr_e:
+                logger.debug(f"[{upload_id}] scene_fusion enrich skipped: {_enr_e}")
         except Exception as _fuse_e:
             logger.debug(f"[{upload_id}] scene_fusion skipped: {_fuse_e}")
 

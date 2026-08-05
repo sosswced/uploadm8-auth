@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, patch
 
 from services.ml_engine import (
     _alert_ml_engine_failure,
+    _is_transient_build_failure,
+    _root_exception_line,
+    _run_build_with_retries,
     _script_cmd,
     _seed_on_train_fail_enabled,
     _subprocess_detail,
@@ -106,3 +109,82 @@ def test_ops_webhook_resolve_rejects_non_discord():
     assert _allowed_ops_discord_webhook(
         "https://discord.com/api/webhooks/123/abc"
     ).startswith("https://discord.com/")
+
+
+def test_root_exception_line_skips_traceback_noise():
+    text = (
+        '  File "C:\\\\Python\\\\thread.py", line 86, in run\n'
+        "    result = ctx.run(self.task)\n"
+        "             ^^^^^^^^^^^^^^^^^^^\n"
+        "socket.gaierror: [Errno 11001] getaddrinfo failed"
+    )
+    assert "getaddrinfo failed" in _root_exception_line(text)
+
+
+def test_is_transient_build_failure_detects_dns():
+    assert _is_transient_build_failure(
+        {"ok": False, "stderr_tail": "socket.gaierror: [Errno 11001] getaddrinfo failed"}
+    )
+    assert not _is_transient_build_failure(
+        {"ok": False, "stderr_tail": "ValueError: bad parquet schema"}
+    )
+    assert not _is_transient_build_failure({"ok": True, "stderr_tail": "getaddrinfo"})
+
+
+def test_run_build_with_retries_recovers_from_dns():
+    calls = {"n": 0}
+
+    def _step(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return {
+                "ok": False,
+                "stderr_tail": "socket.gaierror: [Errno 11001] getaddrinfo failed",
+            }
+        return {"ok": True, "returncode": 0}
+
+    with patch("services.ml_engine.asyncio.sleep", new=AsyncMock()):
+        out = asyncio.run(_run_build_with_retries(_step, attempts=3, label="promo"))
+    assert out["ok"] is True
+    assert out.get("transient_retries") == 1
+    assert calls["n"] == 2
+
+
+def test_run_build_with_retries_does_not_retry_logic_errors():
+    calls = {"n": 0}
+
+    def _step(*_a, **_k):
+        calls["n"] += 1
+        return {"ok": False, "stderr_tail": "ValueError: bad schema"}
+
+    out = asyncio.run(_run_build_with_retries(_step, attempts=3, label="promo"))
+    assert out["ok"] is False
+    assert calls["n"] == 1
+
+
+def test_alert_includes_build_root():
+    rec = AsyncMock(return_value="inc-1")
+    with patch("services.ops_incidents.record_operational_incident", new=rec):
+        asyncio.run(
+            _alert_ml_engine_failure(
+                object(),
+                {
+                    "ok": False,
+                    "error": "dataset build failed",
+                    "cycle_status": "failed",
+                    "steps": {
+                        "build_dataset": {
+                            "stderr_tail": (
+                                'File "x.py", line 1\n'
+                                "socket.gaierror: [Errno 11001] getaddrinfo failed"
+                            )
+                        }
+                    },
+                    "seeded": False,
+                },
+            )
+        )
+    body = rec.await_args.kwargs["body"]
+    assert "build_root=" in body
+    assert "getaddrinfo failed" in body
+    assert rec.await_args.kwargs["details"]["transient_build"] is True

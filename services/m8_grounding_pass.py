@@ -175,6 +175,21 @@ def _sentence_split(text: str) -> List[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+_FORMULA_STUB_RE = re.compile(
+    r"(?is)^\s*(?:anchored\s+in\s+)?\d{1,3}\s*mph\s*[,·—\-]\s*.{0,80}\s*$"
+)
+
+
+def is_formula_stub_caption(text: str) -> bool:
+    """True for checklist stubs like 'Anchored in 88 MPH, Garlock Road' (no persona voice)."""
+    t = (text or "").strip()
+    if not t or len(t) > 120:
+        return False
+    if re.match(r"(?i)^\s*anchored\s+in\b", t):
+        return True
+    return bool(_FORMULA_STUB_RE.match(t))
+
+
 def strip_ungrounded_sentences(
     text: str,
     claims: List[Dict[str, Any]],
@@ -183,6 +198,9 @@ def strip_ungrounded_sentences(
     """
     Drop sentences that share no token with any claimed evidence text.
     Returns (new_text, stripped_count).
+
+    Fail open on voice: if stripping would gut a longer caption into a thin
+    stub, keep the original so persona/style/tone prose survives grounding.
     """
     if not text or not claims:
         return text, 0
@@ -193,7 +211,8 @@ def strip_ungrounded_sentences(
             claim_blob += " " + str(meta.get("text") or "").lower()
     kept: List[str] = []
     stripped = 0
-    for sent in _sentence_split(text):
+    sentences = _sentence_split(text)
+    for sent in sentences:
         tokens = {t for t in re.findall(r"[a-z0-9]{3,}", sent.lower())}
         if not tokens:
             kept.append(sent)
@@ -205,7 +224,15 @@ def strip_ungrounded_sentences(
             stripped += 1
     if not kept:
         return text, 0
-    return " ".join(kept), stripped
+    joined = " ".join(kept)
+    # Preserve persona voice: never reduce a real caption to a thin fact stub.
+    if stripped and (
+        len(joined) < 40
+        or is_formula_stub_caption(joined)
+        or (len(sentences) >= 2 and stripped >= max(1, (len(sentences) + 1) // 2) and len(text) >= 60)
+    ):
+        return text, 0
+    return joined, stripped
 
 
 def ensure_must_use_coverage(
@@ -214,7 +241,7 @@ def ensure_must_use_coverage(
     *,
     min_required: int = 2,
 ) -> Tuple[str, bool]:
-    """Append a short factual clause when must_use coverage is below min_required."""
+    """Weave missing must_use facts into existing prose — never replace voice with a stub."""
     if not must_use:
         return text, False
     blob = (text or "").lower()
@@ -230,11 +257,14 @@ def ensure_must_use_coverage(
         return text, False
     need = max(0, min_required - hits)
     inject = ", ".join(missing[: max(1, need)])
-    base = (text or "").rstrip()
-    if base and not base.endswith((".", "!", "?")):
-        base += "."
-    clause = f" Anchored in {inject}."
-    return (base + clause).strip(), True
+    base = (text or "").strip()
+    # Empty / already-a-stub: leave factual tokens only — no "Anchored in" brand
+    # that the model then copies as the entire caption.
+    if not base or is_formula_stub_caption(base):
+        return inject.rstrip(" .") + ".", True
+    # Soft-merge into existing voice (em dash closer, not a checklist sentence).
+    core = base.rstrip(" .!?")
+    return f"{core} — {inject}.", True
 
 
 def apply_grounding_pass2_to_ranked(
@@ -282,13 +312,32 @@ def apply_grounding_pass2_to_ranked(
         new_cap, injected = ensure_must_use_coverage(new_cap, must_use)
         if injected:
             report["must_use_injected"] += 1
+
+        variants = block.get("variants_ranked") or block.get("variants") or []
+        # Voice salvage: if winner collapsed to a fact stub, prefer the best
+        # non-stub variant and soft-weave must_use into that voice.
+        voice_repaired = False
+        if is_formula_stub_caption(new_cap) and isinstance(variants, list):
+            for v in variants:
+                if not isinstance(v, dict):
+                    continue
+                alt = str(v.get("caption") or "").strip()
+                if not alt or is_formula_stub_caption(alt) or len(alt) < 40:
+                    continue
+                alt2, _ = ensure_must_use_coverage(alt, must_use)
+                if alt2 and not is_formula_stub_caption(alt2):
+                    new_cap = alt2
+                    injected = True
+                    voice_repaired = True
+                    report["must_use_injected"] = int(report.get("must_use_injected") or 0) + 1
+                    break
+
         selected = dict(selected)
         selected["caption"] = new_cap
         selected["claims"] = claims
         block["winner"] = selected
         block["selected"] = selected  # alias for newer consumers
 
-        variants = block.get("variants_ranked") or block.get("variants") or []
         if isinstance(variants, list):
             for v in variants:
                 if not isinstance(v, dict):
@@ -305,6 +354,7 @@ def apply_grounding_pass2_to_ranked(
             "claims": len(claims),
             "stripped": n_strip,
             "must_use_injected": injected,
+            "voice_repaired": voice_repaired,
         }
         platforms[pl] = block
 
@@ -328,9 +378,10 @@ EVIDENCE CATALOG (bind claims to these ids only):
 
 CLAIMS CONTRACT (required when catalog is non-empty):
 - Each variant MUST include "claims": [ {{ "text": "...", "evidence_ids": ["e1", ...], "confidence": 0.0-1.0 }} ].
-- Every factual noun phrase in caption/title should appear in some claim.text.
+- Every factual noun phrase (speed, place, song, landmark) in caption/title should appear in some claim.text.
 - evidence_ids MUST reference catalog ids above; never invent ids.
-- If you cannot ground a sentence, omit it from the caption.
+- Keep style/tone/voice prose — only omit sentences that invent false facts not in the catalog.
+- Never write checklist stubs like "Anchored in 110 MPH, Road Name" as the whole caption; weave facts into voice.
 """
 
 
@@ -342,4 +393,5 @@ __all__ = [
     "synthesize_claims_from_text",
     "ensure_must_use_coverage",
     "strip_ungrounded_sentences",
+    "is_formula_stub_caption",
 ]

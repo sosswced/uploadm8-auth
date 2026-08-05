@@ -8,6 +8,7 @@ import pytest
 from core.db_pool import (
     DatabaseUnavailableError,
     acquire_db,
+    connect_with_retry,
     is_dead_connection_error,
     is_transient_db_error,
 )
@@ -140,5 +141,49 @@ def test_acquire_db_exhausted_connection_errors_raise_unavailable():
             async with acquire_db(pool, attempts=3):
                 pass
         assert pool.acquire_calls == 3
+
+    asyncio.run(_run())
+
+
+def test_is_transient_includes_gaierror():
+    assert is_transient_db_error(OSError("getaddrinfo failed"))
+    try:
+        import socket
+
+        assert is_transient_db_error(socket.gaierror(11001, "getaddrinfo failed"))
+    except Exception:
+        pass
+
+
+def test_connect_with_retry_recovers_from_transient(monkeypatch):
+    calls = {"n": 0}
+
+    async def _fake_connect(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise OSError("getaddrinfo failed")
+        return object()
+
+    monkeypatch.setattr("core.db_pool.asyncpg.connect", _fake_connect)
+    monkeypatch.setattr("core.db_pool._backoff_s", lambda _a: 0)
+
+    async def _run():
+        conn = await connect_with_retry("postgresql://x", attempts=4)
+        assert conn is not None
+
+    asyncio.run(_run())
+    assert calls["n"] == 3
+
+
+def test_connect_with_retry_exhausted(monkeypatch):
+    async def _fake_connect(*_a, **_k):
+        raise OSError("getaddrinfo failed")
+
+    monkeypatch.setattr("core.db_pool.asyncpg.connect", _fake_connect)
+    monkeypatch.setattr("core.db_pool._backoff_s", lambda _a: 0)
+
+    async def _run():
+        with pytest.raises(OSError, match="getaddrinfo"):
+            await connect_with_retry("postgresql://x", attempts=2)
 
     asyncio.run(_run())

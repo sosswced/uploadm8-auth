@@ -26,7 +26,6 @@ import os
 import sys
 from pathlib import Path
 
-import asyncpg
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -37,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_REPO_ROOT / ".env")
 
+from core.db_pool import connect_with_retry
 from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_write_token
 from services.hf_dataset_export import coerce_dataframe_for_hf, push_dataframe_to_hub
 
@@ -348,7 +348,7 @@ def _dedupe_promo(df: pd.DataFrame, limit: int) -> pd.DataFrame:
 
 
 async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFrame:
-    conn = await asyncpg.connect(dsn)
+    conn = await connect_with_retry(dsn)
     try:
         # Primary path: curated view.
         try:
@@ -362,7 +362,7 @@ async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFra
         await conn.close()
 
     # Fallback path: inline assembly (view missing or empty).
-    conn = await asyncpg.connect(dsn)
+    conn = await connect_with_retry(dsn)
     touch_rows = []
     snap_rows = []
     try:

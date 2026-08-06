@@ -1,4 +1,4 @@
-"""M8 OpenAI retry ladder: full → expand(on length/parse) → compact → text_only; stop on quota."""
+﻿"""M8 OpenAI retry ladder: full â†’ expand(on length/parse) â†’ compact â†’ text_only; stop on quota."""
 
 from __future__ import annotations
 
@@ -263,9 +263,64 @@ def test_prompt_contains_creative_spine_and_authority():
     )
     assert "CREATIVE AUTHORITY" in prompt
     assert "CREATIVE SPINE" in prompt
-    # Spine must appear after PLATFORM RULES / near TASK (recency)
-    spine_i = prompt.find("CREATIVE SPINE")
+    assert "CREATIVE COMBINATION BRIEF" in prompt or "CREATIVE COMBINATION" in prompt
+    # Creative brief must lead (before SCENE GRAPH); TASK still remands voice.
+    brief_i = prompt.find("CREATIVE COMBINATION")
+    if brief_i < 0:
+        brief_i = prompt.find("CREATIVE AUTHORITY")
+    sg_i = prompt.find("SCENE GRAPH (evidence")
     task_i = prompt.find("\nTASK:")
-    assert spine_i > 0 and task_i > spine_i
+    assert brief_i > 0 and sg_i > brief_i
+    assert task_i > sg_i
+    assert "Audible Style / Tone / Voice" in prompt[task_i : task_i + 800]
     assert "REJECTED by the ranker" not in prompt
     assert "Style: mixed" in prompt and "mix niche" in prompt
+
+def test_trim_m8_prompt_keeps_creative_and_task():
+    from stages.m8_engine import _trim_m8_prompt_preserving_creative
+
+    fat_sg = "{\n" + ",\n".join('  "pad%s": "' % i + ("x" * 180) + '"' for i in range(200)) + "\n}\n"
+    prompt = (
+        "You are M8.\n"
+        "CREATIVE COMBINATION BRIEF — PUNCHY x CINEMATIC x RADIO_HOST\n"
+        "CREATIVE SPINE: spoken as radio host.\n"
+        "SCENE GRAPH (evidence - do not invent):\n"
+        + fat_sg
+        + "PLATFORM RULES:\nyoutube stuff\n"
+        "\nTASK:\n"
+        "Audible Style / Tone / Voice from the CREATIVE SPINE must be present.\n"
+        "Return ONLY valid JSON.\n"
+        + ("padding " * 500)
+    )
+    assert len(prompt) > 28_000
+    out = _trim_m8_prompt_preserving_creative(prompt, 28_000)
+    assert len(out) <= 28_000
+    assert "CREATIVE COMBINATION BRIEF" in out
+    assert "CREATIVE SPINE" in out
+    assert out.find("\nTASK:\n") > 0
+    assert "Audible Style / Tone / Voice" in out
+    assert "Return ONLY valid JSON" in out
+    assert '"pad0"' not in out
+    sg_i = out.find("SCENE GRAPH")
+    task_i = out.find("\nTASK:\n")
+    assert sg_i > 0 and task_i > sg_i
+    assert out[task_i : task_i + 80].startswith("\nTASK:\n")
+
+
+def test_trim_m8_last_resort_keeps_task_header():
+    from stages.m8_engine import _trim_m8_prompt_preserving_creative
+
+    head = "CREATIVE COMBINATION BRIEF — X\n" + ("H" * 20_000) + "\n"
+    mid = "SCENE GRAPH (evidence):\n" + ("M" * 15_000) + "\nPLATFORM RULES:\nyt\n"
+    tail = (
+        "\nTASK:\nAudible Style / Tone / Voice must be present.\n"
+        "Return ONLY valid JSON.\n"
+        + ("T" * 12_000)
+    )
+    prompt = head + mid + tail
+    out = _trim_m8_prompt_preserving_creative(prompt, 28_000)
+    assert len(out) <= 28_000
+    assert "CREATIVE COMBINATION BRIEF" in out
+    ti = out.find("\nTASK:\n")
+    assert ti > 0
+    assert "Audible Style / Tone / Voice" in out[ti : ti + 200]

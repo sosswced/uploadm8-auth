@@ -1369,13 +1369,15 @@ hashtags may reference artist/title/genre tokens for discovery while respecting 
 ANTI-GENERIC RULES. If audio_environment or fusion_narrative describe ambience, fold 1–2 audible cues into prose
 and hashtag tokens so posts match how the clip sounds, not only how it looks.
 
-{hydration_timeline_brief}
+{authority_line}
 {creative_full}
+{creative_spine}
+
+{hydration_timeline_brief}
 SCENE GRAPH (evidence - do not invent beyond it; you may interpret visually grounded details):
 {sg}
 
 CATEGORY: {category}
-{authority_line}
 {_user_brand_directive(ctx)}
 {_task_prompt(generate_title, generate_caption, generate_hashtags)}
 
@@ -1392,7 +1394,7 @@ CATEGORY: {category}
 PLATFORM RULES:
 {chr(10).join(plat_blocks)}
 {matrix_section}
-{creative_spine}
+CREATIVE REMINDER (do not drift): {creative_spine}
 TASK:
 For EACH platform listed in scene_graph.platforms, output EXACTLY 5 variants ranked as "variant_index" 1..5.
 Each variant must feel meaningfully different (hook style, angle, emotion), not minor word swaps.
@@ -1442,6 +1444,88 @@ Return ONLY valid JSON (no markdown) in this exact shape:
 
 Include only keys for platforms in scene_graph.platforms (lowercase).
 """
+
+
+def _trim_m8_prompt_preserving_creative(prompt: str, limit: int) -> str:
+    """Shrink oversized M8 prompts without dropping Style/Tone/Voice or TASK.
+
+    Legacy trim cut at PLATFORM RULES and discarded the TASK / creative remanding —
+    compact retries then had evidence but no prose contract or JSON schema.
+    Prefer dropping PLATFORM RULES / replacing the SCENE GRAPH body wholesale;
+    never mid-slice JSON. Always keep CREATIVE BRIEF (head) + TASK from the start.
+    """
+    text = prompt or ""
+    lim = max(4000, int(limit or 0))
+    if len(text) <= lim:
+        return text
+
+    sg_mark = "SCENE GRAPH (evidence"
+    task_mark = "\nTASK:\n"
+    sg_i = text.find(sg_mark)
+    task_i = text.find(task_mark)
+
+    def _shrink_mid(mid: str, budget: int) -> str:
+        """Shrink SG…pre-TASK without mid-string JSON cuts."""
+        if budget < 120:
+            return (
+                "SCENE GRAPH: [trimmed — obey CREATIVE BRIEF + HYDRATION BRIEF]\n"
+            )
+        if len(mid) <= budget:
+            return mid
+        stub = (
+            "SCENE GRAPH: [trimmed for length — obey CREATIVE BRIEF above and "
+            "HYDRATION + TIMELINE BRIEF; do not invent facts]\n"
+        )
+        # Keep PLATFORM RULES when they fit after the stub (whole section only).
+        pr = mid.find("\nPLATFORM RULES:")
+        if pr >= 0:
+            plat = mid[pr:]
+            if len(stub) + len(plat) <= budget:
+                return stub + plat.lstrip("\n")
+            # Drop platform rules entirely — never slice mid-rule.
+        if len(stub) <= budget:
+            return stub
+        return "SCENE GRAPH: [trimmed]\n"
+
+    if sg_i >= 0 and task_i > sg_i:
+        head = text[:sg_i]
+        mid = text[sg_i:task_i]
+        tail = text[task_i:]
+        budget = lim - len(head) - len(tail) - 48
+        mid2 = _shrink_mid(mid, max(0, budget))
+        out = head + mid2 + tail
+        if len(out) <= lim:
+            return out
+        # Last resort: creative head + SG stub + TASK from the *start*
+        # (never tail[-n:], which drops the TASK header / voice instructions).
+        stub = (
+            "SCENE GRAPH: [trimmed — obey CREATIVE BRIEF + HYDRATION BRIEF]\n"
+        )
+        keep_tail = min(len(tail), max(3500, lim // 3))
+        keep_head = lim - keep_tail - len(stub) - 48
+        if keep_head < 800:
+            keep_head = max(600, lim - keep_tail - len(stub) - 48)
+        head_part = head if len(head) <= keep_head else (
+            head[:keep_head].rstrip() + "\n…[creative head trimmed]\n"
+        )
+        if len(head_part) + len(stub) + keep_tail > lim:
+            keep_head = max(500, lim - keep_tail - len(stub) - 48)
+            head_part = head[:keep_head].rstrip() + "\n…[creative head trimmed]\n"
+        tail_part = tail if len(tail) <= keep_tail else (
+            tail[:keep_tail].rstrip() + "\n…[task tail trimmed]\n"
+        )
+        return head_part + stub + tail_part
+
+    # No SG/TASK markers — keep start (creative) + end.
+    keep_end = min(len(text), max(2500, lim // 3))
+    keep_start = lim - keep_end - 40
+    if keep_start < 1000:
+        return text[: lim - 20].rstrip() + "\n…[prompt trimmed]"
+    return (
+        text[:keep_start].rstrip()
+        + "\n…[prompt trimmed]\n"
+        + text[-keep_end:]
+    )
 
 
 def _penalize_generic(text: str) -> float:
@@ -3112,17 +3196,8 @@ async def run_m8_caption_engine(
     http_to = 120.0
     temperature = m8_temperature_for_tone(caption_tone)
 
-    compact_prompt = prompt
-    # Soft cap oversized prompts at a section boundary when possible.
-    if len(compact_prompt) > 28_000:
-        cut_at = compact_prompt.rfind("\nPLATFORM RULES:", 0, 28_000)
-        if cut_at < 10_000:
-            cut_at = 28_000
-        compact_prompt = compact_prompt[:cut_at].rstrip() + "\n…[prompt trimmed]"
-
-    full_prompt = prompt if len(prompt) <= 48_000 else (
-        prompt[: prompt.rfind("\nPLATFORM RULES:", 0, 48_000) or 48_000].rstrip() + "\n…[prompt trimmed]"
-    )
+    compact_prompt = _trim_m8_prompt_preserving_creative(prompt, 28_000)
+    full_prompt = _trim_m8_prompt_preserving_creative(prompt, 48_000)
 
     ladder = [
         {

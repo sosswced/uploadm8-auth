@@ -67,6 +67,11 @@ def class_rank_for_cluster(
     clusters = data.get("clusters") if isinstance(data.get("clusters"), dict) else {}
     if tag and isinstance(clusters.get(tag), list) and clusters[tag]:
         return [str(c) for c in clusters[tag] if c]
+    # Automotive-only learning must not skew gardening/food/travel globals.
+    auto_tags = {"automotive", "driving", "dashcam", "vehicle"}
+    cluster_keys = {str(k).strip().lower() for k in clusters.keys() if k}
+    if cluster_keys and cluster_keys <= auto_tags and tag not in auto_tags:
+        return list(_BOOTSTRAP_GLOBAL)
     global_order = data.get("global") if isinstance(data.get("global"), list) else _BOOTSTRAP_GLOBAL
     return [str(c) for c in global_order if c]
 
@@ -154,9 +159,18 @@ def rebuild_hero_fact_priors(
         if row_counts[tag] >= min_rows:
             clusters_out[tag] = _ranked(wins)
 
+    auto_tags = {"automotive", "driving", "dashcam", "vehicle"}
+    cluster_keys = {str(k).strip().lower() for k in clusters_out.keys() if k}
+    # When only automotive clusters learned, keep bootstrap global so other
+    # domains do not inherit a speed-heavy world prior.
+    if cluster_keys and cluster_keys <= auto_tags:
+        global_order = list(_BOOTSTRAP_GLOBAL)
+    else:
+        global_order = _ranked(global_wins) if global_wins else list(_BOOTSTRAP_GLOBAL)
+
     payload = {
         "version": 1,
-        "global": _ranked(global_wins) if global_wins else list(_BOOTSTRAP_GLOBAL),
+        "global": global_order,
         "clusters": clusters_out,
         "row_counts": dict(row_counts),
         "source": "learned" if clusters_out or global_wins else "bootstrap",

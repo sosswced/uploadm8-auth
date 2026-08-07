@@ -508,6 +508,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "captionCreativeVaryStyle",
             "captionCreativeVaryTone",
             "captionCreativeVaryVoice",
+            "multiStyleCaptions",
         )
         caption_snake = (
             "caption_style",
@@ -519,6 +520,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "caption_creative_vary_style",
             "caption_creative_vary_tone",
             "caption_creative_vary_voice",
+            "multi_style_captions",
         )
         thumb_keys = ("thumbnailSelectionMode", "thumbnailRenderPipeline")
         thumb_snake = ("thumbnail_selection_mode", "thumbnail_render_pipeline")
@@ -612,6 +614,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                     ("captionCreativeVaryStyle", "caption_creative_vary_style"),
                     ("captionCreativeVaryTone", "caption_creative_vary_tone"),
                     ("captionCreativeVaryVoice", "caption_creative_vary_voice"),
+                    ("multiStyleCaptions", "multi_style_captions"),
                 ):
                     if camel in p or snake in p:
                         raw = p.get(camel) if camel in p else p.get(snake)

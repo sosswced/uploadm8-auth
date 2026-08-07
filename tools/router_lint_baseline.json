@@ -78,7 +78,7 @@
       "max_db_touch_lines": 4
     },
     "routers/me.py": {
-      "max_lines": 1583,
+      "max_lines": 1610,
       "max_db_touch_lines": 57
     },
     "routers/me_settings.py": {
@@ -106,7 +106,7 @@
       "max_db_touch_lines": 11
     },
     "routers/preferences.py": {
-      "max_lines": 803,
+      "max_lines": 860,
       "max_db_touch_lines": 21
     },
     "routers/public_entitlements.py": {

@@ -218,10 +218,11 @@ def _trace_m8(ctx: JobContext, upload_id: str, event: str, payload: Dict[str, An
 
 def m8_evidence_matrix_enabled(user_settings: Optional[Dict[str, Any]]) -> bool:
     """
-    Extra JSON block ``caption_evidence_matrix`` in the same multimodal M8 call.
+    Extra JSON block ``caption_evidence_matrix`` via a second M8 matrix call.
 
-    Enable: M8_CAPTION_STYLE_MATRIX=true | 1 | yes, or user ``multiStyleCaptions`` / ``multi_style_captions`` true.
-    Disable: M8_CAPTION_STYLE_MATRIX=false | 0 | no, or when unset and no user flag (saves completion tokens).
+    Default ON when unset. Hard-off: ``M8_CAPTION_STYLE_MATRIX=0|false|no|off``.
+    Hard-on: env true. User ``multiStyleCaptions`` / ``multi_style_captions`` overrides
+    when set (Settings toggle).
     """
     raw = (os.environ.get("M8_CAPTION_STYLE_MATRIX") or "").strip().lower()
     if raw in ("1", "true", "yes", "on"):
@@ -233,7 +234,7 @@ def m8_evidence_matrix_enabled(user_settings: Optional[Dict[str, Any]]) -> bool:
         return bool(us.get("multiStyleCaptions"))
     if us.get("multi_style_captions") is not None:
         return bool(us.get("multi_style_captions"))
-    return False
+    return True
 
 
 def _sanitize_evidence_matrix(raw: Any, expected_max: int) -> Optional[Dict[str, Any]]:
@@ -972,11 +973,12 @@ def _task_prompt(generate_title: bool, generate_caption: bool, generate_hashtags
 
 
 def _platform_prompt(platform: str, target: Dict[str, Any]) -> str:
+    """Platform constraints only — CREATIVE SPINE owns voice; do not emit Persona=."""
     c = target.get("constraints") or {}
     banned = ", ".join(str(x) for x in (c.get("banned_phrases") or [])[:10])
     return (
         f"{_platform_constraints(platform)} "
-        f"Persona={target.get('persona', 'storyteller')}; risk={target.get('risk_level', 'safe')}; "
+        f"risk={target.get('risk_level', 'safe')}; "
         f"caption_len={c.get('caption_length_min', 80)}-{c.get('caption_length_max', 300)}; "
         "emoji_policy=none (no Unicode emojis or emoticons in title or caption); "
         f"hook_formula={c.get('hook_formula', 'scene_hook')}; "
@@ -1850,6 +1852,9 @@ def _evidence_coverage_score(
     template-style variant ("Cruise under vast skies") will score 0 hits and
     receive -200.0, putting it well below any evidence-bearing variant — the
     LLM cannot win with category-seed copy when concrete evidence exists.
+
+    Soft partial: one must_use hit on non-stub voice stays competitive vs ·
+    checklist stacks that merely stuff more tokens.
     """
     if not must_use:
         return 0.0
@@ -1858,6 +1863,16 @@ def _evidence_coverage_score(
     if hits == 0:
         return -200.0
     if hits < min_required:
+        stub = False
+        checklist = bool(title and " · " in str(title))
+        try:
+            from services.m8_grounding_pass import is_formula_stub_caption
+
+            stub = is_formula_stub_caption(caption) or is_formula_stub_caption(title)
+        except Exception:
+            stub = bool(re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()))
+        if not stub and not checklist:
+            return 8.0  # voice with ≥1 hit — prefer over checklist stuffing
         return -50.0
     # Diminishing returns above min_required so we don't reward over-stuffing.
     return min(40.0, 18.0 + (hits - min_required) * 6.0)
@@ -2053,10 +2068,11 @@ def _quality_gate_penalty(platform: str, title: str, caption: str) -> float:
         from services.m8_grounding_pass import is_formula_stub_caption
 
         if is_formula_stub_caption(caption) or is_formula_stub_caption(title):
-            penalty += 16.0
+            # Must land below the ≥45 winner gate so checklist stubs cannot publish.
+            penalty += 40.0
     except Exception:
         if re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()):
-            penalty += 16.0
+            penalty += 40.0
     if platform == "youtube" and len((title or "").strip()) < 12:
         penalty += 6.0
     if len((caption or "").strip()) < 35:
@@ -2153,8 +2169,9 @@ def _repair_artifacts_selective(
         if alt_c:
             repaired["caption"] = alt_c
         else:
+            # Never prepend clickbait "POV:" — keep runner-up empty or hydrate later.
             c = str(repaired.get("caption") or "").strip()
-            repaired["caption"] = ("POV: " + c) if c and not c.lower().startswith("pov") else c
+            repaired["caption"] = c
     if not checks.get("hashtags_ok", True):
         tags = repaired.get("hashtags") or []
         cleaned: List[str] = []
@@ -2227,6 +2244,26 @@ def score_variant(
     base -= _attribution_penalty(caption, title, scene_graph)
     base -= _quality_gate_penalty(platform, title, caption)
     base -= _primary_hydration_penalty(caption, title, scene_graph)
+    # Prefer audible voice prose over · checklist / formula stubs when both
+    # touch evidence (zero-evidence still dies at −200 via coverage score).
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        _stub = is_formula_stub_caption(caption) or is_formula_stub_caption(title)
+    except Exception:
+        _stub = bool(re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()))
+    _checklist = bool(
+        title
+        and " · " in title
+        and not re.search(
+            r"\b(through|near|on|at|with|into|under|over|from|while|when|along|past)\b",
+            title,
+            re.I,
+        )
+    )
+    if must_use and not _stub and not _checklist:
+        if _evidence_coverage(f"{caption} {title}", must_use) >= 1:
+            base += 12.0
     tags = variant.get("hashtags") or []
     if isinstance(tags, list):
         base -= penalize_generic_vision_hashtags(tags)
@@ -2344,11 +2381,34 @@ def rank_and_select(
             winner = ranked[0]
             if len(ranked) > 1:
                 runner_up = ranked[1]
-            # Quality gate: if top result still weak, use best non-weak candidate.
+            # Prefer non-stub voice above the quality floor; never crown formula stubs.
+            def _is_stub_cand(cand: Dict[str, Any]) -> bool:
+                try:
+                    from services.m8_grounding_pass import is_formula_stub_caption
+
+                    return is_formula_stub_caption(str(cand.get("caption") or "")) or is_formula_stub_caption(
+                        str(cand.get("title") or "")
+                    )
+                except Exception:
+                    c = str(cand.get("caption") or "")
+                    t = str(cand.get("title") or "")
+                    return bool(
+                        re.match(r"(?i)^\s*anchored\s+in\b", c)
+                        or (" · " in t and not re.search(r"\b(through|near|with|on|at)\b", t, re.I))
+                    )
+
             for cand in ranked:
+                if _is_stub_cand(cand):
+                    continue
                 if float(cand.get("score") or 0) >= 45.0:
                     winner = cand
                     break
+            else:
+                # All stubs / weak — keep best non-stub if any, else top (repair/fallback later).
+                for cand in ranked:
+                    if not _is_stub_cand(cand):
+                        winner = cand
+                        break
 
             # ── Title hard-ban filter ────────────────────────────────────
             # Walk candidates in score order; first one whose title passes
@@ -2358,6 +2418,8 @@ def rank_and_select(
             need_title = pl in ("youtube", "instagram", "facebook")
             if need_title:
                 for cand in ranked:
+                    if _is_stub_cand(cand):
+                        continue
                     cand_title = str(cand.get("title") or "").strip()
                     ok_t, reason_t = _validate_title(cand_title, scene_graph, platform=pl)
                     if ok_t:
@@ -2369,8 +2431,12 @@ def rank_and_select(
                         "reason": reason_t,
                     })
                 else:
-                    # All variants failed — prefer voice from winning caption, then
-                    # spoken evidence fallback (never · checklist stacks).
+                    # No non-stub candidate had a valid title — caption voice / evidence title.
+                    if winner is None or _is_stub_cand(winner):
+                        for cand in ranked:
+                            if not _is_stub_cand(cand):
+                                winner = cand
+                                break
                     if winner is None:
                         winner = ranked[0]
                     winner = dict(winner)
@@ -2390,8 +2456,6 @@ def rank_and_select(
                             winner["title"] = fallback
                             title_validation_meta["evidence_fallback_used"] = True
                         else:
-                            # No allowed evidence — return null title rather than
-                            # ship a transcript/lyric quote.
                             winner["title"] = None
                             title_validation_meta["evidence_fallback_used"] = False
                             title_validation_meta["title_set_to_null"] = True
@@ -2406,6 +2470,8 @@ def rank_and_select(
             winner, preflight_meta = _repair_artifacts_selective(
                 pl, winner, ranked, scene_graph, strategy_target
             )
+            if isinstance(winner, dict) and "winner_source" not in winner:
+                winner["winner_source"] = "main"
         out_plat[pl] = {
             "variants_ranked": ranked,
             "winner": winner,
@@ -2418,6 +2484,289 @@ def rank_and_select(
         "m8_version": parsed.get("m8_version") or M8_ENGINE_VERSION,
         "platforms": out_plat,
         "must_use": must_use,
+    }
+
+
+def merge_matrix_cells_into_ranked(
+    ranked: Dict[str, Any],
+    matrix_san: Optional[Dict[str, Any]],
+    scene_graph: Dict[str, Any],
+    historical_signals: Optional[Dict[str, Any]] = None,
+    strategy: Optional[Dict[str, Any]] = None,
+    *,
+    ctx: Optional[JobContext] = None,
+) -> Dict[str, Any]:
+    """Score matrix cell captions and let a higher-scoring cell win publish.
+
+    Matrix cells are TikTok-oriented; they compete on tiktok/instagram (and
+    facebook) caption slots. YouTube keeps main spine unless a cell clearly
+    beats with a caption-derived title.
+    """
+    if not isinstance(ranked, dict) or not isinstance(matrix_san, dict):
+        return ranked
+    cells = matrix_san.get("cells") if isinstance(matrix_san.get("cells"), list) else []
+    if not cells:
+        return ranked
+
+    must_use = list(ranked.get("must_use") or [])
+    style_ui = ""
+    tone_ui = ""
+    voice_ui = ""
+    if ctx is not None:
+        us = getattr(ctx, "user_settings", None) or {}
+        style_ui = str(us.get("captionStyle") or us.get("caption_style") or "").lower()
+        tone_ui = str(us.get("captionTone") or us.get("caption_tone") or "").lower()
+        voice_ui = str(us.get("captionVoice") or us.get("caption_voice") or "").lower()
+    min_must = 1 if style_ui == "freestyle" else 2
+    platforms_out = ranked.get("platforms") if isinstance(ranked.get("platforms"), dict) else {}
+    compete = ("tiktok", "instagram", "facebook", "youtube")
+
+    for pl in list(platforms_out.keys()):
+        pl_l = str(pl).lower()
+        if pl_l not in compete:
+            continue
+        block = platforms_out.get(pl) or {}
+        if not isinstance(block, dict):
+            continue
+        ranked_list = list(block.get("variants_ranked") or [])
+        strategy_target = ((strategy or {}).get("outputs") or {}).get("platform_targets", {}).get(pl_l, {})
+        best = block.get("winner")
+        best_score = float((best or {}).get("score") or -1e9) if isinstance(best, dict) else -1e9
+        matrix_added = 0
+        for i, cell in enumerate(cells[:24]):
+            if not isinstance(cell, dict):
+                continue
+            cap = str(cell.get("tiktok_caption") or cell.get("caption") or "").strip()
+            if not cap:
+                continue
+            cell_style = str(cell.get("caption_style") or style_ui or "").lower()
+            cell_tone = str(cell.get("caption_tone") or tone_ui or "").lower()
+            cell_voice = str(cell.get("caption_voice") or voice_ui or "").lower()
+            title = ""
+            if pl_l in ("youtube", "instagram", "facebook"):
+                title = (_platform_title_from_caption(pl_l, cap) or "")[:100]
+            variant = {
+                "variant_index": f"matrix_{i}",
+                "title": title or None,
+                "caption": cap,
+                "hashtags": list(cell.get("hashtags") or [])[:12],
+                "claims": [],
+            }
+            sc, why = score_variant(
+                pl_l,
+                variant,
+                scene_graph,
+                historical_signals,
+                must_use=must_use,
+                min_must_use=min_must,
+                caption_style=cell_style or style_ui,
+                caption_tone=cell_tone or tone_ui,
+                caption_voice=cell_voice or voice_ui,
+            )
+            item = {
+                **variant,
+                "score": round(sc, 4),
+                "rationale": why,
+                "winner_source": "matrix",
+                "matrix_cell": {
+                    "caption_style": cell_style,
+                    "caption_tone": cell_tone,
+                    "caption_voice": cell_voice,
+                    "cell_index": i,
+                },
+            }
+            ranked_list.append(item)
+            matrix_added += 1
+            # Only crown matrix cells that beat main AND pass title hard-ban (when needed).
+            if sc <= best_score:
+                continue
+            try:
+                from services.m8_grounding_pass import is_formula_stub_caption
+
+                if is_formula_stub_caption(cap) or is_formula_stub_caption(title or ""):
+                    continue
+            except Exception:
+                if re.match(r"(?i)^\s*anchored\s+in\b", cap):
+                    continue
+            if pl_l in ("youtube", "instagram", "facebook"):
+                ok_t, _ = _validate_title(title or "", scene_graph, platform=pl_l)
+                if not ok_t:
+                    # Keep cell as ranked candidate with null title; don't crown yet.
+                    item["title"] = None
+                    from_cap = _platform_title_from_caption(pl_l, cap)
+                    if from_cap:
+                        ok2, _ = _validate_title(from_cap, scene_graph, platform=pl_l)
+                        if ok2:
+                            item["title"] = from_cap
+                        else:
+                            continue
+                    else:
+                        continue
+            best = item
+            best_score = sc
+        ranked_list.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+        winner = best if isinstance(best, dict) else (ranked_list[0] if ranked_list else None)
+        if winner:
+            winner, preflight = _repair_artifacts_selective(
+                pl_l, winner, ranked_list, scene_graph, strategy_target
+            )
+            if pl_l == "tiktok" and isinstance(winner, dict):
+                winner = dict(winner)
+                winner["title"] = None
+            elif pl_l in ("youtube", "instagram", "facebook") and isinstance(winner, dict):
+                ok_w, _ = _validate_title(str(winner.get("title") or ""), scene_graph, platform=pl_l)
+                if not ok_w:
+                    from_cap = _platform_title_from_caption(pl_l, str(winner.get("caption") or ""))
+                    if from_cap:
+                        ok2, _ = _validate_title(from_cap, scene_graph, platform=pl_l)
+                        winner = dict(winner)
+                        winner["title"] = from_cap if ok2 else None
+                    else:
+                        winner = dict(winner)
+                        winner["title"] = None
+            block["variants_ranked"] = ranked_list
+            block["winner"] = winner
+            block["preflight"] = preflight
+            block["matrix_candidates"] = matrix_added
+            if isinstance(winner, dict):
+                block["winner_source"] = winner.get("winner_source") or "main"
+                if winner.get("matrix_cell"):
+                    block["winning_matrix_cell"] = winner.get("matrix_cell")
+        platforms_out[pl] = block
+
+    ranked["platforms"] = platforms_out
+    ranked["selection_meta"] = {
+        **(ranked.get("selection_meta") if isinstance(ranked.get("selection_meta"), dict) else {}),
+        "matrix_in_pool": True,
+        "matrix_cell_count": len(cells),
+    }
+    return ranked
+
+
+def m8_voice_fallback_enabled() -> bool:
+    raw = (os.environ.get("M8_VOICE_FALLBACK") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def build_voice_fallback_selection(
+    scene_graph: Dict[str, Any],
+    *,
+    caption_style: str = "story",
+    caption_tone: str = "authentic",
+    caption_voice: str = "default",
+    platforms: Optional[List[str]] = None,
+    ctx: Optional[JobContext] = None,
+) -> Dict[str, Any]:
+    """Deterministic voice-shaped captions when OpenAI quota/key fails.
+
+    Uses creative facets + must_use evidence — never Anchored-in / · checklist
+    as the primary form.
+    """
+    from core.caption_creative import (
+        normalize_caption_style,
+        normalize_caption_tone,
+        normalize_caption_voice,
+        style_directive,
+        tone_directive,
+        voice_directive,
+    )
+
+    style_k = normalize_caption_style(caption_style)
+    tone_k = normalize_caption_tone(caption_tone)
+    voice_k = normalize_caption_voice(caption_voice)
+    sf = (style_directive(style_k).get("facets") or {})
+    tf = (tone_directive(tone_k).get("facets") or {})
+    vf = (voice_directive(voice_k).get("facets") or {})
+    must_use = build_must_use_shortlist(scene_graph)
+    if ctx is not None:
+        must_use = merge_m8_must_use_tokens(must_use, ctx, max_tokens=12)
+    anchors = [str(t).strip() for t in (must_use or []) if str(t).strip()][:4]
+    geo = scene_graph.get("geo") or {}
+    place = (
+        str(geo.get("gazetteer_place") or geo.get("city") or geo.get("road") or "").strip()
+    )
+    peak = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
+    mph = ""
+    try:
+        if peak is not None and float(peak) >= 5:
+            mph = f"{int(round(float(peak)))} MPH"
+    except (TypeError, ValueError):
+        pass
+    mus = scene_graph.get("music") or {}
+    music_bit = ""
+    if mus.get("artist") and mus.get("title"):
+        music_bit = f"{mus.get('artist')} — {mus.get('title')}"
+    elif mus.get("artist") or mus.get("title"):
+        music_bit = str(mus.get("artist") or mus.get("title"))
+
+    pov = str(vf.get("pov") or "").lower()
+    if "second" in pov or "you" in pov:
+        lead = "You're in it"
+    elif "first" in pov or "shotgun" in pov:
+        lead = "I'm riding shotgun"
+    else:
+        lead = "The road keeps the receipts"
+
+    intensity = int(tf.get("intensity") or 2)
+    bang = "!" if intensity >= 4 else ""
+    bits = [b for b in (mph, place, music_bit) if b]
+    mid = ", ".join(bits[:2]) if bits else (anchors[0] if anchors else "this stretch")
+    hook = str(sf.get("hook") or "scene").split("—")[0].strip()[:40]
+
+    caption = f"{lead} — {mid}{bang} {hook} energy, still grounded in what the clip shows."
+    if anchors:
+        missing = [a for a in anchors[:2] if a.lower() not in caption.lower()]
+        if missing:
+            caption = f"{caption} {missing[0]} stays in frame."
+    caption = strip_stray_hashtag_json_blob(caption.strip())[:520]
+    # Guard against formula stubs
+    if re.match(r"(?i)^\s*anchored\s+in\b", caption) or " · " in caption:
+        caption = f"{lead} through {place or mid}{bang}".strip()
+
+    title = ""
+    if mph and place:
+        title = f"{mph} through {place}"[:100]
+    elif place:
+        title = f"{lead} near {place}"[:100]
+    elif mph:
+        title = f"{mph} — {lead}"[:100]
+    else:
+        title = (caption.split(".")[0] or lead)[:100]
+
+    plats = [str(p).lower() for p in (platforms or scene_graph.get("platforms") or ["tiktok"])]
+    if not plats:
+        plats = ["tiktok"]
+    out_plat: Dict[str, Any] = {}
+    tags = [str(a).lstrip("#").replace(" ", "")[:24] for a in anchors[:6] if a]
+    for pl in plats:
+        w = {
+            "variant_index": "voice_fallback",
+            "title": None if pl == "tiktok" else title,
+            "caption": caption,
+            "hashtags": tags,
+            "score": 40.0,
+            "rationale": "voice_template_fallback",
+            "winner_source": "voice_fallback",
+        }
+        out_plat[pl] = {
+            "variants_ranked": [w],
+            "winner": w,
+            "runner_up": None,
+            "preflight": {},
+            "title_validation": {},
+            "winner_source": "voice_fallback",
+        }
+    return {
+        "m8_version": M8_ENGINE_VERSION,
+        "platforms": out_plat,
+        "must_use": must_use,
+        "selection_meta": {
+            "winner_source": "voice_fallback",
+            "llm_tier": "none",
+            "seed_style": style_k,
+            "seed_tone": tone_k,
+            "seed_voice": voice_k,
+        },
     }
 
 
@@ -3142,7 +3491,7 @@ async def run_m8_caption_engine(
         except Exception as e:
             logger.debug("M8 extra strategy context skipped: %s", e)
     # Main variants never share completion budget with the evidence matrix.
-    # Matrix stays off-by-default; when enabled, request it in a later expand tier only.
+    # Matrix defaults ON (user/env can disable); second call keeps budget isolated.
     prompt = _build_m8_prompt(
         ctx,
         scene,
@@ -3282,9 +3631,10 @@ async def run_m8_caption_engine(
     # Optional second call: evidence matrix only (own budget — never competes with variants).
     if parsed and include_mat and matrix_prompt:
         try:
+            mat_prompt_trimmed = _trim_m8_prompt_preserving_creative(matrix_prompt, 40_000)
             mat_parsed, mat_tokens, mat_err = await _call_openai_m8_json(
                 frames=list(frames[:2]),
-                prompt=matrix_prompt if len(matrix_prompt) <= 40_000 else matrix_prompt[:40_000],
+                prompt=mat_prompt_trimmed,
                 model=model,
                 max_completion_tokens=matrix_compl,
                 http_timeout_sec=120.0,
@@ -3313,6 +3663,60 @@ async def run_m8_caption_engine(
             "tokens": tokens,
             "llm_tier": used_tier,
         })
+        # Voice template fallback — never silent checklist stubs on quota/key miss.
+        if err in ("openai_quota", "no_api_key") and m8_voice_fallback_enabled():
+            try:
+                fb = build_voice_fallback_selection(
+                    scene,
+                    caption_style=str(caption_style or "story"),
+                    caption_tone=str(caption_tone or "authentic"),
+                    caption_voice=str(caption_voice or "default"),
+                    platforms=[str(p).lower() for p in (scene.get("platforms") or ctx.platforms or [])],
+                    ctx=ctx,
+                )
+                fb["scene_graph"] = scene
+                apply_selection_to_context(
+                    ctx,
+                    fb,
+                    generate_hashtags=generate_hashtags,
+                    hashtag_count=hashtag_count,
+                    blocked_tags=blocked_tags,
+                    always_tags=always_tags,
+                    base_tags=base_tags,
+                    category=category,
+                    strategy=strategy,
+                )
+                ctx.m8_engine_meta = {
+                    "version": M8_ENGINE_VERSION,
+                    "family_slug": M8_ENGINE_SLUG,
+                    "ai_slug": M8_ENGINE_AI_SLUG,
+                    "ai_display": M8_ENGINE_AI_DISPLAY,
+                    "mlai_slug": M8_ENGINE_AI_SLUG,
+                    "mlai_display": M8_ENGINE_AI_DISPLAY,
+                    "model": model,
+                    "tokens": tokens,
+                    "llm_tier": "none",
+                    "winner_source": "voice_fallback",
+                    "m8_degraded_reason": err,
+                    "selection_meta": fb.get("selection_meta") or {},
+                }
+                _trace_m8(ctx, str(ctx.upload_id), "voice_fallback", {
+                    "ok": True,
+                    "error_class": err,
+                    "winner_source": "voice_fallback",
+                })
+                return {
+                    "ok": True,
+                    "tokens": tokens,
+                    "error": None,
+                    "error_class": err,
+                    "llm_tier": "none",
+                    "winner_source": "voice_fallback",
+                    "degraded": True,
+                    "m8_degraded_reason": err,
+                }
+            except Exception as _fb_e:
+                logger.warning("M8 voice fallback failed: %s", _fb_e)
         return {
             "ok": False,
             "tokens": tokens,
@@ -3340,6 +3744,9 @@ async def run_m8_caption_engine(
     ranked["strategy_priors"] = (historical or {}).get("__strategy_priors__", {})
     if matrix_san:
         ranked["caption_evidence_matrix"] = matrix_san
+        ranked = merge_matrix_cells_into_ranked(
+            ranked, matrix_san, scene, historical, strategy=strategy, ctx=ctx
+        )
 
     try:
         from services.m8_grounding_pass import (
@@ -3383,6 +3790,12 @@ async def run_m8_caption_engine(
         "ml_strategy_priors": (historical or {}).get("__strategy_priors__", {}),
         "caption_evidence_matrix": bool(matrix_san),
         "caption_evidence_matrix_cells": len((matrix_san or {}).get("cells") or []) if matrix_san else 0,
+        "selection_meta": ranked.get("selection_meta") or {},
+        "winner_sources": {
+            str(pl): (block.get("winner_source") or ((block.get("winner") or {}).get("winner_source")))
+            for pl, block in ((ranked.get("platforms") or {}).items())
+            if isinstance(block, dict)
+        },
         "grounding_pass2": bool((ranked.get("grounding_pass2") or {}).get("enabled")),
         "grounding_pass2_report": ranked.get("grounding_pass2") or {},
         "evidence_catalog_size": len(ranked.get("evidence_catalog") or {}),

@@ -144,9 +144,15 @@ _SPEED_RE = re.compile(
     re.IGNORECASE,
 )
 
-# OCR often inserts junk between digits and the unit glyph (46°MPH, 46|MPH).
+# OCR junk between digits and unit (46|MPH, 46·MPH). Do **not** treat ``.`` as a
+# separator — that turns lon tails (``115.178398°MPH`` → ``398 MPH``) into speeds.
+# Degree (°) is handled separately so lon integers (``115°MPH``) are not rewritten.
 _SPEED_OCR_SEP_RE = re.compile(
-    r"(\d{1,3})\s*[\|°·•./:`'\"]+\s*(?=(?:MPH|KMH|KPH|KM/H|MI/H)\b)",
+    r"(?<![\d.])(\d{1,3})\s*[\|·•/:`'\"]+\s*(?=(?:MPH|KMH|KPH|KM/H|MI/H)\b)",
+    re.IGNORECASE,
+)
+_SPEED_OCR_DEG_SEP_RE = re.compile(
+    r"(?<![\d.])(\d{1,3})\s*[°º]\s*(?=(?:MPH|KMH|KPH|KM/H|MI/H)\b)",
     re.IGNORECASE,
 )
 
@@ -275,15 +281,35 @@ def _normalize_speed_unit_text(line: str) -> str:
     """Normalize OCR unit spellings so only unit-labeled speeds can match.
 
     Bare integers are intentionally left alone — without mph/kmh after them
-    they never become speeds.
+    they never become speeds. Lon/lat degree bleed (``115°MPH``, ``398°MPH``
+    from a decimal tail) is never rewritten into a bare ``NN MPH`` token.
     """
     if not line:
         return line
     s = line
     for pat, repl in _SPEED_UNIT_NORMALIZE:
         s = pat.sub(repl, s)
-    # 46°MPH / 46|MPH / 46.MPH → "46 MPH"
+    # 46|MPH / 46·MPH → "46 MPH" (never use '.' — lon fraction tails).
     s = _SPEED_OCR_SEP_RE.sub(r"\1 ", s)
+
+    from core.speed_units import coordinate_integer_parts
+
+    coord_ints = coordinate_integer_parts(s)
+
+    def _deg_sep(m: re.Match) -> str:
+        digits = m.group(1)
+        try:
+            n = int(digits)
+        except ValueError:
+            return m.group(0)
+        # Lon/lat integer + degree + hallucinated unit → leave intact so
+        # ``_SPEED_RE`` cannot match (degree still sits between digits and unit).
+        if n in coord_ints:
+            return m.group(0)
+        return f"{digits} "
+
+    # 46°MPH → "46 MPH" only when 46 is not a GPS integer on this line.
+    s = _SPEED_OCR_DEG_SEP_RE.sub(_deg_sep, s)
     return s
 
 
@@ -320,19 +346,24 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
     (exits, lon fragments, house numbers) never count as speed.
 
     Prefers the HUD speed token that follows a lat/lon pair (Escort/M8 order:
-    date → time → GPS → speed → driver). Rejects roadside speed-limit copy and
-    values outside a plausible dashcam range so OCR of signs / noise cannot
-    become the published peak.
+    date → time → GPS → speed → driver). Rejects roadside speed-limit copy,
+    lat/lon integer bleed (``-115MPH``, ``122°MPH``), and values outside a
+    plausible dashcam range so OCR of signs / GPS noise cannot become the
+    published peak.
     """
     if not line or _SPEED_LIMIT_CONTEXT_RE.search(line):
         return None, None
 
-    from core.speed_units import looks_like_coordinate_or_degree
+    from core.speed_units import (
+        looks_like_coordinate_or_degree,
+        speed_match_is_coordinate_bleed,
+    )
 
     # Pure coordinate / heading lines never yield a speed.
     if looks_like_coordinate_or_degree(line):
         return None, None
 
+    raw_line = line
     line = _normalize_speed_unit_text(line)
     matches = list(_SPEED_RE.finditer(line))
     if not matches:
@@ -345,6 +376,22 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
         # Never treat a match that sits inside the lat/lon span as speed
         # (e.g. mangled "115°" fragments near longitude).
         if gps_span is not None and gps_span[0] <= m.start() < gps_span[1]:
+            continue
+        digits = m.group(1)
+        if speed_match_is_coordinate_bleed(
+            line,
+            match_start=m.start(),
+            match_end=m.end(),
+            speed_digits=digits,
+        ):
+            continue
+        # Signed lon glued to unit on the raw strip (``-115MPH``, ``-122 MPH``).
+        if re.search(
+            rf"(?:^|[\s,;])[+\-\u2010-\u2015]{re.escape(digits)}\s*"
+            rf"(?:MPH|KMH|KPH|KM/H|MI/H)\b",
+            raw_line,
+            re.IGNORECASE,
+        ):
             continue
         mph, unit = _speed_match_to_mph(m)
         if mph is None or unit is None:

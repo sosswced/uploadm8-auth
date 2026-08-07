@@ -201,6 +201,12 @@ def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
         ("trillEnabled", "trill_enabled"), ("trillAiEnhance", "trill_ai_enhance"),
         ("trillOpenaiModel", "trill_openai_model"),
         ("trillSkipLowScore", "trill_skip_low_score"),
+        ("randomizeCaptionCreative", "randomize_caption_creative"),
+        ("captionCreativePickMode", "caption_creative_pick_mode"),
+        ("captionCreativeVaryStyle", "caption_creative_vary_style"),
+        ("captionCreativeVaryTone", "caption_creative_vary_tone"),
+        ("captionCreativeVaryVoice", "caption_creative_vary_voice"),
+        ("multiStyleCaptions", "multi_style_captions"),
     ]:
         v = up.get(camel) if up.get(camel) is not None else up.get(snake)
         if v is not None:
@@ -270,6 +276,12 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("caption_tone", "captionTone"),
         ("caption_voice", "captionVoice"),
         ("caption_frame_count", "captionFrameCount"),
+        ("randomize_caption_creative", "randomizeCaptionCreative"),
+        ("caption_creative_pick_mode", "captionCreativePickMode"),
+        ("caption_creative_vary_style", "captionCreativeVaryStyle"),
+        ("caption_creative_vary_tone", "captionCreativeVaryTone"),
+        ("caption_creative_vary_voice", "captionCreativeVaryVoice"),
+        ("multi_style_captions", "multiStyleCaptions"),
         ("speeding_mph", "speedingMph"),
         ("euphoria_mph", "euphoriaMph"),
     ]
@@ -640,6 +652,25 @@ async def get_user_preferences(
                 out["captionTone"] = up.get("captionTone") or up.get("caption_tone") or "authentic"
                 out["captionVoice"] = up.get("captionVoice") or up.get("caption_voice") or "default"
                 out["captionFrameCount"] = up.get("captionFrameCount") or up.get("caption_frame_count") or 6
+                _pick = up.get("captionCreativePickMode")
+                if _pick is None:
+                    _pick = up.get("caption_creative_pick_mode")
+                if _pick is not None:
+                    out["captionCreativePickMode"] = out["caption_creative_pick_mode"] = _pick
+                _rand = up.get("randomizeCaptionCreative")
+                if _rand is None:
+                    _rand = up.get("randomize_caption_creative")
+                if _rand is not None:
+                    out["randomizeCaptionCreative"] = out["randomize_caption_creative"] = bool(_rand)
+                for camel, snake in (
+                    ("captionCreativeVaryStyle", "caption_creative_vary_style"),
+                    ("captionCreativeVaryTone", "caption_creative_vary_tone"),
+                    ("captionCreativeVaryVoice", "caption_creative_vary_voice"),
+                    ("multiStyleCaptions", "multi_style_captions"),
+                ):
+                    vv = up.get(camel) if up.get(camel) is not None else up.get(snake)
+                    if vv is not None:
+                        out[camel] = out[snake] = bool(vv)
                 _overlay_upload_ai_audio_studio_prefs(out, up)
             else:
                 out.setdefault("captionStyle", "story")

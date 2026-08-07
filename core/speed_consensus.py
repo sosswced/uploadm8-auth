@@ -101,6 +101,8 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
 
     # Provider *families* — osd + osd_series are the same HUD pipeline and must
     # not inflate confidence to "high" without an independent corroborator.
+    # gps_implied is corroboration-only: it must never be the *peak source*, and
+    # alone with HUD it stays medium (haversine can track lon-integer OCR bleed).
     family_of = {
         "telemetry": "telemetry",
         "osd": "hud",
@@ -111,17 +113,27 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
     agreeing_families = sorted(
         {family_of[n] for n in agreeing if n in family_of}
     )
+    # Families that can elevate a non-telemetry peak to publishable high.
+    elevating_families = [f for f in agreeing_families if f != "gps"]
 
     if peak < 5:
         confidence = "none"
     elif source == "telemetry":
         confidence = "high"
-    elif len(agreeing_families) >= 2:
-        # Independent families agree (e.g. HUD + GPS, HUD + vision).
+    elif source == "gps_implied":
+        # Defensive: gps_implied is never selected by trusted_peak_speed_mph.
+        confidence = "low"
+    elif len(elevating_families) >= 2:
+        # Independent elevating families agree (e.g. HUD + vision, telemetry already high).
+        confidence = "high"
+    elif (
+        "hud" in agreeing_families
+        and "vision" in agreeing_families
+    ):
         confidence = "high"
     elif source.startswith("osd") or source == "osd+series_cap":
-        # Single-family HUD. Aggregate may be a poisoned outlier while series
-        # (or series-capped peak) is still a fair medium candidate for prompts.
+        # Single-family HUD (even if gps_implied agrees). Medium for prompts;
+        # not publishable into titles until telemetry/vision corroborates.
         confidence = "medium"
     elif not outliers and source in ("vision_ocr", "osd_series"):
         confidence = "medium"

@@ -184,6 +184,16 @@ class UploadInit(BaseModel):
         alias="captionCreativeVaryVoice",
         description="When randomizing, vary voice (False = lock to caption_voice)",
     )
+    caption_creative_override: Optional[bool] = Field(
+        default=None,
+        alias="captionCreativeOverride",
+        description="When true, client explicitly overrides account pick_mode (incl. off)",
+    )
+    multi_style_captions: Optional[bool] = Field(
+        default=None,
+        alias="multiStyleCaptions",
+        description="Evidence-matrix Style/Tone/Voice neighbor sweep (default ON when unset)",
+    )
     caption_style: Optional[str] = Field(default=None, alias="captionStyle")
     caption_tone: Optional[str] = Field(default=None, alias="captionTone")
     caption_voice: Optional[str] = Field(default=None, alias="captionVoice")

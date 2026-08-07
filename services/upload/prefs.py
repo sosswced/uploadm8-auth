@@ -169,12 +169,23 @@ def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) ->
     rand_raw = getattr(data, "randomize_caption_creative", None)
     if rand_raw is None:
         rand_raw = getattr(data, "randomizeCaptionCreative", None)
+    override = getattr(data, "caption_creative_override", None)
+    if override is None:
+        override = getattr(data, "captionCreativeOverride", None)
+    explicit_override = bool(override) is True
 
     if mode_raw is not None and str(mode_raw).strip() != "":
         mode = normalize_caption_creative_pick_mode(mode_raw)
-    elif rand_raw is not None:
-        mode = normalize_caption_creative_pick_mode(rand_raw)
+    elif rand_raw is True or (
+        isinstance(rand_raw, str) and str(rand_raw).strip().lower() in ("1", "true", "yes", "on")
+    ):
+        mode = "random"
     else:
+        mode = None
+
+    # Never clobber account cycle/random with bare 'off' / false from an
+    # unchecked upload checkbox. Only apply off when the client opts in.
+    if mode == "off" and not explicit_override:
         mode = None
 
     if mode is not None:
@@ -183,6 +194,13 @@ def merge_upload_init_caption_creative(user_prefs: Dict[str, Any], data: Any) ->
         on = mode != "off"
         user_prefs["randomize_caption_creative"] = on
         user_prefs["randomizeCaptionCreative"] = on
+
+    multi_raw = getattr(data, "multi_style_captions", None)
+    if multi_raw is None:
+        multi_raw = getattr(data, "multiStyleCaptions", None)
+    if multi_raw is not None:
+        user_prefs["multi_style_captions"] = bool(multi_raw)
+        user_prefs["multiStyleCaptions"] = bool(multi_raw)
 
     def _merge_vary(attr_snake: str, attr_camel: str, out_snake: str, out_camel: str) -> None:
         raw = getattr(data, attr_snake, None)

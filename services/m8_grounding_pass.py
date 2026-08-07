@@ -176,17 +176,25 @@ def _sentence_split(text: str) -> List[str]:
 
 
 _FORMULA_STUB_RE = re.compile(
-    r"(?is)^\s*(?:anchored\s+in\s+)?\d{1,3}\s*mph\s*[,·—\-]\s*.{0,80}\s*$"
+    # Checklist only: "88 MPH, Road" / "88 MPH · Place" — NOT "88 MPH — prose voice…"
+    r"(?is)^\s*(?:anchored\s+in\s+)?\d{1,3}\s*mph\s*[,·]\s*.{0,80}\s*$"
 )
 
 
 def is_formula_stub_caption(text: str) -> bool:
-    """True for checklist stubs like 'Anchored in 88 MPH, Garlock Road' (no persona voice)."""
+    """True for checklist stubs like 'Anchored in 88 MPH, Garlock Road' (no persona voice).
+
+    Soft-inject titles ``154 MPH — <creative prose>`` are NOT stubs.
+    """
     t = (text or "").strip()
     if not t or len(t) > 120:
         return False
     if re.match(r"(?i)^\s*anchored\s+in\b", t):
         return True
+    # Em-dash / long hyphen voice inject: keep as prose when remainder is long.
+    m = re.match(r"(?is)^\s*\d{1,3}\s*mph\s*[—\-]\s*(.+)$", t)
+    if m and len(m.group(1).strip()) >= 20 and " · " not in t:
+        return False
     return bool(_FORMULA_STUB_RE.match(t))
 
 
@@ -331,6 +339,23 @@ def apply_grounding_pass2_to_ranked(
                     voice_repaired = True
                     report["must_use_injected"] = int(report.get("must_use_injected") or 0) + 1
                     break
+
+        # Never publish Anchored-in / · checklist as the whole caption.
+        if is_formula_stub_caption(new_cap):
+            toks = [str(t).strip() for t in (must_use or []) if str(t).strip()][:3]
+            if toks:
+                if len(toks) == 1:
+                    woven = f"Out here with {toks[0]} still in frame — what the clip actually shows."
+                elif len(toks) == 2:
+                    woven = f"Out here with {toks[0]} and {toks[1]} — what the clip actually shows."
+                else:
+                    woven = (
+                        f"Out here with {toks[0]}, {toks[1]}, and {toks[2]} "
+                        "— what the clip actually shows."
+                    )
+                new_cap = woven[:520]
+                voice_repaired = True
+                report["stub_replaced"] = int(report.get("stub_replaced") or 0) + 1
 
         selected = dict(selected)
         selected["caption"] = new_cap

@@ -1346,6 +1346,9 @@ def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
     if " · " in t and re.search(r"\b\d{2,3}\s*mph\b", t, re.I):
         # Already the compact formula — not salvage voice.
         return False
+    # Wrong MPH claims need scrub + rebuild, not soft-prepend.
+    if re.search(r"\b\d{2,3}\s*mph\b", t, re.I) and not _title_mentions_trusted_speed(t, pool):
+        return False
     place = _format_place(pool)
     if place and t.lower() == place.lower():
         return False
@@ -1394,6 +1397,8 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     Place-only titles are always thin when richer beats exist — including titles
     longer than 36 chars that are still just geo prose without MPH/music.
     Creative titles that already cite trusted peak speed and place/music are kept.
+    Place/music creative voice missing MPH is *not* thin — soft-inject MPH instead
+    of wiping to a · checklist formula.
     """
     t = scrub_machine_publish_dump(title or "").strip()
     if not t:
@@ -1423,8 +1428,21 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     place = _format_place(pool)
     if place and blob == place.lower():
         return True
-    # Any title that skips trusted peak speed is thin — even long creative copy.
+    # Soft MPH gate: salvageable place/music prose survives; inject MPH later.
+    # Wrong MPH claims stay thin so scrub/rebuild can run.
     if has_speed and not mentions_speed:
+        if re.search(r"\b\d{2,3}\s*mph\b", t, re.I):
+            return True
+        if _title_is_salvageable_voice(t, pool):
+            return False
+        if (
+            _title_mentions_place_or_music(t, pool)
+            and len(t) >= 20
+            and " · " not in t
+            and not _is_generic_caption(t)
+            and not _is_machine_label_dump(t)
+        ):
+            return False
         return True
     if has_music and not mentions_music and not mentions_speed and len(t) < 40:
         return True
@@ -2291,6 +2309,26 @@ def enforce_hydration(
         working = scrubbed
         if not title_anchor:
             return working if working != raw.strip() else None
+        # Soft-inject peak MPH into place/music voice before thin/wipe decisions.
+        salvage_base = working
+        if not _title_mentions_place_or_music(salvage_base, pool) and pre_scrub:
+            salvage_base = pre_scrub
+        if (
+            not _title_mentions_trusted_speed(working, pool)
+            and (
+                _title_is_salvageable_voice(working, pool)
+                or _title_is_salvageable_voice(salvage_base, pool)
+                or (
+                    _title_mentions_place_or_music(salvage_base, pool)
+                    and len(salvage_base) >= 20
+                    and " · " not in salvage_base
+                    and not _is_generic_caption(salvage_base)
+                )
+            )
+        ):
+            new = _inject_peak_mph_into_title(salvage_base, pool)
+            if new and new != raw.strip():
+                return new
         # Wrong-MPH scrub removed the number but left creative place/music prose
         # → inject trusted peak instead of · formula wipe.
         if (

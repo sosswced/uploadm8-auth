@@ -850,17 +850,17 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     input_video = ctx.local_video_path
     watermark_vf: Optional[str] = None
     single_pass_wm = bool(getattr(ctx, "watermark_single_pass", False))
-    if (
-        single_pass_wm
-        and ctx.entitlements
-        and ctx.entitlements.can_watermark
-    ):
+    if single_pass_wm:
         try:
-            from stages.watermark_stage import build_watermark_vf_for_transcode
+            from stages.watermark_stage import (
+                build_watermark_vf_for_transcode,
+                should_apply_watermark,
+            )
 
-            watermark_vf = await build_watermark_vf_for_transcode(ctx, input_video)
-            if watermark_vf:
-                logger.info("[%s] WATERMARK_SINGLE_PASS: burn-in during transcode", ctx.upload_id)
+            if should_apply_watermark(ctx):
+                watermark_vf = await build_watermark_vf_for_transcode(ctx, input_video)
+                if watermark_vf:
+                    logger.info("[%s] WATERMARK_SINGLE_PASS: burn-in during transcode", ctx.upload_id)
         except Exception as e:
             logger.warning("[%s] single-pass watermark filter skipped: %s", ctx.upload_id, e)
     elif ctx.processed_video_path and ctx.processed_video_path.exists():

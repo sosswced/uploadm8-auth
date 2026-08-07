@@ -813,6 +813,53 @@ async def _coach_fetch_upload_bundle(conn: Any, uid: uuid.UUID):
         return None
 
 
+async def _coach_effective_engagement_snapshot(conn: Any, uid: uuid.UUID) -> Dict[str, Any]:
+    """
+    30d engagement snapshot using columns ⋃ TikTok/YouTube/Meta platform_results.
+
+    Keeps coach heuristics aligned with Analytics when upload columns are stale.
+    """
+    from services.upload_engagement import effective_upload_metrics, engagement_rate_pct
+
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT views, likes, comments, shares, platform_results
+              FROM uploads
+             WHERE user_id = $1::uuid
+               AND status IN ('completed', 'succeeded')
+               AND created_at >= NOW() - INTERVAL '30 days'
+            """,
+            uid,
+        )
+    except Exception as e:
+        logger.warning("coach effective engagement snapshot failed user_id=%s: %s", uid, e)
+        return {"samples_30d": 0}
+    if not rows:
+        return {"samples_30d": 0}
+    n = len(rows)
+    views = likes = comments = shares = 0.0
+    ers: List[float] = []
+    for r in rows:
+        m = effective_upload_metrics(r, shortform_only=True)
+        views += float(m["views"])
+        likes += float(m["likes"])
+        comments += float(m["comments"])
+        shares += float(m["shares"])
+        if int(m["views"] or 0) > 0:
+            ers.append(
+                engagement_rate_pct(m["views"], m["likes"], m["comments"], m["shares"])
+            )
+    return {
+        "samples_30d": n,
+        "avg_views": round(views / n, 2),
+        "avg_likes": round(likes / n, 2),
+        "avg_comments": round(comments / n, 2),
+        "avg_shares": round(shares / n, 2),
+        "engagement_rate_pct": round((sum(ers) / len(ers)) if ers else 0.0, 3),
+    }
+
+
 async def _coach_parallel_prefs(conn: Any, uid: uuid.UUID):
     try:
         return await conn.fetchrow(
@@ -935,8 +982,11 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
     async def _gr(c):
         return await _coach_avg_grounding(c, uid)
 
+    async def _eng(c):
+        return await _coach_effective_engagement_snapshot(c, uid)
+
     try:
-        baselines, upload_row, prefs, wallet, studio_n, content_attribution_insights, avg_grounding = await asyncio.gather(
+        baselines, upload_row, prefs, wallet, studio_n, content_attribution_insights, avg_grounding, eng_snap = await asyncio.gather(
             _acquire_run(_bl),
             _acquire_run(_ub),
             _acquire_run(_pr),
@@ -944,6 +994,7 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
             _acquire_run(_st),
             _acquire_run(_ins),
             _acquire_run(_gr),
+            _acquire_run(_eng),
         )
     except Exception:
         logger.exception("coach parallel gather failed user_id=%s", user_id)
@@ -956,7 +1007,7 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
                 "suggestions": [],
                 "smart_offer": None,
                 "baselines": baselines,
-                "engagement_snapshot": {"samples_30d": 0},
+                "engagement_snapshot": eng_snap if isinstance(eng_snap, dict) else {"samples_30d": 0},
                 "m8_engine": m8_engine_identity_payload(),
                 "content_attribution_insights": content_attribution_insights,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -964,12 +1015,13 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
             }
         )
 
-    eng_snap = _engagement_snapshot_from_coach_upload_row(urow)
+    if not isinstance(eng_snap, dict) or not eng_snap.get("samples_30d"):
+        eng_snap = _engagement_snapshot_from_coach_upload_row(urow)
 
     suggestions: List[Dict[str, Any]] = []
     tier = str(urow["tier"] or "free") if urow else "free"
     ok_u = int(urow["ok_uploads"] or 0) if urow else 0
-    my_v = float(urow["my_avg_views"] or 0) if urow else 0.0
+    my_v = float(eng_snap.get("avg_views") or urow["my_avg_views"] or 0) if urow else 0.0
     g_v = float(baselines.get("global_avg_views") or 0)
     max_plat = int(urow["max_plat_spread"] or 0) if urow else 0
     g_er = float(baselines.get("global_avg_engagement_rate_pct") or 0)

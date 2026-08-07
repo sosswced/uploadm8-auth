@@ -216,19 +216,24 @@ async def logout_other_sessions(request: Request, user: dict = Depends(get_curre
             pass
         rt = (body.get("refresh_token") or body.get("refreshToken") or "").strip()
     if not rt:
+        rt = (request.headers.get("X-Refresh-Token") or "").strip()
+    if not rt:
         raise HTTPException(
             400,
             "No refresh token available (cookie or JSON). Sign out and sign in again, or use full Log out.",
         )
     h = _sha256_hex(rt)
+    now = datetime.now(timezone.utc)
     async with core.state.db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT id FROM refresh_tokens
             WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL
+              AND expires_at > $3
             """,
             h,
             user["id"],
+            now,
         )
         if not row:
             raise HTTPException(
@@ -238,13 +243,79 @@ async def logout_other_sessions(request: Request, user: dict = Depends(get_curre
         revoked_rows = await conn.fetch(
             """
             UPDATE refresh_tokens SET revoked_at = NOW()
-            WHERE user_id = $1 AND revoked_at IS NULL AND id <> $2
+            WHERE user_id = $1 AND revoked_at IS NULL AND id <> $2 AND expires_at > $3
             RETURNING id
             """,
             user["id"],
             row["id"],
+            now,
         )
-    return {"status": "other_sessions_revoked", "sessions_revoked": len(revoked_rows)}
+    return {
+        "status": "other_sessions_revoked",
+        "sessions_revoked": len(revoked_rows),
+        "sessions_remaining": 1,
+    }
+
+
+@router.get("/sessions")
+async def list_active_sessions(request: Request, user: dict = Depends(get_current_user)):
+    """
+    List non-revoked, non-expired refresh sessions for Settings → Active Sessions.
+    Marks the session matching this request's refresh cookie/body as current.
+    """
+    rt = (refresh_token_from_cookie(request.cookies) or "").strip()
+    if not rt:
+        # GET has no body; optional header for bearer/dev clients
+        rt = (request.headers.get("X-Refresh-Token") or "").strip()
+    current_hash = _sha256_hex(rt) if rt else None
+    now = datetime.now(timezone.utc)
+    async with core.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, created_at, expires_at
+            FROM refresh_tokens
+            WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > $2
+            ORDER BY created_at DESC
+            """,
+            user["id"],
+            now,
+        )
+        current_id = None
+        if current_hash:
+            current_id = await conn.fetchval(
+                """
+                SELECT id FROM refresh_tokens
+                WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > $3
+                """,
+                current_hash,
+                user["id"],
+                now,
+            )
+
+    sessions = []
+    for r in rows:
+        created = r["created_at"]
+        is_current = current_id is not None and r["id"] == current_id
+        sessions.append(
+            {
+                "id": str(r["id"]),
+                "created_at": created.isoformat() if created else None,
+                "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+                "is_current": bool(is_current),
+                "label": "This device" if is_current else "Other device / browser",
+            }
+        )
+    # If we could not match the current refresh token but sessions exist, mark newest as current
+    # only when there is exactly one session (avoids lying about multi-device).
+    if sessions and not any(s["is_current"] for s in sessions) and len(sessions) == 1:
+        sessions[0]["is_current"] = True
+        sessions[0]["label"] = "This device"
+
+    return {
+        "sessions": sessions,
+        "active_count": len(sessions),
+        "other_count": sum(1 for s in sessions if not s["is_current"]),
+    }
 
 
 @router.post("/forgot-password")
@@ -444,7 +515,7 @@ async def confirm_email(
 
 @router.get("/verify-email")
 async def verify_email_change(token: str = Query(..., min_length=8)):
-    """Complete admin-initiated email change using plaintext token in email_changes."""
+    """Complete email change (admin or self-serve) using plaintext token in email_changes."""
     async with core.state.db_pool.acquire() as conn:
         ec = await conn.fetchrow(
             """
@@ -458,12 +529,25 @@ async def verify_email_change(token: str = Query(..., min_length=8)):
         )
         if not ec:
             raise HTTPException(status_code=404, detail="Invalid or expired verification link")
+        new_email = str(ec["new_email"] or "").lower().strip()
+        taken = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
+            new_email,
+            ec["user_id"],
+        )
+        if taken:
+            raise HTTPException(status_code=409, detail="Email already in use")
         await conn.execute(
-            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
+            """
+            UPDATE users
+            SET email = $1, email_verified = true, updated_at = NOW()
+            WHERE id = $2
+            """,
+            new_email,
             ec["user_id"],
         )
         await conn.execute("UPDATE email_changes SET verification_token = NULL WHERE id = $1", ec["id"])
-        email = ec["new_email"]
+        email = new_email
     return {"email": email, "new_email": email}
 
 

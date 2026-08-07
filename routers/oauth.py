@@ -580,7 +580,9 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 if existing:
                     await conn.execute("""
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
-                        account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW() WHERE id = $5
+                        account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW(),
+                        oauth_health = 'ok'
+                        WHERE id = $5
                     """, token_blob, account_name, account_username, account_avatar, existing["id"])
                     connect_action = "PLATFORM_RECONNECTED"
                 else:
@@ -602,7 +604,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                                 account_avatar = $4,
                                 account_id = $5,
                                 updated_at = NOW(),
-                                last_oauth_reconnect_at = NOW()
+                                last_oauth_reconnect_at = NOW(),
+                                oauth_health = 'ok'
                             WHERE id = $6
                               AND user_id = $7
                               AND platform = $8

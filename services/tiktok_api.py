@@ -56,7 +56,11 @@ TIKTOK_BRANDED_CONTENT_POLICY_URL = "https://www.tiktok.com/legal/page/global/bc
 
 
 def tiktok_app_audited() -> bool:
-    """True after TikTok Content Posting API audit passes. Set ``TIKTOK_APP_AUDITED=1``."""
+    """True after TikTok Content Posting API audit passes. Set ``TIKTOK_APP_AUDITED=1``.
+
+    Reads the live environment (not a frozen import-time snapshot) so API/worker
+    restarts pick up portal approval without code changes.
+    """
     v = (os.environ.get("TIKTOK_APP_AUDITED") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
@@ -73,6 +77,19 @@ def tiktok_force_private_unaudited() -> bool:
     v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
+
+def tiktok_direct_post_status() -> dict:
+    """Machine-readable Direct Post capability for API/UI."""
+    audited = tiktok_app_audited()
+    force_private = tiktok_force_private_unaudited()
+    return {
+        "api": "content_posting_direct_post",
+        "source": "FILE_UPLOAD",
+        "app_audited": audited,
+        "unaudited_mode": not audited,
+        "privacy_clamped_to_self_only": force_private,
+        "public_publish_enabled": not force_private,
+    }
 
 def tiktok_video_list_url() -> str:
     return (

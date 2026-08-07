@@ -57,7 +57,7 @@ EXISTING WIRING (confirmed active):
 - send_password_changed_email    → /api/auth/reset-password            ✓
 - send_password_changed_email    → /api/auth/change-password            ✓
 - send_account_deleted_email     → DELETE /api/me                      ✓
-- send_email_change_email        → PUT /api/admin/users/{id}/email       ✓
+- send_email_change_email        → PUT /api/admin/users/{id}/email + PUT /api/settings/email       ✓
 - send_admin_reset_password_email→ POST /api/admin/users/{id}/reset-password ✓
 - send_subscription_started_email→ checkout.session.completed          ✓
 - send_trial_started_email       → checkout.session.completed (trial)  ✓

@@ -754,9 +754,14 @@ def _tiktok_status_lines(ctx: JobContext, result: PlatformResult) -> List[str]:
     canon = (payload.get("upload_privacy") or _canonical_privacy(ctx) or "public").strip().lower()
 
     if not result.platform_url and not result.platform_video_id:
-        lines.append(
-            "TikTok is still processing this upload. If it is not on your profile yet, open the TikTok app and check **Inbox** or **Drafts**."
-        )
+        if level == "SELF_ONLY":
+            lines.append(
+                "TikTok is still processing this upload. If it is not on your profile yet, open the TikTok app and check **Inbox** or **Drafts**."
+            )
+        else:
+            lines.append(
+                "TikTok is still processing this upload. It should appear on your profile shortly at the visibility you selected."
+            )
 
     if level == "SELF_ONLY":
         if canon == "unlisted":

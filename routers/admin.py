@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 import bcrypt
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 import core.state
@@ -1145,7 +1145,7 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
         )
 
     # Send verification email to the new address (name = target user, not admin)
-    _verify_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+    _verify_link = f"{FRONTEND_URL.rstrip('/')}/verify-email.html?token={verification_token}"
     _target_name = old.get("name") or "there"
     background_tasks.add_task(
         send_email_change_email,
@@ -2654,7 +2654,18 @@ async def admin_put_billing_catalog(
 
 @router.get("/settings")
 async def get_admin_settings(user: dict = Depends(require_master_admin)):
-    return admin_settings_cache
+    out = dict(admin_settings_cache)
+    key = str(out.get("watermark_logo_r2_key") or "").strip()
+    if key:
+        try:
+            from core.r2 import generate_presigned_download_url
+
+            out["watermark_logo_url"] = generate_presigned_download_url(key, ttl=3600) or ""
+        except Exception:
+            out["watermark_logo_url"] = ""
+    else:
+        out["watermark_logo_url"] = ""
+    return out
 
 
 @router.put("/settings")
@@ -2664,16 +2675,31 @@ async def update_admin_settings(settings: dict, user: dict = Depends(require_mas
         "watermark_size_scale",
         "watermark_opacity",
         "watermark_position",
+        "watermark_text_position",
         "watermark_text_color",
         "watermark_font_weight",
+        "watermark_font_family",
+        "watermark_mode",
+        "watermark_logo_r2_key",
+        "watermark_logo_position",
+        "watermark_logo_size_scale",
+        "watermark_logo_opacity",
+        "watermark_sponsored_prefix",
+        "watermark_sponsored_prefix_text",
     }
     if wm_keys.intersection(settings):
         from stages.db import (
+            normalize_watermark_settings,
             sanitize_watermark_burn_text,
+            sanitize_watermark_font_family,
             sanitize_watermark_font_weight,
+            sanitize_watermark_logo_r2_key,
+            sanitize_watermark_mode,
             sanitize_watermark_opacity,
             sanitize_watermark_position,
             sanitize_watermark_size_scale,
+            sanitize_watermark_sponsored_prefix,
+            sanitize_watermark_sponsored_prefix_text,
             sanitize_watermark_text_color,
         )
 
@@ -2694,6 +2720,12 @@ async def update_admin_settings(settings: dict, user: dict = Depends(require_mas
             settings["watermark_position"] = sanitize_watermark_position(
                 settings.get("watermark_position")
             )
+        if "watermark_text_position" in settings:
+            settings["watermark_text_position"] = sanitize_watermark_position(
+                settings.get("watermark_text_position")
+            )
+            # Keep legacy key in sync for older workers / UI.
+            settings["watermark_position"] = settings["watermark_text_position"]
         if "watermark_text_color" in settings:
             settings["watermark_text_color"] = sanitize_watermark_text_color(
                 settings.get("watermark_text_color")
@@ -2702,10 +2734,123 @@ async def update_admin_settings(settings: dict, user: dict = Depends(require_mas
             settings["watermark_font_weight"] = sanitize_watermark_font_weight(
                 settings.get("watermark_font_weight")
             )
+        if "watermark_font_family" in settings:
+            settings["watermark_font_family"] = sanitize_watermark_font_family(
+                settings.get("watermark_font_family")
+            )
+        if "watermark_mode" in settings:
+            settings["watermark_mode"] = sanitize_watermark_mode(settings.get("watermark_mode"))
+        if "watermark_logo_r2_key" in settings:
+            settings["watermark_logo_r2_key"] = sanitize_watermark_logo_r2_key(
+                settings.get("watermark_logo_r2_key")
+            )
+        if "watermark_logo_position" in settings:
+            settings["watermark_logo_position"] = sanitize_watermark_position(
+                settings.get("watermark_logo_position")
+            )
+        if "watermark_logo_size_scale" in settings:
+            settings["watermark_logo_size_scale"] = sanitize_watermark_size_scale(
+                settings.get("watermark_logo_size_scale")
+            )
+        if "watermark_logo_opacity" in settings:
+            settings["watermark_logo_opacity"] = sanitize_watermark_opacity(
+                settings.get("watermark_logo_opacity")
+            )
+        if "watermark_sponsored_prefix" in settings:
+            settings["watermark_sponsored_prefix"] = sanitize_watermark_sponsored_prefix(
+                settings.get("watermark_sponsored_prefix")
+            )
+        if "watermark_sponsored_prefix_text" in settings:
+            settings["watermark_sponsored_prefix_text"] = sanitize_watermark_sponsored_prefix_text(
+                settings.get("watermark_sponsored_prefix_text")
+            )
+        # Normalize mode against logo presence after sanitization.
+        merged = normalize_watermark_settings({**core.state.admin_settings_cache, **settings})
+        settings["watermark_mode"] = merged["mode"]
+        if merged.get("logo_r2_key") is not None and "watermark_logo_r2_key" in settings:
+            settings["watermark_logo_r2_key"] = merged["logo_r2_key"]
     core.state.admin_settings_cache.update(settings)
     async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(core.state.admin_settings_cache))
     return {"status": "updated", "settings": core.state.admin_settings_cache}
+
+
+@router.post("/watermark-logo")
+async def upload_admin_watermark_logo(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_master_admin),
+):
+    """Upload a PNG/JPEG/WebP logo for free-tier / sponsorship video watermarks."""
+    from core.config import R2_BUCKET_NAME
+    from core.r2 import get_s3_client, generate_presigned_download_url
+    from stages.db import sanitize_watermark_logo_r2_key
+
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    ctype = (file.content_type or "").split(";")[0].strip().lower()
+    if ctype not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type. Use JPEG, PNG, WebP, or GIF.")
+    content = await file.read()
+    if len(content) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Logo must be 2MB or smaller.")
+    ext = "png"
+    if file.filename and "." in file.filename:
+        cand = file.filename.rsplit(".", 1)[-1].lower()
+        if cand in ("png", "jpg", "jpeg", "webp", "gif"):
+            ext = "jpg" if cand == "jpeg" else cand
+    elif "jpeg" in ctype or ctype == "image/jpg":
+        ext = "jpg"
+    elif "webp" in ctype:
+        ext = "webp"
+    elif "gif" in ctype:
+        ext = "gif"
+
+    if not R2_BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="Missing R2_BUCKET_NAME")
+    r2_key = f"watermarks/admin/logo.{ext}"
+    r2_key = sanitize_watermark_logo_r2_key(r2_key) or r2_key
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=r2_key,
+        Body=content,
+        ContentType=ctype or f"image/{ext}",
+    )
+    core.state.admin_settings_cache["watermark_logo_r2_key"] = r2_key
+    # Prefer both when a logo is present and mode was text-only.
+    mode = str(core.state.admin_settings_cache.get("watermark_mode") or "text").lower()
+    if mode == "text":
+        core.state.admin_settings_cache["watermark_mode"] = "both"
+    async with core.state.db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(core.state.admin_settings_cache),
+        )
+    logo_url = ""
+    try:
+        logo_url = generate_presigned_download_url(r2_key, ttl=3600) or ""
+    except Exception:
+        logo_url = ""
+    return {
+        "success": True,
+        "r2_key": r2_key,
+        "logo_url": logo_url,
+        "watermark_mode": core.state.admin_settings_cache.get("watermark_mode"),
+        "settings": core.state.admin_settings_cache,
+    }
+
+
+@router.delete("/watermark-logo")
+async def clear_admin_watermark_logo(user: dict = Depends(require_master_admin)):
+    """Clear the admin watermark logo key (does not delete the R2 object)."""
+    core.state.admin_settings_cache["watermark_logo_r2_key"] = ""
+    if str(core.state.admin_settings_cache.get("watermark_mode") or "").lower() in ("logo", "both"):
+        core.state.admin_settings_cache["watermark_mode"] = "text"
+    async with core.state.db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(core.state.admin_settings_cache),
+        )
+    return {"success": True, "settings": core.state.admin_settings_cache}
 
 
 @router.get("/calculator/pricing")

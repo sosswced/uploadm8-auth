@@ -23,7 +23,7 @@ ACCOUNT_DELETION_COUNT_TABLES: frozenset[str] = frozenset(
 # UPDATE users SET fragments like "name = $2" — left-hand column must be allowlisted.
 USERS_UPDATE_COLUMNS_ME: frozenset[str] = frozenset({"name", "timezone"})
 USERS_UPDATE_COLUMNS_PROFILE: frozenset[str] = frozenset(
-    {"first_name", "last_name", "avatar_r2_key", "name"}
+    {"first_name", "last_name", "avatar_r2_key", "name", "timezone"}
 )
 USERS_UPDATE_COLUMNS_ADMIN: frozenset[str] = frozenset(
     {"subscription_tier", "role", "status", "flex_enabled"}

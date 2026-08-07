@@ -1,10 +1,47 @@
-"""Upload-row engagement from ``platform_results`` + column fallbacks (user KPI, dashboard, digest)."""
+"""Upload-row engagement from ``platform_results`` + column fallbacks (user KPI, dashboard, digest).
+
+Also powers coach / ML quality scoring so TikTok, YouTube, and Meta (Instagram/Facebook)
+engagement on ``platform_results`` feeds “What’s working for you” tips — not only stale
+``uploads.views/likes/comments/shares`` columns.
+"""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from core.json_utils import safe_json
 from services.upload_metrics import SUCCESSFUL_STATUS_SQL_IN
+
+# Platforms whose engagement must flow into coach / quality / packaging tips.
+COACH_ENGAGEMENT_PLATFORMS = frozenset({"tiktok", "youtube", "instagram", "facebook"})
+
+
+def engagement_rate_pct(views: int, likes: int, comments: int, shares: int) -> float:
+    v = max(0, int(views or 0))
+    if v <= 0:
+        return 0.0
+    interactions = max(0, int(likes or 0)) + max(0, int(comments or 0)) + max(0, int(shares or 0))
+    return (interactions / float(v)) * 100.0
+
+
+def _column_metrics(row: Any) -> Dict[str, int]:
+    if row is None:
+        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+    get = row.get if hasattr(row, "get") else lambda k, d=None: getattr(row, k, d)
+    return {
+        "views": max(0, int(get("views") or 0)),
+        "likes": max(0, int(get("likes") or 0)),
+        "comments": max(0, int(get("comments") or 0)),
+        "shares": max(0, int(get("shares") or 0)),
+    }
+
+
+def _max_metrics(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
+    return {
+        "views": max(int(a.get("views") or 0), int(b.get("views") or 0)),
+        "likes": max(int(a.get("likes") or 0), int(b.get("likes") or 0)),
+        "comments": max(int(a.get("comments") or 0), int(b.get("comments") or 0)),
+        "shares": max(int(a.get("shares") or 0), int(b.get("shares") or 0)),
+    }
 
 
 def rollup_engagement_from_platform_results(
@@ -12,40 +49,145 @@ def rollup_engagement_from_platform_results(
     *,
     shortform_only: bool = False,
     successful_only: bool = True,
+    platforms: Optional[frozenset] = None,
 ) -> dict[str, int]:
     """Sum per-platform metrics stored on platform_results when uploads.views/likes are stale."""
+    from services.content_success_features import entry_metrics, entry_successful
+
     tv = tl = tc = ts = 0
     if not entries:
         return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
 
-    def _pick_int(d: dict, *keys: str) -> int:
-        for k in keys:
-            if k in d and d[k] is not None:
-                try:
-                    return int(d[k] or 0)
-                except (TypeError, ValueError):
-                    return 0
-        return 0
-
-    shortform_platforms = {"tiktok", "youtube", "instagram", "facebook"}
-    successful_statuses = {"published", "succeeded", "success", "completed", "partial"}
+    allow = platforms or (COACH_ENGAGEMENT_PLATFORMS if shortform_only else None)
 
     for e in entries:
         if not isinstance(e, dict):
             continue
         plat = str(e.get("platform") or "").strip().lower()
-        if shortform_only and plat and plat not in shortform_platforms:
+        if allow is not None and plat and plat not in allow:
             continue
-        if successful_only:
-            ok = bool(e.get("success") is True)
-            st = str(e.get("status") or "").strip().lower()
-            if (not ok) and (st not in successful_statuses):
-                continue
-        tv += _pick_int(e, "views", "view_count", "play_count", "playCount", "video_views")
-        tl += _pick_int(e, "likes", "like_count", "likeCount")
-        tc += _pick_int(e, "comments", "comment_count", "commentCount")
-        ts += _pick_int(e, "shares", "share_count", "shareCount")
+        if successful_only and not entry_successful(e):
+            continue
+        m = entry_metrics(e, plat or "unknown")
+        tv += int(m["views"])
+        tl += int(m["likes"])
+        tc += int(m["comments"])
+        ts += int(m["shares"])
     return {"views": tv, "likes": tl, "comments": tc, "shares": ts}
+
+
+def effective_upload_metrics(row: Any, *, shortform_only: bool = True) -> Dict[str, int]:
+    """
+    Element-wise max of upload columns and successful platform_results rollup.
+
+    Prefer PR metrics (TikTok / YouTube / Instagram / Facebook, including Meta
+    reactions / impressions aliases) when columns are stale or zero.
+    """
+    cols = _column_metrics(row)
+    get = row.get if hasattr(row, "get") else lambda k, d=None: getattr(row, k, d)
+    pr = normalize_upload_platform_results_list(get("platform_results"))
+    roll = rollup_engagement_from_platform_results(
+        pr,
+        shortform_only=shortform_only,
+        successful_only=True,
+        platforms=COACH_ENGAGEMENT_PLATFORMS if shortform_only else None,
+    )
+    return _max_metrics(cols, roll)
+
+
+def per_platform_upload_metrics(row: Any) -> List[Dict[str, Any]]:
+    """
+    One metric blob per TikTok / YouTube / Instagram / Facebook target.
+
+    Uses true per-platform ``platform_results`` stats when present; otherwise falls
+    back to upload columns for single-platform posts (or shared columns when
+    multi-platform but PR has no metrics yet).
+    """
+    from services.content_success_features import entry_metrics, entry_successful
+
+    get = row.get if hasattr(row, "get") else lambda k, d=None: getattr(row, k, d)
+    cols = _column_metrics(row)
+    pr = normalize_upload_platform_results_list(get("platform_results"))
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for e in pr:
+        if not isinstance(e, dict) or not entry_successful(e):
+            continue
+        plat = str(e.get("platform") or "").strip().lower()
+        if not plat or plat not in COACH_ENGAGEMENT_PLATFORMS:
+            continue
+        m = entry_metrics(e, plat)
+        if (m["views"] + m["likes"] + m["comments"] + m["shares"]) <= 0:
+            continue
+        seen.add(plat)
+        out.append(
+            {
+                "platform": plat,
+                **m,
+                "engagement_rate_pct": engagement_rate_pct(
+                    m["views"], m["likes"], m["comments"], m["shares"]
+                ),
+            }
+        )
+
+    platforms = [
+        str(p).strip().lower()
+        for p in (get("platforms") or [])
+        if str(p).strip()
+    ]
+    platforms = [p for p in platforms if p in COACH_ENGAGEMENT_PLATFORMS]
+
+    if not out:
+        # No usable PR metrics — attribute columns to each declared platform
+        # (same prior behavior) so single-platform posts still score.
+        for plat in platforms or ["all"]:
+            if (cols["views"] + cols["likes"] + cols["comments"] + cols["shares"]) <= 0:
+                continue
+            out.append(
+                {
+                    "platform": plat if plat != "all" else "all",
+                    **cols,
+                    "engagement_rate_pct": engagement_rate_pct(
+                        cols["views"], cols["likes"], cols["comments"], cols["shares"]
+                    ),
+                }
+            )
+        return out
+
+    # Some platforms already have real PR metrics. Do not assign rolled-up
+    # upload-column totals to the remaining platforms (double-counts multi-post).
+    return out
+
+
+def strategy_key_from_artifacts(output_artifacts: Any) -> str:
+    """Match ml_scoring_job SQL attribution key for quality daily rows."""
+    oa = safe_json(output_artifacts, {})
+    if not isinstance(oa, dict):
+        oa = {}
+    key = str(oa.get("content_attribution_key") or "").strip()
+    if key:
+        return key
+    tsel = str(oa.get("thumbnail_selection_method") or "").strip() or "na"
+    trend = str(oa.get("thumbnail_render_method") or "").strip() or "na"
+    return f"legacy|tsel={tsel}|trend={trend}"
+
+
+def grounding_score_from_artifacts(output_artifacts: Any) -> Optional[float]:
+    oa = safe_json(output_artifacts, {})
+    if not isinstance(oa, dict):
+        return None
+    hr = oa.get("hydration_report") if isinstance(oa.get("hydration_report"), dict) else {}
+    gs = hr.get("grounding_score")
+    if gs is None:
+        gsv = oa.get("grounding_score_v1") if isinstance(oa.get("grounding_score_v1"), dict) else {}
+        gs = gsv.get("grounding_score")
+    try:
+        if gs is None or str(gs).strip() == "":
+            return None
+        return float(gs)
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_upload_platform_results_list(raw: Any) -> list:

@@ -382,6 +382,8 @@ def compute_smart_schedule_display(schedule_mode: str, schedule_metadata: Any) -
 
 def _build_slim_upload_item(d: dict) -> dict:
     """Minimal projection for analytics top-content (no enrichment / presign)."""
+    from services.upload_engagement import effective_upload_metrics
+
     ai_title = (d.get("ai_generated_title") or d.get("ai_title") or "") or ""
     raw_title = (d.get("title") or "").strip()
     title = (
@@ -389,6 +391,7 @@ def _build_slim_upload_item(d: dict) -> dict:
         if ai_title and is_placeholder_upload_title(raw_title, d.get("filename") or "")
         else (raw_title or ai_title)
     )
+    m = effective_upload_metrics(d, shortform_only=True)
     return {
         "id": str(d.get("id")),
         "title": title,
@@ -397,10 +400,10 @@ def _build_slim_upload_item(d: dict) -> dict:
         "status": d.get("status") or "",
         "created_at": _dt_iso(d.get("created_at")),
         "completed_at": _dt_iso(d.get("completed_at")),
-        "views": int(d.get("views") or 0),
-        "likes": int(d.get("likes") or 0),
-        "comments": int(d.get("comments") or 0),
-        "shares": int(d.get("shares") or 0),
+        "views": int(m.get("views") or 0),
+        "likes": int(m.get("likes") or 0),
+        "comments": int(m.get("comments") or 0),
+        "shares": int(m.get("shares") or 0),
     }
 
 
@@ -584,6 +587,7 @@ async def fetch_user_uploads_list(
             "likes",
             "comments",
             "shares",
+            "platform_results",
         ]
     elif shell:
         # Dashboard/queue first paint: card fields without AI/pipeline blobs or avatar enrich.

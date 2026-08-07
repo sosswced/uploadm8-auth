@@ -230,6 +230,13 @@ class ProfileUpdateSettings(BaseModel):
     last_name: Optional[str] = None
     timezone: Optional[str] = None
 
+
+class EmailChangeSettings(BaseModel):
+    """Self-serve Settings → Change Email (requires current password)."""
+
+    new_email: EmailStr
+    current_password: str = Field(min_length=1)
+
 class PreferencesUpdate(BaseModel):
     """Settings page / legacy prefs — includes Caption & AI card fields for save/load."""
     emailNotifs: Optional[bool] = None

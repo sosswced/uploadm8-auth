@@ -272,6 +272,7 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("thumbnail_render_pipeline", "thumbnailRenderPipeline"),
         ("thumbnail_apply_mode", "thumbnailApplyMode"),
         ("thumbnail_ref_persona_mode", "thumbnailRefPersonaMode"),
+        ("sponsor_watermark_opt_in", "sponsorWatermarkOptIn"),
         ("caption_style", "captionStyle"),
         ("caption_tone", "captionTone"),
         ("caption_voice", "captionVoice"),
@@ -326,6 +327,7 @@ def _overlay_upload_ai_audio_studio_prefs(result: dict, up: dict) -> None:
         ("tiktokBurnStyledCover", "tiktok_burn_styled_cover"),
         ("thumbnailStudioEnabled", "thumbnail_studio_enabled"),
         ("thumbnailStudioEngineEnabled", "thumbnail_studio_engine_enabled"),
+        ("sponsorWatermarkOptIn", "sponsor_watermark_opt_in"),
         ("thumbnailStudioStrict", "thumbnail_studio_strict"),
         ("thumbnailPersonaEnabled", "thumbnail_persona_enabled"),
     ]:

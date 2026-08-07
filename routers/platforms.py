@@ -27,6 +27,7 @@ from services.tiktok_api import (
     TIKTOK_BRANDED_CONTENT_POLICY_URL,
     TIKTOK_MUSIC_USAGE_CONFIRMATION_URL,
     fetch_tiktok_creator_info,
+    tiktok_direct_post_status,
     tiktok_unaudited_mode,
 )
 from stages import db as db_stage
@@ -93,6 +94,7 @@ async def tiktok_creator_info(
         raise HTTPException(502, err)
 
     unaudited = tiktok_unaudited_mode()
+    status = tiktok_direct_post_status()
 
     return {
         "ok": True,
@@ -100,6 +102,9 @@ async def tiktok_creator_info(
         "identity": identity or {},
         "creator_info": info,
         "unaudited_mode": unaudited,
+        "app_audited": status["app_audited"],
+        "public_publish_enabled": status["public_publish_enabled"],
+        "direct_post": status,
         "links": {
             "music_usage_confirmation": TIKTOK_MUSIC_USAGE_CONFIRMATION_URL,
             "branded_content_policy": TIKTOK_BRANDED_CONTENT_POLICY_URL,

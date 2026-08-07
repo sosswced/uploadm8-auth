@@ -3,8 +3,8 @@ UploadM8 Watermark Stage
 ==========================
 Apply tier-based watermark overlay to videos using FFmpeg.
 
-Free tier: UploadM8 watermark applied.
-Creator Pro+: No watermark (or custom white-label).
+Free tier (can_watermark): UploadM8 text/logo burned in.
+Paid tiers: no burn unless sponsorWatermarkOptIn (UploadM8 sponsorship branding).
 
 Exports: run_watermark_stage(ctx)
 """
@@ -13,7 +13,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Cap FFmpeg CPU/RAM per invocation so concurrent jobs don't OOM the box.
 _FFMPEG_THREADS_DEFAULT = max(
@@ -44,6 +44,9 @@ _WATERMARK_REF_SHORT_EDGE = 1080
 _WATERMARK_BASE_FONT_AT_REF = 42
 _WATERMARK_MIN_FONT = 20
 _WATERMARK_MAX_FONT = 120
+_WATERMARK_BASE_LOGO_AT_REF = 180
+_WATERMARK_MIN_LOGO = 48
+_WATERMARK_MAX_LOGO = 480
 # Optional explicit override; otherwise we auto-detect a system font below.
 WATERMARK_FONT_FILE = os.environ.get("WATERMARK_FONT_FILE", "").strip() or None
 
@@ -54,20 +57,53 @@ WATERMARK_X264_PRESET = (
 )
 WATERMARK_X264_CRF = os.environ.get("WATERMARK_X264_CRF", "23").strip() or "23"
 
-# Candidate fontfile paths in order of preference. drawtext without a fontfile
-# relies on fontconfig finding *some* font; on slim Linux containers no font
-# may be installed and the filter will fail at runtime. We always try to pass
-# an explicit fontfile=... when one is available.
+# font_family → (bold candidates, regular candidates)
+_FONT_FAMILY_CANDIDATES: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    "dejavu": (
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "C:/Windows/Fonts/DejaVuSans-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "C:/Windows/Fonts/DejaVuSans.ttf",
+        ),
+    ),
+    "liberation": (
+        (
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+            "C:/Windows/Fonts/LiberationSans-Bold.ttf",
+        ),
+        (
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/LiberationSans-Regular.ttf",
+        ),
+    ),
+    "arial": (
+        (
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ),
+        (
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ),
+    ),
+}
+
+# Fallback across families when preferred family is missing on the worker image.
 _FONT_CANDIDATES_BOLD = (
-    # Linux (Debian/Ubuntu — install via fonts-dejavu-core)
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    # Alpine
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    # macOS
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/Library/Fonts/Arial Bold.ttf",
-    # Windows
     "C:/Windows/Fonts/arialbd.ttf",
 )
 _FONT_CANDIDATES_REGULAR = (
@@ -87,25 +123,36 @@ def _hex_to_ffmpeg_color(hex_color: str) -> str:
     return "white"
 
 
-def _resolve_fontfile(bold: bool = True) -> Optional[str]:
-    """Return the first existing fontfile path, or None if nothing is found."""
-    if WATERMARK_FONT_FILE and Path(WATERMARK_FONT_FILE).exists():
-        return WATERMARK_FONT_FILE
-    candidates = _FONT_CANDIDATES_BOLD if bold else _FONT_CANDIDATES_REGULAR
+def _first_existing_font(candidates: Tuple[str, ...]) -> Optional[str]:
     for p in candidates:
         try:
             if Path(p).exists():
                 return p
         except OSError:
             continue
-    # Fallback: any readable font from the other weight list
-    for p in (_FONT_CANDIDATES_REGULAR if bold else _FONT_CANDIDATES_BOLD):
-        try:
-            if Path(p).exists():
-                return p
-        except OSError:
-            continue
     return None
+
+
+def _resolve_fontfile(bold: bool = True, font_family: str = "dejavu") -> Optional[str]:
+    """Return the first existing fontfile path, or None if nothing is found."""
+    if WATERMARK_FONT_FILE and Path(WATERMARK_FONT_FILE).exists():
+        return WATERMARK_FONT_FILE
+    fam = str(font_family or "dejavu").strip().lower()
+    pair = _FONT_FAMILY_CANDIDATES.get(fam)
+    if pair:
+        preferred = pair[0] if bold else pair[1]
+        found = _first_existing_font(preferred)
+        if found:
+            return found
+        # Same family, other weight
+        found = _first_existing_font(pair[1] if bold else pair[0])
+        if found:
+            return found
+    fallback = _FONT_CANDIDATES_BOLD if bold else _FONT_CANDIDATES_REGULAR
+    found = _first_existing_font(fallback)
+    if found:
+        return found
+    return _first_existing_font(_FONT_CANDIDATES_REGULAR if bold else _FONT_CANDIDATES_BOLD)
 
 
 def _watermark_skip_hint_from_ffmpeg_stderr(stderr_text: str) -> str:
@@ -118,6 +165,8 @@ def _watermark_skip_hint_from_ffmpeg_stderr(stderr_text: str) -> str:
             " [drawtext/fonts: install fonts (e.g. fonts-dejavu-core in Docker) "
             "or set WATERMARK_FONT_FILE to a .ttf path]"
         )
+    if "overlay" in low and ("invalid" in low or "error" in low):
+        return " [logo overlay failed — check PNG/JPEG watermark logo asset]"
     if "unknown encoder" in low and "libx264" in low:
         return " [ffmpeg build missing libx264]"
     if "not recognized as an internal or external command" in low:
@@ -128,13 +177,7 @@ def _watermark_skip_hint_from_ffmpeg_stderr(stderr_text: str) -> str:
 
 
 def _escape_drawtext(text: str) -> str:
-    """Escape a string for use inside a drawtext text='...' value.
-
-    drawtext is sensitive to single quotes, backslashes, colons and percent
-    signs because the filter uses ':' as a key separator and '%' for
-    expressions. See ffmpeg-filters docs.
-    """
-    # Order matters: backslash first.
+    """Escape a string for use inside a drawtext text='...' value."""
     return (
         text.replace("\\", "\\\\")
         .replace("'", r"\'")
@@ -157,6 +200,20 @@ def _get_position_filter(position: str, font_size: int) -> str:
     return positions.get(position, positions["bottom-right"])
 
 
+def _get_overlay_xy(position: str, pad: int = 16) -> str:
+    """FFmpeg overlay x/y expressions for a corner/center layout."""
+    pad = max(8, int(pad))
+    positions = {
+        "top-left": f"x={pad}:y={pad}",
+        "top-center": f"x=(main_w-overlay_w)/2:y={pad}",
+        "top-right": f"x=main_w-overlay_w-{pad}:y={pad}",
+        "bottom-left": f"x={pad}:y=main_h-overlay_h-{pad}",
+        "bottom-center": f"x=(main_w-overlay_w)/2:y=main_h-overlay_h-{pad}",
+        "bottom-right": f"x=main_w-overlay_w-{pad}:y=main_h-overlay_h-{pad}",
+    }
+    return positions.get(position, positions["bottom-right"])
+
+
 def compute_scaled_watermark_font_size(
     width: int,
     height: int,
@@ -168,6 +225,51 @@ def compute_scaled_watermark_font_size(
     scale = max(0.5, min(2.0, float(size_scale) / 100.0))
     raw = _WATERMARK_BASE_FONT_AT_REF * (short_edge / _WATERMARK_REF_SHORT_EDGE) * scale
     return max(_WATERMARK_MIN_FONT, min(_WATERMARK_MAX_FONT, int(round(raw))))
+
+
+def compute_scaled_logo_width(
+    width: int,
+    height: int,
+    *,
+    size_scale: int = 100,
+) -> int:
+    """Scale logo width to the video's short edge with an admin multiplier."""
+    short_edge = max(1, min(int(width or 0), int(height or 0)))
+    scale = max(0.5, min(2.0, float(size_scale) / 100.0))
+    raw = _WATERMARK_BASE_LOGO_AT_REF * (short_edge / _WATERMARK_REF_SHORT_EDGE) * scale
+    return max(_WATERMARK_MIN_LOGO, min(_WATERMARK_MAX_LOGO, int(round(raw))))
+
+
+def format_watermark_display_text(settings: Dict[str, Any]) -> str:
+    """Apply optional 'Sponsored by' prefix to the burn-in label."""
+    text = str(settings.get("text") or WATERMARK_TEXT or "Upload M8").strip() or "Upload M8"
+    if settings.get("sponsored_prefix"):
+        prefix = str(settings.get("sponsored_prefix_text") or "Sponsored by").strip() or "Sponsored by"
+        # Avoid double-prefix if admin already typed it into the label.
+        low = text.lower()
+        if not low.startswith(prefix.lower()):
+            text = f"{prefix} {text}".strip()
+    return text[:120]
+
+
+def watermark_requires_logo_prepass(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Logo overlay needs a dedicated FFmpeg pass (cannot use text-only single-pass vf)."""
+    s = settings or {}
+    mode = str(s.get("mode") or "text").strip().lower()
+    return mode in ("logo", "both") and bool(str(s.get("logo_r2_key") or "").strip())
+
+
+def should_apply_watermark(ctx: JobContext) -> bool:
+    """Free-tier burn-in, or paid opt-in for UploadM8 sponsorship branding."""
+    explicit = getattr(ctx, "apply_watermark", None)
+    if explicit is not None:
+        return bool(explicit)
+    if ctx.entitlements and getattr(ctx.entitlements, "can_watermark", False):
+        return True
+    us = getattr(ctx, "user_settings", None) or {}
+    if isinstance(us, dict):
+        return bool(us.get("sponsorWatermarkOptIn") or us.get("sponsor_watermark_opt_in"))
+    return False
 
 
 def resolve_watermark_settings(ctx: JobContext) -> Dict[str, Any]:
@@ -182,23 +284,34 @@ def resolve_watermark_settings(ctx: JobContext) -> Dict[str, Any]:
         raw["size_scale"] = WATERMARK_SIZE_SCALE
     if "opacity" not in raw:
         raw["opacity"] = WATERMARK_OPACITY
-    if "position" not in raw:
+    if "position" not in raw and "text_position" not in raw:
         raw["position"] = WATERMARK_POSITION
     return normalize_watermark_settings(raw)
 
 
 def resolve_watermark_display_text(ctx: JobContext) -> str:
-    return resolve_watermark_settings(ctx)["text"]
+    return format_watermark_display_text(resolve_watermark_settings(ctx))
 
 
 async def build_watermark_vf_for_transcode(ctx: JobContext, video_path: Path) -> Optional[str]:
-    """Build drawtext vf fragment for single-pass watermark burn during transcode."""
-    if ctx.entitlements and not ctx.entitlements.can_watermark:
+    """Build drawtext vf fragment for single-pass watermark burn during transcode.
+
+    Returns None when logo overlay is required (caller must run watermark pre-pass)
+    or when burn-in is not applicable.
+    """
+    if not should_apply_watermark(ctx):
         return None
     wm_settings = resolve_watermark_settings(ctx)
+    if watermark_requires_logo_prepass(wm_settings):
+        return None
+    if wm_settings.get("mode") == "logo":
+        return None
     font_weight = wm_settings.get("font_weight") or "bold"
     bold = str(font_weight).strip().lower() not in ("normal", "regular", "400")
-    fontfile = _resolve_fontfile(bold=bold)
+    fontfile = _resolve_fontfile(
+        bold=bold,
+        font_family=str(wm_settings.get("font_family") or "dejavu"),
+    )
     if not fontfile:
         return None
     font_size = WATERMARK_FONT_SIZE
@@ -212,10 +325,10 @@ async def build_watermark_vf_for_transcode(ctx: JobContext, video_path: Path) ->
     except Exception:
         pass
     return build_drawtext_filter(
-        text=wm_settings["text"],
+        text=format_watermark_display_text(wm_settings),
         font_size=font_size,
         opacity=wm_settings["opacity"],
-        position=wm_settings["position"],
+        position=wm_settings.get("text_position") or wm_settings.get("position") or WATERMARK_POSITION,
         fontfile=fontfile,
         text_color=wm_settings.get("text_color") or "#ffffff",
         font_weight=font_weight,
@@ -230,14 +343,11 @@ def build_drawtext_filter(
     fontfile: Optional[str] = None,
     text_color: str = "#ffffff",
     font_weight: str = "bold",
+    font_family: str = "dejavu",
 ) -> str:
-    """Build the ffmpeg drawtext filter string used by the watermark stage.
-
-    Exposed so tests (and callers) can verify the exact filter that gets sent
-    to ffmpeg without spinning up a subprocess.
-    """
+    """Build the ffmpeg drawtext filter string used by the watermark stage."""
     bold = str(font_weight or "bold").strip().lower() not in ("normal", "regular", "400")
-    fontfile = fontfile if fontfile is not None else _resolve_fontfile(bold=bold)
+    fontfile = fontfile if fontfile is not None else _resolve_fontfile(bold=bold, font_family=font_family)
     pos = _get_position_filter(position, font_size)
     parts = [f"drawtext=text='{_escape_drawtext(text)}'"]
     if fontfile:
@@ -254,19 +364,41 @@ def build_drawtext_filter(
     return ":".join(parts)
 
 
+def build_logo_overlay_chain(
+    *,
+    logo_width: int,
+    opacity: float,
+    position: str,
+    include_drawtext: Optional[str] = None,
+) -> str:
+    """Build filter_complex for logo scale/opacity + overlay (+ optional drawtext)."""
+    op = max(0.05, min(1.0, float(opacity)))
+    xy = _get_overlay_xy(position, pad=max(12, int(round(logo_width * 0.08))))
+    # Input 0 = video, input 1 = logo image
+    chain = (
+        f"[1:v]scale={int(logo_width)}:-1,format=rgba,"
+        f"colorchannelmixer=aa={op:.2f}[lg];"
+        f"[0:v][lg]overlay={xy}"
+    )
+    if include_drawtext:
+        chain += f"[v1];[v1]{include_drawtext}"
+    return chain
+
+
 async def run_watermark_stage(ctx: JobContext) -> JobContext:
     """
-    Apply watermark to the video if required by tier.
+    Apply watermark to the video if required by tier or paid sponsorship opt-in.
 
     Logic:
-    - If entitlements.can_watermark is False → no watermark (paid tier benefit).
-    - If True → burn a text watermark onto the video.
+    - If should_apply_watermark is False → skip (paid tier without opt-in).
+    - mode text → drawtext only
+    - mode logo → overlay only
+    - mode both → overlay + drawtext
     - On FFmpeg failure, skip gracefully (don't block the pipeline).
     """
     ctx.mark_stage("watermark")
 
-    # Check if watermark is needed
-    if ctx.entitlements and not ctx.entitlements.can_watermark:
+    if not should_apply_watermark(ctx):
         raise SkipStage("Watermark not required for this tier")
 
     # Find the video to watermark
@@ -288,21 +420,37 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         )
 
     wm_settings = resolve_watermark_settings(ctx)
+    mode = str(wm_settings.get("mode") or "text").strip().lower()
+    logo_path = getattr(ctx, "watermark_logo_local_path", None)
+    if isinstance(logo_path, str):
+        logo_path = Path(logo_path)
+    has_logo = bool(logo_path and Path(logo_path).exists())
+    if mode in ("logo", "both") and not has_logo:
+        if mode == "logo":
+            raise SkipStage("Watermark logo mode but logo file missing")
+        mode = "text"
+
+    want_text = mode in ("text", "both")
+    want_logo = mode in ("logo", "both") and has_logo
+
     font_weight = wm_settings.get("font_weight") or "bold"
     bold = str(font_weight).strip().lower() not in ("normal", "regular", "400")
-    fontfile = _resolve_fontfile(bold=bold)
-    if not fontfile:
-        # Without a fontfile drawtext often fails on slim Linux containers
-        # because no fontconfig fonts are installed. Surface this loudly so
-        # ops adds fonts-dejavu-core (or sets WATERMARK_FONT_FILE) to the image.
+    font_family = str(wm_settings.get("font_family") or "dejavu")
+    fontfile = _resolve_fontfile(bold=bold, font_family=font_family) if want_text else None
+    if want_text and not fontfile:
         logger.error(
             "Watermark cannot be applied: no usable fontfile found. "
             "Install fonts-dejavu-core in the worker image or set "
             "WATERMARK_FONT_FILE=/path/to/font.ttf"
         )
-        raise SkipStage("No fontfile available for drawtext")
-    display_text = wm_settings["text"]
+        if not want_logo:
+            raise SkipStage("No fontfile available for drawtext")
+        want_text = False
+        mode = "logo"
+
+    display_text = format_watermark_display_text(wm_settings)
     font_size = WATERMARK_FONT_SIZE
+    logo_width = _WATERMARK_BASE_LOGO_AT_REF
     try:
         info = await get_video_info(video_path)
         font_size = compute_scaled_watermark_font_size(
@@ -310,48 +458,67 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
             info.height,
             size_scale=wm_settings["size_scale"],
         )
+        logo_width = compute_scaled_logo_width(
+            info.width,
+            info.height,
+            size_scale=int(wm_settings.get("logo_size_scale") or 100),
+        )
     except Exception as e:
         logger.warning(
-            "Watermark font size fallback for upload %s (ffprobe failed: %s)",
+            "Watermark size fallback for upload %s (ffprobe failed: %s)",
             ctx.upload_id,
             e,
         )
 
     logger.info(
-        "Applying '%s' watermark to upload %s (fontsize=%s, opacity=%s, position=%s) using font %s",
-        display_text,
+        "Applying watermark to upload %s (mode=%s, text=%r, fontsize=%s, logo_w=%s)",
         ctx.upload_id,
-        font_size,
-        wm_settings["opacity"],
-        wm_settings["position"],
-        fontfile,
+        mode,
+        display_text if want_text else None,
+        font_size if want_text else None,
+        logo_width if want_logo else None,
     )
 
     output_path = ctx.temp_dir / f"wm_{ctx.upload_id}.mp4"
+    drawtext_filter = None
+    if want_text:
+        drawtext_filter = build_drawtext_filter(
+            text=display_text,
+            font_size=font_size,
+            opacity=wm_settings["opacity"],
+            position=wm_settings.get("text_position") or wm_settings.get("position") or WATERMARK_POSITION,
+            fontfile=fontfile,
+            text_color=wm_settings.get("text_color") or "#ffffff",
+            font_weight=font_weight,
+            font_family=font_family,
+        )
 
-    drawtext_filter = build_drawtext_filter(
-        text=display_text,
-        font_size=font_size,
-        opacity=wm_settings["opacity"],
-        position=wm_settings["position"],
-        fontfile=fontfile,
-        text_color=wm_settings.get("text_color") or "#ffffff",
-        font_weight=font_weight,
+    cmd = [ffmpeg_bin, "-y", "-i", str(video_path)]
+    if want_logo:
+        cmd.extend(["-i", str(logo_path)])
+        filter_complex = build_logo_overlay_chain(
+            logo_width=logo_width,
+            opacity=float(wm_settings.get("logo_opacity") or 0.9),
+            position=str(wm_settings.get("logo_position") or "bottom-left"),
+            include_drawtext=drawtext_filter if want_text else None,
+        )
+        cmd.extend(["-filter_complex", filter_complex])
+    elif drawtext_filter:
+        cmd.extend(["-vf", drawtext_filter])
+    else:
+        raise SkipStage("Watermark mode produced no filters")
+
+    cmd.extend(
+        [
+            "-c:v", "libx264",
+            "-threads", str(FFMPEG_THREADS),
+            "-preset", WATERMARK_X264_PRESET,
+            "-crf", WATERMARK_X264_CRF,
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
     )
-
-    cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-i", str(video_path),
-        "-vf", drawtext_filter,
-        "-c:v", "libx264",
-        "-threads", str(FFMPEG_THREADS),
-        "-preset", WATERMARK_X264_PRESET,
-        "-crf", WATERMARK_X264_CRF,
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        str(output_path),
-    ]
 
     logger.debug("Watermark ffmpeg cmd: %s", " ".join(cmd))
 

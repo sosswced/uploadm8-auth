@@ -10,7 +10,7 @@ import logging
 import math
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from core.content_attribution import (
@@ -334,48 +334,54 @@ async def fetch_ranked_strategies(conn, user_id: uuid.UUID, lookback_days: int =
 
 
 async def fetch_engagement_anomaly(conn, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-    """Compare recent uploads vs prior window on engagement rate (likes+comments+shares)/views."""
-    row = await conn.fetchrow(
+    """Compare recent uploads vs prior window on engagement rate (likes+comments+shares)/views.
+
+    Uses effective metrics (upload columns ⋃ TikTok/YouTube/Meta ``platform_results``)
+    so Analytics-synced engagement is not ignored when columns are stale.
+    """
+    from services.upload_engagement import effective_upload_metrics, engagement_rate_pct
+
+    rows = await conn.fetch(
         """
-        WITH per AS (
-            SELECT
-                CASE WHEN created_at >= NOW() - interval '14 days' THEN 'recent' ELSE 'prior' END AS bucket,
-                CASE WHEN COALESCE(views, 0) > 0 THEN
-                  (COALESCE(likes,0)+COALESCE(comments,0)+COALESCE(shares,0))::double precision / views::double precision * 100.0
-                ELSE NULL END AS er,
-                COALESCE(views,0)::bigint AS v
-            FROM uploads
-            WHERE user_id = $1::uuid
-              AND status IN ('completed', 'succeeded', 'partial')
-              AND created_at >= NOW() - interval '60 days'
-        ),
-        agg AS (
-            SELECT bucket,
-                   COUNT(*) FILTER (WHERE er IS NOT NULL)::int AS n,
-                   AVG(er) FILTER (WHERE er IS NOT NULL) AS mean_er,
-                   COALESCE(STDDEV_POP(er), 0) AS std_er
-              FROM per
-             GROUP BY bucket
-        )
-        SELECT
-            MAX(mean_er) FILTER (WHERE bucket = 'recent') AS recent_mean,
-            MAX(n) FILTER (WHERE bucket = 'recent') AS recent_n,
-            MAX(mean_er) FILTER (WHERE bucket = 'prior') AS prior_mean,
-            MAX(n) FILTER (WHERE bucket = 'prior') AS prior_n,
-            MAX(std_er) FILTER (WHERE bucket = 'prior') AS prior_std
-        FROM agg
+        SELECT created_at, views, likes, comments, shares, platform_results
+          FROM uploads
+         WHERE user_id = $1::uuid
+           AND status IN ('completed', 'succeeded', 'partial')
+           AND created_at >= NOW() - interval '60 days'
         """,
         user_id,
     )
-    if not row:
+    if not rows:
         return None
-    recent_m = _finite(row["recent_mean"])
-    prior_m = _finite(row["prior_mean"])
-    recent_n = int(row["recent_n"] or 0)
-    prior_n = int(row["prior_n"] or 0)
-    prior_std = _finite(row["prior_std"])
+    now = datetime.now(timezone.utc)
+    recent_cut = now - timedelta(days=14)
+    recent_ers: List[float] = []
+    prior_ers: List[float] = []
+    for r in rows:
+        created = r["created_at"]
+        if created is not None and getattr(created, "tzinfo", None) is None:
+            created = created.replace(tzinfo=timezone.utc)
+        m = effective_upload_metrics(r, shortform_only=True)
+        if int(m["views"] or 0) <= 0:
+            continue
+        er = engagement_rate_pct(m["views"], m["likes"], m["comments"], m["shares"])
+        if created is not None and created >= recent_cut:
+            recent_ers.append(er)
+        else:
+            prior_ers.append(er)
+    recent_n = len(recent_ers)
+    prior_n = len(prior_ers)
     if recent_n < 4 or prior_n < 6:
         return None
+    recent_m = _finite(sum(recent_ers) / recent_n)
+    prior_m = _finite(sum(prior_ers) / prior_n)
+    if prior_n > 1:
+        mean_p = prior_m
+        prior_std = _finite(
+            (sum((x - mean_p) ** 2 for x in prior_ers) / prior_n) ** 0.5
+        )
+    else:
+        prior_std = 0.0
     delta = recent_m - prior_m
     threshold = max(0.8, 1.5 * prior_std) if prior_std > 0 else 1.0
     if delta < -threshold:
@@ -460,9 +466,11 @@ async def fetch_hashtag_traction(
     min_uploads_per_tag = max(2, min(int(min_uploads_per_tag or 2), 20))
     # Cap rows for /api/me/coach (UPLOADM8-5S) — hashtag aggregation does not need
     # unbounded history; newest first uses idx_uploads_user_status_created_completed.
+    from services.upload_engagement import effective_upload_metrics, engagement_rate_pct
+
     rows = await conn.fetch(
         """
-        SELECT id, views, likes, comments, shares, created_at, output_artifacts
+        SELECT id, views, likes, comments, shares, created_at, output_artifacts, platform_results
           FROM uploads
          WHERE user_id = $1::uuid
            AND status IN ('completed', 'succeeded', 'partial')
@@ -483,13 +491,14 @@ async def fetch_hashtag_traction(
         if not tags:
             continue
         uploads_with_tags += 1
-        v = int(r["views"] or 0)
-        lk = int(r["likes"] or 0)
-        cm = int(r["comments"] or 0)
-        sh = int(r["shares"] or 0)
+        m = effective_upload_metrics(r, shortform_only=True)
+        v = int(m["views"] or 0)
+        lk = int(m["likes"] or 0)
+        cm = int(m["comments"] or 0)
+        sh = int(m["shares"] or 0)
         er: Optional[float] = None
         if v > 0:
-            er = ((lk + cm + sh) / float(v)) * 100.0
+            er = engagement_rate_pct(v, lk, cm, sh)
         for tag in tags:
             a = agg[tag]
             a["uploads"] += 1

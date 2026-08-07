@@ -23,11 +23,21 @@ CURRENT_KEY_ID = "v1"
 admin_settings_cache: Dict[str, Any] = {
     "demo_data_enabled": False,
     "billing_mode": BILLING_MODE,
-    # Free-tier FFmpeg drawtext (master admin editable; worker reads DB each job).
+    # Free-tier / sponsorship FFmpeg watermark (master admin editable; worker reads DB each job).
     "watermark_burn_text": "Upload M8",
     "watermark_size_scale": 100,
     "watermark_opacity": 0.85,
     "watermark_position": "bottom-right",
+    "watermark_text_color": "#ffffff",
+    "watermark_font_weight": "bold",
+    "watermark_font_family": "dejavu",
+    "watermark_mode": "text",
+    "watermark_logo_r2_key": "",
+    "watermark_logo_position": "bottom-left",
+    "watermark_logo_size_scale": 100,
+    "watermark_logo_opacity": 0.9,
+    "watermark_sponsored_prefix": False,
+    "watermark_sponsored_prefix_text": "Sponsored by",
     # Dynamic weak-taxonomy hard-ban overlay (see services/generic_hard_ban.py).
     "generic_hard_ban": {
         "added": [],

@@ -2172,6 +2172,14 @@ async def run_migrations(db_pool):
                 ALTER TABLE user_preferences
                     ADD COLUMN IF NOT EXISTS trill_skip_low_score BOOLEAN NOT NULL DEFAULT FALSE;
             """),
+            # Connected-account OAuth health for keepalive / reconnect UI.
+            (1102, """
+                ALTER TABLE platform_tokens
+                    ADD COLUMN IF NOT EXISTS oauth_health VARCHAR(32);
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_oauth_health
+                    ON platform_tokens (oauth_health)
+                    WHERE revoked_at IS NULL AND oauth_health = 'needs_reconnection';
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

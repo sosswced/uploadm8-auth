@@ -267,9 +267,13 @@ class JobContext:
 
     entitlements: Optional[Entitlements] = None
     user_settings: Dict[str, Any] = field(default_factory=dict)
-    # Free-tier burn-in settings (from admin_settings + worker; watermark_stage reads these).
+    # Free-tier / sponsorship burn-in (from admin_settings + worker; watermark_stage reads these).
     watermark_text: Optional[str] = None
     watermark_settings: Dict[str, Any] = field(default_factory=dict)
+    # Explicit apply flag: free can_watermark, or paid sponsorWatermarkOptIn.
+    apply_watermark: Optional[bool] = None
+    # Local path to downloaded admin logo (PNG/JPEG) for overlay pass.
+    watermark_logo_local_path: Optional[Path] = None
 
     temp_dir: Optional[Path] = None
     local_video_path: Optional[Path] = None

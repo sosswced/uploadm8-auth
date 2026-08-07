@@ -294,6 +294,18 @@ OAUTH_CONFIG = {
 # TikTok
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+# Content Posting Direct Post: set to 1 after TikTok Developer Portal audit approval
+# so PUBLIC_TO_EVERYONE / Friends / Followers are allowed (not clamped to SELF_ONLY).
+TIKTOK_APP_AUDITED = (os.environ.get("TIKTOK_APP_AUDITED") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Emergency rollback: force SELF_ONLY even when audited.
+TIKTOK_FORCE_PRIVATE_UNAUDITED = (
+    os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or ""
+).strip().lower() in ("1", "true", "yes", "on")
 # Separate secret used to verify TikTok webhook payloads (HMAC-SHA256).
 # Set this to the value shown in TikTok Developer Portal -> your app ->
 # Webhooks -> "Client Secret". Falls back to TIKTOK_CLIENT_SECRET if

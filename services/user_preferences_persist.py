@@ -559,6 +559,8 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "thumbnail_studio_default_strategy",
             "thumbnailDefaultStrategy",
             "thumbnail_default_strategy",
+            "sponsorWatermarkOptIn",
+            "sponsor_watermark_opt_in",
         )
         if any(k in p or sk in p for k, sk in zip(caption_keys, caption_snake)) or any(
             k in p or sk in p for k, sk in zip(thumb_keys, thumb_snake)
@@ -666,6 +668,9 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 v_persona = _pick_bool("thumbnailPersonaEnabled", "thumbnail_persona_enabled")
                 if v_persona is not None:
                     users_prefs["thumbnailPersonaEnabled"] = users_prefs["thumbnail_persona_enabled"] = v_persona
+                v_sponsor_wm = _pick_bool("sponsorWatermarkOptIn", "sponsor_watermark_opt_in")
+                if v_sponsor_wm is not None:
+                    users_prefs["sponsorWatermarkOptIn"] = users_prefs["sponsor_watermark_opt_in"] = v_sponsor_wm
                 # Merge Studio default strategy (Settings niche / make-default from Studio).
                 incoming_strat = (
                     p.get("thumbnailStudioDefaultStrategy")

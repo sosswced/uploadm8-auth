@@ -30,7 +30,8 @@ _PLATFORM_TOKEN_SELECT = """
         is_primary,
         created_at,
         last_oauth_reconnect_at,
-        last_used_at
+        last_used_at,
+        oauth_health
     FROM platform_tokens
     WHERE user_id = $1
       AND revoked_at IS NULL
@@ -40,7 +41,14 @@ _PLATFORM_TOKEN_SELECT = """
 """
 
 
-def account_status(token_id: str, auth_error_by_token: Mapping[str, str]) -> str:
+def account_status(
+    token_id: str,
+    auth_error_by_token: Mapping[str, str],
+    *,
+    oauth_health: Optional[str] = None,
+) -> str:
+    if str(oauth_health or "").strip().lower() == "needs_reconnection":
+        return "needs_reconnection"
     code = (auth_error_by_token.get(str(token_id)) or "").strip()
     if code in AUTH_RECONNECT_ERROR_CODES:
         return "needs_reconnection"
@@ -62,7 +70,8 @@ def serialize_platform_account(
     created = row.get("created_at")
     reconnect = row.get("last_oauth_reconnect_at")
     last_used = row.get("last_used_at")
-    status = account_status(tid, auth_error_by_token)
+    oauth_health = row.get("oauth_health") if hasattr(row, "get") else None
+    status = account_status(tid, auth_error_by_token, oauth_health=oauth_health)
     created_iso = created.isoformat() if created else None
     return {
         "id": tid,
@@ -72,6 +81,7 @@ def serialize_platform_account(
         "avatar": resolve_stored_account_avatar_url(row.get("account_avatar"), presign=presign),
         "is_primary": row.get("is_primary"),
         "status": status,
+        "oauth_health": str(oauth_health or "").strip() or None,
         "connected_at": created_iso,
         "first_connected_at": created_iso,
         "last_reconnected_at": reconnect.isoformat() if reconnect else None,
@@ -116,7 +126,8 @@ async def fetch_auth_errors_by_token(conn: asyncpg.Connection, user_id: str) -> 
                 u.updated_at,
                 elem->>'token_row_id' AS token_id,
                 elem->>'error_code' AS error_code,
-                COALESCE((elem->>'success')::boolean, false) AS success
+                COALESCE((elem->>'success')::boolean, false) AS success,
+                COALESCE(elem->>'http_status', '') AS http_status
             FROM uploads u
             CROSS JOIN LATERAL jsonb_array_elements(
                 CASE
@@ -130,7 +141,7 @@ async def fetch_auth_errors_by_token(conn: asyncpg.Connection, user_id: str) -> 
               AND elem->>'token_row_id' IS NOT NULL
               AND elem->>'token_row_id' <> ''
         )
-        SELECT DISTINCT ON (token_id) token_id, error_code, success
+        SELECT DISTINCT ON (token_id) token_id, error_code, success, http_status
         FROM elems
         ORDER BY token_id, updated_at DESC NULLS LAST
         """,
@@ -141,8 +152,18 @@ async def fetch_auth_errors_by_token(conn: asyncpg.Connection, user_id: str) -> 
         if r["success"]:
             continue
         code = (r["error_code"] or "").strip()
-        if code in AUTH_RECONNECT_ERROR_CODES:
-            out[str(r["token_id"])] = code
+        http_status = str(r["http_status"] or "").strip()
+        classic = code in {
+            "PLATFORM_AUTH_FAILED",
+            "AUTH_FAILED",
+            "TOKEN_EXPIRED",
+            "NOT_CONNECTED",
+            "NO_TOKEN",
+        }
+        publish_auth = code in ("INIT_FAILED", "UPLOAD_FAILED") and http_status in ("401", "403")
+        http_only = (not code) and http_status in ("401", "403")
+        if classic or publish_auth or http_only:
+            out[str(r["token_id"])] = code or f"HTTP_{http_status}"
     return out
 
 

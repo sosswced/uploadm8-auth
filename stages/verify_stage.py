@@ -292,9 +292,34 @@ async def verify_single_attempt(
         platform, raw_status, has_video_id=has_video_id
     )
 
+    # Precompute TikTok URL early so ledger + platform_results can share it.
+    if plat == "tiktok" and tiktok_video_id:
+        uname_hint = ""
+        if isinstance(token_data, dict):
+            uname_hint = (
+                str(token_data.get("_account_username") or "").strip().lstrip("@")
+            )
+        tiktok_post_url = _tiktok_web_video_url(tiktok_video_id, uname_hint or None)
+
     # Persist status (pending stays pending so the loop keeps polling).
-    if verify_status != prev_verify or _is_terminal_verify_status(verify_status):
-        await db_stage.update_publish_attempt_verified(db_pool, attempt_id, verify_status)
+    # TikTok: stamp ledger platform_post_id when status/fetch returns video_id so
+    # analytics / reconcile attach without waiting on public-only video.list.
+    if (
+        verify_status != prev_verify
+        or _is_terminal_verify_status(verify_status)
+        or (plat == "tiktok" and tiktok_video_id)
+    ):
+        await db_stage.update_publish_attempt_verified(
+            db_pool,
+            attempt_id,
+            verify_status,
+            platform_url=tiktok_post_url if plat == "tiktok" and tiktok_video_id else None,
+            platform_post_id=(
+                str(tiktok_video_id).strip()
+                if plat == "tiktok" and tiktok_video_id
+                else None
+            ),
+        )
     logger.debug(
         "Verify %s/%s: raw=%s → %s video_id=%s",
         platform,
@@ -344,10 +369,11 @@ async def verify_single_attempt(
                                         .strip()
                                         .lstrip("@")
                                     )
-                                tt_url = _tiktok_web_video_url(tiktok_video_id, uname)
+                                tt_url = _tiktok_web_video_url(tiktok_video_id, uname) or tiktok_post_url
                                 item["platform_url"] = tt_url
                                 item["url"] = tt_url
-                                tiktok_post_url = tt_url
+                                if tt_url:
+                                    tiktok_post_url = tt_url
                                 updated = True
                             if updated:
                                 await conn.execute(

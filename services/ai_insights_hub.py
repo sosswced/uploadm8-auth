@@ -71,37 +71,20 @@ def _prefs_summary(prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 async def fetch_user_platform_engagement(
     conn: Any, user_id: uuid.UUID, *, days: int = 90, limit: int = 8
 ) -> List[Dict[str, Any]]:
+    """Per-platform engagement from true TikTok / YouTube / Meta platform_results when present."""
+    from services.upload_engagement import COACH_ENGAGEMENT_PLATFORMS, per_platform_upload_metrics
+
     since = datetime.now(timezone.utc) - timedelta(days=max(14, min(days, 365)))
     rows = await conn.fetch(
         """
-        SELECT
-            TRIM(LOWER(unnest(u.platforms))) AS platform,
-            COUNT(*)::bigint AS uploads,
-            COALESCE(AVG(u.views), 0)::float AS avg_views,
-            COALESCE(AVG(u.likes), 0)::float AS avg_likes,
-            COALESCE(AVG(u.comments), 0)::float AS avg_comments,
-            COALESCE(AVG(u.shares), 0)::float AS avg_shares,
-            COALESCE(SUM(COALESCE(u.views, 0)), 0)::bigint AS sum_views,
-            COALESCE(SUM(COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0)), 0)::bigint AS sum_interactions,
-            COALESCE(AVG(
-                CASE WHEN COALESCE(u.views, 0) > 0 THEN
-                    (COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0))::float
-                    / NULLIF(u.views::float, 0) * 100.0
-                ELSE NULL END
-            ), 0)::float AS avg_engagement_rate_pct
-        FROM uploads u
-        WHERE u.user_id = $1::uuid
-          AND u.created_at >= $2
-          AND u.status IN ('completed', 'succeeded', 'partial')
-          AND u.platforms IS NOT NULL AND array_length(u.platforms, 1) > 0
-        GROUP BY 1
-        HAVING COUNT(*) >= 1
-        ORDER BY avg_engagement_rate_pct DESC NULLS LAST, uploads DESC
-        LIMIT $3
+        SELECT platforms, views, likes, comments, shares, platform_results
+          FROM uploads
+         WHERE user_id = $1::uuid
+           AND created_at >= $2
+           AND status IN ('completed', 'succeeded', 'partial')
         """,
         user_id,
         since,
-        limit,
     )
     icons = {
         "youtube": "fab fa-youtube",
@@ -109,24 +92,57 @@ async def fetch_user_platform_engagement(
         "instagram": "fab fa-instagram",
         "facebook": "fab fa-facebook",
     }
-    out: List[Dict[str, Any]] = []
+    agg: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "uploads": 0,
+            "sum_views": 0,
+            "sum_likes": 0,
+            "sum_comments": 0,
+            "sum_shares": 0,
+            "sum_interactions": 0,
+            "er_sum": 0.0,
+            "er_n": 0,
+        }
+    )
     for r in rows or []:
-        plat = str(r["platform"] or "")
+        for m in per_platform_upload_metrics(r):
+            plat = str(m.get("platform") or "").strip().lower()
+            if plat not in COACH_ENGAGEMENT_PLATFORMS:
+                continue
+            a = agg[plat]
+            a["uploads"] += 1
+            a["sum_views"] += int(m["views"])
+            a["sum_likes"] += int(m["likes"])
+            a["sum_comments"] += int(m["comments"])
+            a["sum_shares"] += int(m["shares"])
+            a["sum_interactions"] += int(m["likes"]) + int(m["comments"]) + int(m["shares"])
+            er = m.get("engagement_rate_pct")
+            if er is not None and int(m["views"] or 0) > 0:
+                a["er_sum"] += float(er)
+                a["er_n"] += 1
+
+    out: List[Dict[str, Any]] = []
+    for plat, a in agg.items():
+        n = max(int(a["uploads"]), 1)
+        er_n = int(a["er_n"])
         out.append(
             {
                 "platform": plat,
                 "icon": icons.get(plat, "fas fa-globe"),
-                "uploads": int(r["uploads"] or 0),
-                "avg_views": round(float(r["avg_views"] or 0), 1),
-                "avg_likes": round(float(r["avg_likes"] or 0), 1),
-                "avg_comments": round(float(r["avg_comments"] or 0), 1),
-                "avg_shares": round(float(r["avg_shares"] or 0), 1),
-                "sum_views": int(r["sum_views"] or 0),
-                "sum_interactions": int(r["sum_interactions"] or 0),
-                "avg_engagement_rate_pct": round(float(r["avg_engagement_rate_pct"] or 0), 3),
+                "uploads": int(a["uploads"]),
+                "avg_views": round(float(a["sum_views"]) / n, 1),
+                "avg_likes": round(float(a["sum_likes"]) / n, 1),
+                "avg_comments": round(float(a["sum_comments"]) / n, 1),
+                "avg_shares": round(float(a["sum_shares"]) / n, 1),
+                "sum_views": int(a["sum_views"]),
+                "sum_interactions": int(a["sum_interactions"]),
+                "avg_engagement_rate_pct": round(
+                    (float(a["er_sum"]) / er_n) if er_n > 0 else 0.0, 3
+                ),
             }
         )
-    return out
+    out.sort(key=lambda x: (-x["avg_engagement_rate_pct"], -x["uploads"]))
+    return out[:limit]
 
 
 def _artifacts_dict(raw: Any) -> Dict[str, Any]:
@@ -163,30 +179,16 @@ async def fetch_platform_engagement_trends(
     conn: Any, user_id: uuid.UUID, *, weeks: int = 12
 ) -> Dict[str, Any]:
     """Weekly engagement + views per platform for Chart.js line charts."""
+    from services.upload_engagement import COACH_ENGAGEMENT_PLATFORMS, per_platform_upload_metrics
+
     since = datetime.now(timezone.utc) - timedelta(days=max(7, min(weeks, 52) * 7))
     rows = await conn.fetch(
         """
-        SELECT
-            date_trunc('week', u.created_at AT TIME ZONE 'UTC')::date AS week_start,
-            TRIM(LOWER(unnest(u.platforms))) AS platform,
-            COUNT(*)::bigint AS uploads,
-            COALESCE(SUM(COALESCE(u.views, 0)), 0)::bigint AS sum_views,
-            COALESCE(SUM(COALESCE(u.likes, 0)), 0)::bigint AS sum_likes,
-            COALESCE(SUM(COALESCE(u.comments, 0)), 0)::bigint AS sum_comments,
-            COALESCE(SUM(COALESCE(u.shares, 0)), 0)::bigint AS sum_shares,
-            COALESCE(AVG(
-                CASE WHEN COALESCE(u.views, 0) > 0 THEN
-                    (COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0))::float
-                    / NULLIF(u.views::float, 0) * 100.0
-                ELSE NULL END
-            ), 0)::float AS avg_engagement_rate_pct
-        FROM uploads u
-        WHERE u.user_id = $1::uuid
-          AND u.created_at >= $2
-          AND u.status IN ('completed', 'succeeded', 'partial')
-          AND u.platforms IS NOT NULL AND array_length(u.platforms, 1) > 0
-        GROUP BY 1, 2
-        ORDER BY week_start ASC, platform ASC
+        SELECT created_at, platforms, views, likes, comments, shares, platform_results
+          FROM uploads
+         WHERE user_id = $1::uuid
+           AND created_at >= $2
+           AND status IN ('completed', 'succeeded', 'partial')
         """,
         user_id,
         since,
@@ -194,21 +196,46 @@ async def fetch_platform_engagement_trends(
     week_set: set = set()
     by_plat: Dict[str, Dict[date, Dict[str, Any]]] = defaultdict(dict)
     for r in rows or []:
-        ws = r["week_start"]
-        if isinstance(ws, datetime):
-            ws = ws.date()
-        plat = str(r["platform"] or "")
-        if not plat or not ws:
+        created = r["created_at"]
+        if created is None:
             continue
-        week_set.add(ws)
-        by_plat[plat][ws] = {
-            "uploads": int(r["uploads"] or 0),
-            "sum_views": int(r["sum_views"] or 0),
-            "sum_likes": int(r["sum_likes"] or 0),
-            "sum_comments": int(r["sum_comments"] or 0),
-            "sum_shares": int(r["sum_shares"] or 0),
-            "engagement_rate_pct": round(float(r["avg_engagement_rate_pct"] or 0), 3),
-        }
+        if isinstance(created, datetime):
+            ws = created.astimezone(timezone.utc).date()
+            # Align to week start (Monday) like date_trunc('week') in UTC-ish PG
+            ws = ws - timedelta(days=ws.weekday())
+        elif isinstance(created, date):
+            ws = created - timedelta(days=created.weekday())
+        else:
+            continue
+        for m in per_platform_upload_metrics(r):
+            plat = str(m.get("platform") or "").strip().lower()
+            if plat not in COACH_ENGAGEMENT_PLATFORMS:
+                continue
+            week_set.add(ws)
+            cell = by_plat[plat].setdefault(
+                ws,
+                {
+                    "uploads": 0,
+                    "sum_views": 0,
+                    "sum_likes": 0,
+                    "sum_comments": 0,
+                    "sum_shares": 0,
+                    "er_sum": 0.0,
+                    "er_n": 0,
+                },
+            )
+            cell["uploads"] += 1
+            cell["sum_views"] += int(m["views"])
+            cell["sum_likes"] += int(m["likes"])
+            cell["sum_comments"] += int(m["comments"])
+            cell["sum_shares"] += int(m["shares"])
+            if int(m["views"] or 0) > 0:
+                cell["er_sum"] += float(m.get("engagement_rate_pct") or 0.0)
+                cell["er_n"] += 1
+            if cell["er_n"] > 0:
+                cell["engagement_rate_pct"] = round(cell["er_sum"] / cell["er_n"], 3)
+            else:
+                cell["engagement_rate_pct"] = 0.0
     weeks_sorted = sorted(week_set)
     labels = [w.isoformat() for w in weeks_sorted]
     palette = {
@@ -259,9 +286,12 @@ async def fetch_packaging_variant_rollups(
     with per-upload engagement (likes, comments, shares vs views).
     """
     lookback = max(30, min(int(days or 120), 365))
+    from services.upload_engagement import effective_upload_metrics, engagement_rate_pct
+
     rows = await conn.fetch(
         """
-        SELECT views, likes, comments, shares, output_artifacts, studio_content_variant_id
+        SELECT views, likes, comments, shares, output_artifacts, studio_content_variant_id,
+               platform_results
           FROM uploads
          WHERE user_id = $1::uuid
            AND status IN ('completed', 'succeeded', 'partial')
@@ -324,14 +354,17 @@ async def fetch_packaging_variant_rollups(
             },
         )
         bucket["uploads"] += 1
-        v = int(r["views"] or 0)
-        lk = int(r["likes"] or 0)
-        cm = int(r["comments"] or 0)
-        sh = int(r["shares"] or 0)
+        m = effective_upload_metrics(r, shortform_only=True)
+        v = int(m["views"] or 0)
+        lk = int(m["likes"] or 0)
+        cm = int(m["comments"] or 0)
+        sh = int(m["shares"] or 0)
         bucket["views_sum"] += max(v, 0)
         bucket["likes_sum"] += lk
         bucket["comments_sum"] += cm
         er = _engagement_rate_pct(v, lk, cm, sh)
+        if er is None and v > 0:
+            er = engagement_rate_pct(v, lk, cm, sh)
         if er is not None:
             bucket["er_sum"] += er
             bucket["er_n"] += 1

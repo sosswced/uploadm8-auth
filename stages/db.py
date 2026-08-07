@@ -224,6 +224,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "thumbnailApplyMode": "thumbnail_apply_mode",
                         "thumbnailRefPersonaMode": "thumbnail_ref_persona_mode",
                         "thumbnailStudioDefaultStrategy": "thumbnail_studio_default_strategy",
+                        "sponsorWatermarkOptIn": "sponsor_watermark_opt_in",
                         "aiServiceTelemetry": "ai_service_telemetry",
                         "aiServiceDashcamOSD": "ai_service_dashcam_osd",
                         "aiServiceAudioSignals": "ai_service_audio_signals",
@@ -1942,8 +1943,13 @@ async def update_publish_attempt_verified(
     attempt_id: str,
     verify_status: str,
     platform_url: Optional[str] = None,
+    platform_post_id: Optional[str] = None,
 ):
-    """Update verification status of a publish attempt (Step B)."""
+    """Update verification status of a publish attempt (Step B).
+
+    When TikTok status/fetch returns a real ``video_id``, pass it as
+    ``platform_post_id`` so ledger-based analytics / reconcile can attach metrics.
+    """
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1951,6 +1957,7 @@ async def update_publish_attempt_verified(
                 UPDATE publish_attempts
                 SET verify_status = $2,
                     platform_url = COALESCE($3, platform_url),
+                    platform_post_id = COALESCE($4, platform_post_id),
                     verified_at = NOW(),
                     updated_at = NOW()
                 WHERE id = $1
@@ -1958,6 +1965,7 @@ async def update_publish_attempt_verified(
                 attempt_id,
                 verify_status,
                 platform_url,
+                platform_post_id,
             )
     except Exception as e:
         logger.warning(f"update_publish_attempt_verified failed: {e}")
@@ -2020,13 +2028,19 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
         return None
 
 
-# ── Free-tier video watermark (drawtext) ───────────────────────────────────
+# ── Free-tier video watermark (drawtext + optional logo overlay) ───────────
 DEFAULT_WATERMARK_BURN_TEXT = "Upload M8"
 DEFAULT_WATERMARK_SIZE_SCALE = 100
 DEFAULT_WATERMARK_OPACITY = 0.85
 DEFAULT_WATERMARK_POSITION = "bottom-right"
 DEFAULT_WATERMARK_TEXT_COLOR = "#ffffff"
 DEFAULT_WATERMARK_FONT_WEIGHT = "bold"
+DEFAULT_WATERMARK_FONT_FAMILY = "dejavu"
+DEFAULT_WATERMARK_MODE = "text"  # text | logo | both
+DEFAULT_WATERMARK_LOGO_SIZE_SCALE = 100
+DEFAULT_WATERMARK_LOGO_OPACITY = 0.9
+DEFAULT_WATERMARK_SPONSORED_PREFIX = False
+DEFAULT_WATERMARK_SPONSORED_PREFIX_TEXT = "Sponsored by"
 WATERMARK_POSITIONS = frozenset({
     "top-left",
     "top-center",
@@ -2035,6 +2049,8 @@ WATERMARK_POSITIONS = frozenset({
     "bottom-center",
     "bottom-right",
 })
+WATERMARK_FONT_FAMILIES = frozenset({"dejavu", "liberation", "arial"})
+WATERMARK_MODES = frozenset({"text", "logo", "both"})
 
 
 def sanitize_watermark_burn_text(raw: Any) -> str:
@@ -2095,9 +2111,68 @@ def sanitize_watermark_font_weight(raw: Any) -> str:
     return "bold"
 
 
+def sanitize_watermark_font_family(raw: Any) -> str:
+    fam = str(raw or "").strip().lower()
+    if fam in WATERMARK_FONT_FAMILIES:
+        return fam
+    return DEFAULT_WATERMARK_FONT_FAMILY
+
+
+def sanitize_watermark_mode(raw: Any) -> str:
+    mode = str(raw or "").strip().lower()
+    if mode in WATERMARK_MODES:
+        return mode
+    return DEFAULT_WATERMARK_MODE
+
+
+def sanitize_watermark_logo_r2_key(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # Only allow our watermark logo prefix (no path traversal / arbitrary keys).
+    if ".." in s or s.startswith("/"):
+        return ""
+    if not (s.startswith("watermarks/") or s.startswith("white-label/")):
+        return ""
+    return s[:512]
+
+
+def sanitize_watermark_sponsored_prefix(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw or "").strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
+def sanitize_watermark_sponsored_prefix_text(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return DEFAULT_WATERMARK_SPONSORED_PREFIX_TEXT
+    s = " ".join(s.split())
+    return (s[:40].rstrip() or DEFAULT_WATERMARK_SPONSORED_PREFIX_TEXT)
+
+
 def normalize_watermark_settings(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Merge partial admin/worker watermark settings with safe defaults."""
     src = raw or {}
+    text_pos = sanitize_watermark_position(
+        src.get(
+            "text_position",
+            src.get("watermark_text_position", src.get("position", src.get("watermark_position"))),
+        )
+    )
+    logo_pos = sanitize_watermark_position(
+        src.get(
+            "logo_position",
+            src.get("watermark_logo_position", text_pos),
+        )
+    )
+    logo_key = sanitize_watermark_logo_r2_key(
+        src.get("logo_r2_key", src.get("watermark_logo_r2_key"))
+    )
+    mode = sanitize_watermark_mode(src.get("mode", src.get("watermark_mode")))
+    if mode in ("logo", "both") and not logo_key:
+        mode = "text"
     return {
         "text": sanitize_watermark_burn_text(src.get("text", src.get("watermark_burn_text"))),
         "size_scale": sanitize_watermark_size_scale(
@@ -2106,14 +2181,34 @@ def normalize_watermark_settings(raw: Optional[Dict[str, Any]] = None) -> Dict[s
         "opacity": sanitize_watermark_opacity(
             src.get("opacity", src.get("watermark_opacity"))
         ),
-        "position": sanitize_watermark_position(
-            src.get("position", src.get("watermark_position"))
-        ),
+        "position": text_pos,  # backward-compat alias for text position
+        "text_position": text_pos,
         "text_color": sanitize_watermark_text_color(
             src.get("text_color", src.get("watermark_text_color"))
         ),
         "font_weight": sanitize_watermark_font_weight(
             src.get("font_weight", src.get("watermark_font_weight"))
+        ),
+        "font_family": sanitize_watermark_font_family(
+            src.get("font_family", src.get("watermark_font_family"))
+        ),
+        "mode": mode,
+        "logo_r2_key": logo_key,
+        "logo_position": logo_pos,
+        "logo_size_scale": sanitize_watermark_size_scale(
+            src.get("logo_size_scale", src.get("watermark_logo_size_scale", DEFAULT_WATERMARK_LOGO_SIZE_SCALE))
+        ),
+        "logo_opacity": sanitize_watermark_opacity(
+            src.get("logo_opacity", src.get("watermark_logo_opacity", DEFAULT_WATERMARK_LOGO_OPACITY))
+        ),
+        "sponsored_prefix": sanitize_watermark_sponsored_prefix(
+            src.get("sponsored_prefix", src.get("watermark_sponsored_prefix", DEFAULT_WATERMARK_SPONSORED_PREFIX))
+        ),
+        "sponsored_prefix_text": sanitize_watermark_sponsored_prefix_text(
+            src.get(
+                "sponsored_prefix_text",
+                src.get("watermark_sponsored_prefix_text", DEFAULT_WATERMARK_SPONSORED_PREFIX_TEXT),
+            )
         ),
     }
 

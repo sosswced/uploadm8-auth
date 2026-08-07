@@ -35,7 +35,7 @@ from services.trill_vehicle_filter import build_trill_vehicle_filter
 from services.trill_access import TRILL_SCORED_PREDICATE
 from services.uploads_handlers import fetch_user_uploads_list
 from services.white_label import company_slug, load_effective_brand_context
-from services.tiktok_api import tiktok_video_list_url
+from services.tiktok_api import tiktok_video_list_url, tiktok_envelope_error
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -83,24 +83,73 @@ _PLATFORM_CACHE_TTL = 3 * 60 * 60  # 3 hours
 # ============================================================
 
 async def _fetch_tiktok_metrics(access_token: str) -> dict:
-    """TikTok Content API — video list totals + follower stats (requires video.list + user.info.stats)."""
+    """TikTok Content API — video list totals + follower stats (requires video.list + user.info.stats).
+
+    Paginates ``/v2/video/list/`` (public videos only) and fails closed on envelope/scope errors
+    so dashboard pills do not show false ``live`` zeros.
+    """
     if not access_token:
         return {"status": "not_connected"}
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            # 1) Video list (requires video.list)
-            resp = await client.post(
-                tiktok_video_list_url(),
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                # TikTok requires fields in the query string, not the JSON body.
-                json={"max_count": 20},
-            )
-            if resp.status_code != 200:
-                logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
-                return {"status": "error", "error": f"video_list_http_{resp.status_code}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            videos: list = []
+            cursor = None
+            pages = 0
+            max_pages = 25  # 25 * 20 = up to 500 public videos for account rollups
 
-            videos = (resp.json().get("data", {}) or {}).get("videos", []) or []
+            while pages < max_pages:
+                body: dict = {"max_count": 20}
+                if cursor is not None:
+                    body["cursor"] = cursor
+                resp = await client.post(
+                    tiktok_video_list_url(),
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "TikTok video list HTTP %s: %s",
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+                    if pages == 0:
+                        return {
+                            "status": "error",
+                            "error": f"video_list_http_{resp.status_code}",
+                        }
+                    break
+
+                payload = resp.json() if resp.content else {}
+                env_err = tiktok_envelope_error(payload)
+                if env_err:
+                    logger.warning("TikTok video list envelope: %s", env_err)
+                    if pages == 0:
+                        err_l = str(env_err).lower()
+                        status = (
+                            "scope_missing"
+                            if "scope" in err_l or "authorized" in err_l
+                            else "error"
+                        )
+                        return {"status": status, "error": env_err}
+                    break
+
+                data = (payload.get("data") or {}) if isinstance(payload, dict) else {}
+                batch = data.get("videos") or []
+                if isinstance(batch, list):
+                    videos.extend(batch)
+                has_more = bool(data.get("has_more"))
+                next_cur = data.get("cursor")
+                pages += 1
+                if not has_more or next_cur is None:
+                    break
+                try:
+                    cursor = int(next_cur)
+                except (TypeError, ValueError):
+                    break
 
             def _i(v):
                 try:
@@ -108,15 +157,14 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 except Exception:
                     return 0
 
-            views    = sum(_i(v.get("view_count"))    for v in videos)
-            likes    = sum(_i(v.get("like_count"))    for v in videos)
+            views = sum(_i(v.get("view_count")) for v in videos)
+            likes = sum(_i(v.get("like_count")) for v in videos)
             comments = sum(_i(v.get("comment_count")) for v in videos)
-            shares   = sum(_i(v.get("share_count"))   for v in videos)
+            shares = sum(_i(v.get("share_count")) for v in videos)
 
-            durs      = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
+            durs = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
             avg_watch = round(sum(durs) / len(durs), 1) if durs else None
 
-            # 2) User info stats (requires user.info.stats scope)
             followers = following = total_likes = video_count = None
             ui = await client.get(
                 "https://open.tiktokapis.com/v2/user/info/",
@@ -124,26 +172,40 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if ui.status_code == 200:
-                user_obj    = ((ui.json().get("data", {}) or {}).get("user", {}) or {})
-                followers   = user_obj.get("follower_count")
-                following   = user_obj.get("following_count")
-                total_likes = user_obj.get("likes_count")
-                video_count = user_obj.get("video_count")
+                ui_payload = ui.json() if ui.content else {}
+                ui_err = tiktok_envelope_error(ui_payload)
+                if ui_err:
+                    logger.warning("TikTok user.info envelope: %s", ui_err)
+                else:
+                    user_obj = ((ui_payload.get("data", {}) or {}).get("user", {}) or {})
+                    followers = user_obj.get("follower_count")
+                    following = user_obj.get("following_count")
+                    total_likes = user_obj.get("likes_count")
+                    video_count = user_obj.get("video_count")
             else:
-                logger.warning(f"TikTok user.info.stats HTTP {ui.status_code}: {ui.text[:200]}")
+                logger.warning(
+                    "TikTok user.info.stats HTTP %s: %s",
+                    ui.status_code,
+                    ui.text[:200],
+                )
 
             return {
                 "status": "live",
                 "analytics_source": "video.list+user.info.stats",
-                "followers":   _i(followers)   if followers   is not None else None,
-                "following":   _i(following)   if following   is not None else None,
+                "followers": _i(followers) if followers is not None else None,
+                "following": _i(following) if following is not None else None,
                 "total_likes": _i(total_likes) if total_likes is not None else None,
                 "video_count": _i(video_count) if video_count is not None else len(videos),
-                "views":    views,
-                "likes":    likes,
+                "views": views,
+                "likes": likes,
                 "comments": comments,
-                "shares":   shares,
+                "shares": shares,
                 "avg_watch_seconds": avg_watch,
+                "videos_sampled": len(videos),
+                "note": (
+                    "video.list returns public TikTok videos only; "
+                    "Only-me posts need per-upload video.query after verify stamps platform_video_id"
+                ),
             }
 
     except Exception as e:
@@ -1125,6 +1187,17 @@ async def analytics_top_content(
         since=since,
         slim=True,
     )
+    if isinstance(items, list):
+        # Slim path merges platform_results engagement after SQL ORDER BY columns;
+        # re-rank so Top Performing reflects TikTok/YouTube/Meta PR metrics.
+        items.sort(
+            key=lambda x: (
+                int((x or {}).get("views") or 0),
+                int((x or {}).get("likes") or 0),
+                int((x or {}).get("comments") or 0),
+            ),
+            reverse=True,
+        )
     return {"items": items if isinstance(items, list) else []}
 
 

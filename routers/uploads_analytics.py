@@ -28,6 +28,101 @@ router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 _sync_analytics_running: set[str] = set()
 
 
+async def _upsert_pci_metrics_from_platform_results(
+    conn: asyncpg.Connection,
+    *,
+    user_id: str,
+    upload_id: str,
+    pr_list: List[dict],
+    published_at=None,
+) -> int:
+    """
+    Write sync-analytics engagement into platform_content_items (GREATEST).
+
+    Catalog cards / Top Performing (catalog toggle) read PCI; without this bridge
+    LIVE API and uploads columns can look healthy while catalog stays at 0.
+    """
+    from services.content_success_features import entry_metrics, entry_successful
+
+    n = 0
+    for pr in pr_list or []:
+        if not isinstance(pr, dict) or not entry_successful(pr):
+            continue
+        plat = str(pr.get("platform") or "").strip().lower()
+        if plat not in ("tiktok", "youtube", "instagram", "facebook"):
+            continue
+        vid = str(
+            pr.get("platform_video_id")
+            or pr.get("video_id")
+            or pr.get("videoId")
+            or pr.get("media_id")
+            or pr.get("post_id")
+            or ""
+        ).strip()
+        if not vid:
+            continue
+        account_id = str(
+            pr.get("account_id")
+            or pr.get("open_id")
+            or pr.get("page_id")
+            or pr.get("ig_user_id")
+            or ""
+        ).strip()
+        if not account_id:
+            # Prefer linked token row account when present.
+            account_id = str(pr.get("token_account_id") or "").strip()
+        if not account_id:
+            continue
+        m = entry_metrics(pr, plat)
+        if (m["views"] + m["likes"] + m["comments"] + m["shares"]) <= 0:
+            continue
+        try:
+            await conn.execute(
+                """
+                INSERT INTO platform_content_items
+                    (user_id, platform, account_id, platform_video_id,
+                     upload_id, source, published_at,
+                     views, likes, comments, shares, metrics_synced_at, updated_at)
+                VALUES (
+                    $1::uuid, $2, $3, $4,
+                    $5::uuid, 'uploadm8', COALESCE($6::timestamptz, NOW()),
+                    $7, $8, $9, $10, NOW(), NOW()
+                )
+                ON CONFLICT (user_id, platform, account_id, platform_video_id) DO UPDATE SET
+                    upload_id = COALESCE(EXCLUDED.upload_id, platform_content_items.upload_id),
+                    source = CASE
+                        WHEN platform_content_items.source = 'external' THEN 'linked'
+                        ELSE COALESCE(platform_content_items.source, 'uploadm8')
+                    END,
+                    views = GREATEST(COALESCE(platform_content_items.views, 0), EXCLUDED.views),
+                    likes = GREATEST(COALESCE(platform_content_items.likes, 0), EXCLUDED.likes),
+                    comments = GREATEST(COALESCE(platform_content_items.comments, 0), EXCLUDED.comments),
+                    shares = GREATEST(COALESCE(platform_content_items.shares, 0), EXCLUDED.shares),
+                    metrics_synced_at = NOW(),
+                    updated_at = NOW()
+                """,
+                user_id,
+                plat,
+                account_id,
+                vid,
+                upload_id,
+                published_at,
+                int(m["views"]),
+                int(m["likes"]),
+                int(m["comments"]),
+                int(m["shares"]),
+            )
+            n += 1
+        except Exception as e:
+            logger.debug(
+                "pci metrics upsert skipped upload=%s plat=%s: %s",
+                upload_id[:8] if upload_id else "",
+                plat,
+                e,
+            )
+    return n
+
+
 async def _fetch_platform_video_engagement(
     client: httpx.AsyncClient,
     plat: str,
@@ -358,6 +453,16 @@ async def _sync_upload_analytics_core(
                 upload_id,
                 user["id"],
             )
+
+        # Mirror per-platform stats into platform_content_items so catalog /
+        # Top Performing (catalog mode) / aggregate cards leave zero when PR has data.
+        await _upsert_pci_metrics_from_platform_results(
+            conn,
+            user_id=str(user["id"]),
+            upload_id=str(upload_id),
+            pr_list=pr_list,
+            published_at=None,
+        )
 
     if not rows_with_video_id:
         return {

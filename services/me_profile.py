@@ -196,6 +196,11 @@ async def apply_settings_profile_update(
         updates.append(f"{_safe_col('name', USERS_UPDATE_COLUMNS_PROFILE)} = ${len(params) + 1}")
         params.append(full_name)
 
+    if data.timezone is not None:
+        tz = (data.timezone or "").strip() or "UTC"
+        updates.append(f"{_safe_col('timezone', USERS_UPDATE_COLUMNS_PROFILE)} = ${len(params) + 1}")
+        params.append(tz)
+
     if not updates:
         return False, "No changes made"
 

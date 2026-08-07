@@ -38,6 +38,40 @@ TIKTOK_WEBHOOK_REPLAY_WINDOW_SEC = 300   # reject events older than 5 minutes
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = os.environ.get("FACEBOOK_WEBHOOK_VERIFY_TOKEN", "")
 
 
+def _tiktok_webhook_pr_targets(pr_list, share_id: str) -> list:
+    """
+    TikTok platform_results rows this webhook may mutate.
+
+    Prefer exact ``publish_id`` == share_id. Otherwise at most one awaiting row
+    (no video_id yet, empty or matching publish_id). Never patch sibling TikTok
+    accounts after the first match.
+    """
+    if not isinstance(pr_list, list):
+        return []
+    tiktoks = [
+        i
+        for i in pr_list
+        if isinstance(i, dict) and str(i.get("platform") or "").strip().lower() == "tiktok"
+    ]
+    if not tiktoks:
+        return []
+    share = str(share_id or "").strip()
+    if share:
+        by_pub = [i for i in tiktoks if str(i.get("publish_id") or "").strip() == share]
+        if by_pub:
+            return by_pub
+    awaiting = []
+    for i in tiktoks:
+        has_vid = bool(str(i.get("platform_video_id") or i.get("video_id") or "").strip())
+        if has_vid:
+            continue
+        pub = str(i.get("publish_id") or "").strip()
+        if share and pub and pub != share:
+            continue
+        awaiting.append(i)
+    return awaiting[:1]
+
+
 def _verify_tiktok_signature(raw_body: bytes, header: str, secret: str) -> tuple[bool, str]:
     """
     Parse and verify the Tiktok-Signature header.
@@ -133,26 +167,90 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                 )
 
                 if upload:
-                    existing = _safe_json(upload["platform_results"], {})
-                    existing["tiktok"] = {
-                        "status": "published",
-                        "video_id": video_id,
-                        "share_id": share_id,
-                        "published_at": _now_utc().isoformat(),
-                    }
+                    # Pipeline stores platform_results as a list of per-platform objects.
+                    # Patch matching TikTok rows in-place; never replace with a {"tiktok": ...} dict.
+                    existing = _safe_json(upload["platform_results"], [])
+                    if isinstance(existing, dict):
+                        # Legacy/corrupt shape — convert known tiktok dict into a list entry.
+                        legacy = existing.get("tiktok") if isinstance(existing.get("tiktok"), dict) else None
+                        existing = [legacy] if legacy else []
+                    if not isinstance(existing, list):
+                        existing = []
+
+                    vid = str(video_id or "").strip()
+                    share = str(share_id or "").strip()
+                    targets = _tiktok_webhook_pr_targets(existing, share)
+                    for item in targets:
+                        if vid:
+                            item["platform_video_id"] = vid
+                            item["video_id"] = vid
+                        if share:
+                            item["publish_id"] = item.get("publish_id") or share
+                        item["status"] = "published"
+                        item["success"] = True
+                        item["verify_status"] = "confirmed"
+                        item["published_at"] = _now_utc().isoformat()
+                    if not targets and vid:
+                        existing.append(
+                            {
+                                "platform": "tiktok",
+                                "success": True,
+                                "status": "published",
+                                "verify_status": "confirmed",
+                                "platform_video_id": vid,
+                                "video_id": vid,
+                                "publish_id": share or None,
+                                "published_at": _now_utc().isoformat(),
+                            }
+                        )
+
                     await conn.execute(
                         """
                         UPDATE uploads
-                        SET status           = 'completed',
-                            completed_at     = NOW(),
-                            platform_results = $1,
+                        SET platform_results = $1::jsonb,
                             updated_at       = NOW()
                         WHERE id = $2
                         """,
                         json.dumps(existing),
                         upload["id"],
                     )
-                    notes += f" upload={upload['id']} marked=completed video_id={video_id}"
+                    # Stamp only the matching ledger attempt (by publish_id), or
+                    # the single most recent empty TikTok attempt when share is unknown.
+                    if vid:
+                        await conn.execute(
+                            """
+                            UPDATE publish_attempts
+                            SET platform_post_id = COALESCE(platform_post_id, $1),
+                                verify_status = CASE
+                                    WHEN verify_status IS NULL OR verify_status IN ('pending', 'unknown')
+                                    THEN 'confirmed'
+                                    ELSE verify_status
+                                END,
+                                verified_at = COALESCE(verified_at, NOW()),
+                                updated_at = NOW()
+                            WHERE id = (
+                                SELECT id
+                                  FROM publish_attempts
+                                 WHERE upload_id = $2
+                                   AND platform = 'tiktok'
+                                   AND (
+                                        ($3 <> '' AND publish_id = $3)
+                                     OR (
+                                        $3 = ''
+                                        AND (platform_post_id IS NULL OR platform_post_id = '')
+                                     )
+                                   )
+                                 ORDER BY
+                                   CASE WHEN $3 <> '' AND publish_id = $3 THEN 0 ELSE 1 END,
+                                   created_at DESC NULLS LAST
+                                 LIMIT 1
+                            )
+                            """,
+                            vid,
+                            upload["id"],
+                            share,
+                        )
+                    notes += f" upload={upload['id']} patched=platform_results video_id={video_id}"
                 else:
                     notes += f" no-matching-upload-found openid={user_openid}"
 
@@ -185,19 +283,39 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                 )
 
                 if upload:
-                    existing = _safe_json(upload["platform_results"], {})
-                    existing["tiktok"] = {
-                        "status": "failed",
-                        "share_id": share_id,
-                        "failed_at": _now_utc().isoformat(),
-                    }
+                    existing = _safe_json(upload["platform_results"], [])
+                    if isinstance(existing, dict):
+                        legacy = existing.get("tiktok") if isinstance(existing.get("tiktok"), dict) else None
+                        existing = [legacy] if legacy else []
+                    if not isinstance(existing, list):
+                        existing = []
+                    share = str(share_id or "").strip()
+                    targets = _tiktok_webhook_pr_targets(existing, share)
+                    for item in targets:
+                        item["status"] = "failed"
+                        item["success"] = False
+                        item["error_code"] = "tiktok_upload_failed"
+                        item["failed_at"] = _now_utc().isoformat()
+                        if share:
+                            item["publish_id"] = item.get("publish_id") or share
+                    if not targets:
+                        existing.append(
+                            {
+                                "platform": "tiktok",
+                                "success": False,
+                                "status": "failed",
+                                "publish_id": share or None,
+                                "error_code": "tiktok_upload_failed",
+                                "failed_at": _now_utc().isoformat(),
+                            }
+                        )
                     await conn.execute(
                         """
                         UPDATE uploads
                         SET status           = 'failed',
                             error_code       = 'tiktok_upload_failed',
                             error_detail     = 'TikTok reported upload failure via webhook',
-                            platform_results = $1,
+                            platform_results = $1::jsonb,
                             updated_at       = NOW()
                         WHERE id = $2
                         """,

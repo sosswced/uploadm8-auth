@@ -1,12 +1,26 @@
-# TikTok Content Posting API — audit submission kit
+# TikTok Content Posting API — Direct Post (audited)
 
-Use this when resubmitting UploadM8 for TikTok Direct Post audit.
+UploadM8 publishes via TikTok **Content Posting API Direct Post**
+(`POST /v2/post/publish/video/init/` + `FILE_UPLOAD` chunks). This is not Share Kit
+or inbox-draft upload mode.
 
-## App description (paste into TikTok Developer Portal)
+## Production enablement (after TikTok approval)
+
+Set on **both** API and worker processes:
+
+| Variable | Value | Effect |
+|----------|-------|--------|
+| `TIKTOK_APP_AUDITED` | `1` | Public Direct Post — honors user privacy (Everyone / Friends / Followers / Only me) |
+| `TIKTOK_FORCE_PRIVATE_UNAUDITED` | unset | Do not set unless rolling back to private-only |
+
+Without `TIKTOK_APP_AUDITED=1`, the worker clamps privacy to `SELF_ONLY` and the Upload
+UI disables other visibility options (TikTok unaudited-client rule).
+
+## App description (Developer Portal)
 
 UploadM8 is a multi-platform video publishing workspace for creators and agencies. Users upload a video once, configure captions and thumbnails, and publish to TikTok, YouTube, Instagram, and Facebook.
 
-For TikTok, UploadM8 implements the required Content Posting export UX: we call `/v2/post/publish/creator_info/query/` before every post, display the creator avatar and username, let the user manually select privacy from `privacy_level_options` (no default), configure Comment/Duet/Stitch (off by default), complete commercial content disclosure when applicable, and confirm consent with TikTok's Music Usage Confirmation before publishing. While our app is pending audit, posts publish as **Only me (private)** and users are informed in-app before they upload.
+For TikTok, UploadM8 implements the required Content Posting export UX: we call `/v2/post/publish/creator_info/query/` before every post, display the creator avatar and username, let the user manually select privacy from `privacy_level_options` (no default), configure Comment/Duet/Stitch (off by default), complete commercial content disclosure when applicable, and confirm consent with TikTok's Music Usage Confirmation before publishing. With Content Posting API audit approved, Direct Post publishes at the visibility the user selects.
 
 Live app: https://app.uploadm8.com  
 Privacy policy: https://app.uploadm8.com/privacy.html  
@@ -27,43 +41,25 @@ Support: https://app.uploadm8.com/support.html
 
 Requires `META_APP_SECRET` set in production. After deploy, reconnect Facebook/Instagram once so tokens store the Meta user ASID for reliable callback matching.
 
-## Demo video shot list (2–3 minutes)
+## Smoke test after enabling audited mode
 
-1. Sign in at https://app.uploadm8.com/login.html
-2. Open **Upload** → select a short test video
-3. Check **TikTok** → **Post to TikTok** panel appears
-4. Show **audit banner** (private-only until audit passes)
-5. Show **creator avatar + @username** loaded from creator_info API
-6. **Manually select** visibility (e.g. Everyone) — no pre-selected default
-7. Show interaction toggles (Comment/Duet/Stitch) **unchecked by default**
-8. Optionally toggle **Disclose commercial content** → select **Your brand** or **Branded content** → show label prompts
-9. Check **consent** with Music Usage Confirmation link visible
-10. Click **Upload & Publish** → show queue processing
-11. On TikTok app/profile, show post as **Only me** (expected while unaudited)
-12. Narrate: "User chose visibility X; app posts private until audit; user was notified before upload."
+1. Sign in → Upload → select short video → TikTok account
+2. Confirm green **Direct Post enabled** banner (not the yellow audit lock banner)
+3. Select **Everyone** (or Friends/Followers) — option must be enabled
+4. Consent + Upload & Publish
+5. On TikTok profile, confirm post is public (not Only me / Inbox-only)
 
-## Environment (production)
+## Rollback
 
-| Variable | Before audit | After TikTok approves |
-|----------|--------------|------------------------|
-| `TIKTOK_APP_AUDITED` | unset or `0` | `1` |
+```
+TIKTOK_FORCE_PRIVATE_UNAUDITED=1
+```
 
-Do **not** set `TIKTOK_APP_AUDITED=1` until TikTok confirms audit pass.
+or unset `TIKTOK_APP_AUDITED`. Restart API + worker.
 
-## Reviewer test account
+## Reviewer / compliance notes
 
-Provide a test login or clear signup path. Reviewers expect:
-
-- Working signup/login
-- TikTok OAuth connect on **Connected Accounts**
-- Upload flow with Post to TikTok panel
-- Public privacy policy and data deletion URLs reachable without login
-
-## Common rejection causes (avoid)
-
-- Privacy dropdown pre-selected to Public
-- No creator_info call before export UI
-- No consent / Music Usage Confirmation before publish
-- Silent override of user privacy without in-app notice
-- Publishing to TikTok without export settings (API-only path)
-- Demo video skips the Post to TikTok panel
+- Privacy dropdown must not pre-select Public (except unaudited Only-me default)
+- creator_info before export UI
+- Music Usage Confirmation + consent before publish
+- No silent privacy override without in-app notice when clamped

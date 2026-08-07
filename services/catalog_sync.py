@@ -1057,7 +1057,8 @@ async def _link_uploads_for_user_token(
     """
     rows = await conn.fetch(
         """
-        SELECT id, platform_results, title, thumbnail_r2_key, created_at
+        SELECT id, platform_results, title, thumbnail_r2_key, created_at,
+               platforms, views, likes, comments, shares
         FROM uploads
         WHERE user_id = $1
           AND status IN ('completed', 'succeeded', 'partial')
@@ -1119,22 +1120,67 @@ async def _link_uploads_for_user_token(
 
             # If no external row exists yet, insert as 'uploadm8' sourced
             pub_at = row["created_at"]
+            # Seed engagement from upload columns / per-platform PR so catalog
+            # cards are not stuck at 0 until the next list-API upsert.
+            seed_views = seed_likes = seed_comments = seed_shares = 0
+            try:
+                from services.content_success_features import entry_metrics, entry_successful
+                from services.upload_engagement import normalize_upload_platform_results_list
+
+                for e in normalize_upload_platform_results_list(pr):
+                    if not isinstance(e, dict) or not entry_successful(e):
+                        continue
+                    if str(e.get("platform") or "").strip().lower() != platform:
+                        continue
+                    ev = str(
+                        e.get("platform_video_id")
+                        or e.get("video_id")
+                        or e.get("media_id")
+                        or e.get("post_id")
+                        or ""
+                    ).strip()
+                    if ev and ev != vid_id:
+                        continue
+                    m = entry_metrics(e, platform)
+                    seed_views = max(seed_views, int(m["views"]))
+                    seed_likes = max(seed_likes, int(m["likes"]))
+                    seed_comments = max(seed_comments, int(m["comments"]))
+                    seed_shares = max(seed_shares, int(m["shares"]))
+                if seed_views + seed_likes + seed_comments + seed_shares <= 0:
+                    # Single-platform upload: columns are safe to seed.
+                    plats = row.get("platforms") or []
+                    if isinstance(plats, str):
+                        plats = [plats]
+                    plat_list = [str(p).strip().lower() for p in plats if str(p).strip()]
+                    if len(plat_list) == 1 and plat_list[0] == platform:
+                        seed_views = int(row.get("views") or 0)
+                        seed_likes = int(row.get("likes") or 0)
+                        seed_comments = int(row.get("comments") or 0)
+                        seed_shares = int(row.get("shares") or 0)
+            except Exception:
+                pass
             try:
                 await conn.execute(
                     """
                     INSERT INTO platform_content_items
                         (user_id, platform, account_id, platform_video_id,
-                         upload_id, source, published_at, updated_at)
-                    VALUES ($1,$2,$3,$4, $5,'uploadm8',$6,NOW())
+                         upload_id, source, published_at,
+                         views, likes, comments, shares, updated_at)
+                    VALUES ($1,$2,$3,$4, $5,'uploadm8',$6, $7,$8,$9,$10, NOW())
                     ON CONFLICT (user_id, platform, account_id, platform_video_id) DO UPDATE SET
                         upload_id  = EXCLUDED.upload_id,
                         source     = CASE
                             WHEN platform_content_items.source = 'external' THEN 'linked'
                             ELSE 'uploadm8' END,
+                        views = GREATEST(COALESCE(platform_content_items.views, 0), EXCLUDED.views),
+                        likes = GREATEST(COALESCE(platform_content_items.likes, 0), EXCLUDED.likes),
+                        comments = GREATEST(COALESCE(platform_content_items.comments, 0), EXCLUDED.comments),
+                        shares = GREATEST(COALESCE(platform_content_items.shares, 0), EXCLUDED.shares),
                         updated_at = NOW()
                     """,
                     user_id, platform, account_id, vid_id,
                     upload_id, pub_at,
+                    seed_views, seed_likes, seed_comments, seed_shares,
                 )
                 linked += 1
             except Exception as e:
@@ -1362,34 +1408,73 @@ async def get_catalog_aggregate(
 
     where = " AND ".join(conditions)
 
-    _merge_views = """CASE
-        WHEN u.id IS NULL THEN COALESCE(pci.views,0)::bigint
-        WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-          OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-        THEN GREATEST(COALESCE(pci.views,0), COALESCE(u.views,0))::bigint
-        ELSE COALESCE(pci.views,0)::bigint
-    END"""
-    _merge_likes = """CASE
-        WHEN u.id IS NULL THEN COALESCE(pci.likes,0)::bigint
-        WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-          OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-        THEN GREATEST(COALESCE(pci.likes,0), COALESCE(u.likes,0))::bigint
-        ELSE COALESCE(pci.likes,0)::bigint
-    END"""
-    _merge_comments = """CASE
-        WHEN u.id IS NULL THEN COALESCE(pci.comments,0)::bigint
-        WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-          OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-        THEN GREATEST(COALESCE(pci.comments,0), COALESCE(u.comments,0))::bigint
-        ELSE COALESCE(pci.comments,0)::bigint
-    END"""
-    _merge_shares = """CASE
-        WHEN u.id IS NULL THEN COALESCE(pci.shares,0)::bigint
-        WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-          OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-        THEN GREATEST(COALESCE(pci.shares,0), COALESCE(u.shares,0))::bigint
-        ELSE COALESCE(pci.shares,0)::bigint
-    END"""
+    # Per-platform metrics from uploads.platform_results (multi-platform safe).
+    _pr_metric = lambda col, alts: f"""COALESCE((
+        SELECT GREATEST(
+            COALESCE(NULLIF(elem->>'{col}', '')::bigint, 0),
+            {", ".join(f"COALESCE(NULLIF(elem->>'{a}', '')::bigint, 0)" for a in alts)}
+        )
+        FROM jsonb_array_elements(
+            CASE
+                WHEN u.platform_results IS NULL THEN '[]'::jsonb
+                WHEN jsonb_typeof(u.platform_results) = 'array' THEN u.platform_results
+                ELSE '[]'::jsonb
+            END
+        ) AS elem
+        WHERE lower(trim(COALESCE(elem->>'platform', ''))) = lower(trim(pci.platform::text))
+        ORDER BY 1 DESC NULLS LAST
+        LIMIT 1
+    ), 0)"""
+
+    _pr_views = _pr_metric("views", ("view_count", "play_count", "impressions", "video_views"))
+    _pr_likes = _pr_metric("likes", ("like_count", "reactions", "reaction_count"))
+    _pr_comments = _pr_metric("comments", ("comment_count",))
+    _pr_shares = _pr_metric("shares", ("share_count",))
+
+    _merge_views = f"""GREATEST(
+        COALESCE(pci.views,0)::bigint,
+        {_pr_views}::bigint,
+        CASE
+            WHEN u.id IS NULL THEN 0
+            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
+              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
+            THEN COALESCE(u.views,0)::bigint
+            ELSE 0
+        END
+    )"""
+    _merge_likes = f"""GREATEST(
+        COALESCE(pci.likes,0)::bigint,
+        {_pr_likes}::bigint,
+        CASE
+            WHEN u.id IS NULL THEN 0
+            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
+              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
+            THEN COALESCE(u.likes,0)::bigint
+            ELSE 0
+        END
+    )"""
+    _merge_comments = f"""GREATEST(
+        COALESCE(pci.comments,0)::bigint,
+        {_pr_comments}::bigint,
+        CASE
+            WHEN u.id IS NULL THEN 0
+            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
+              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
+            THEN COALESCE(u.comments,0)::bigint
+            ELSE 0
+        END
+    )"""
+    _merge_shares = f"""GREATEST(
+        COALESCE(pci.shares,0)::bigint,
+        {_pr_shares}::bigint,
+        CASE
+            WHEN u.id IS NULL THEN 0
+            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
+              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
+            THEN COALESCE(u.shares,0)::bigint
+            ELSE 0
+        END
+    )"""
     _from = """
         platform_content_items pci
         LEFT JOIN uploads u ON u.id = pci.upload_id AND u.user_id = pci.user_id

@@ -1480,11 +1480,23 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
 
-            # Free tier: burn-in settings from admin_settings (master-editable), DB each job.
-            if ent.can_watermark:
+            # Free tier burn-in, or paid opt-in for UploadM8 sponsorship branding.
+            us = ctx.user_settings if isinstance(ctx.user_settings, dict) else {}
+            opt_in = bool(us.get("sponsorWatermarkOptIn") or us.get("sponsor_watermark_opt_in"))
+            apply_wm = bool(ent.can_watermark) or opt_in
+            ctx.apply_watermark = apply_wm
+            if apply_wm:
+                from stages.watermark_stage import (
+                    format_watermark_display_text,
+                    watermark_requires_logo_prepass,
+                )
+
                 wm_settings = await db_stage.load_watermark_settings(db_pool)
                 ctx.watermark_settings = wm_settings
-                ctx.watermark_text = wm_settings["text"]
+                ctx.watermark_text = format_watermark_display_text(wm_settings)
+                # Logo overlay cannot use text-only single-pass; force dedicated watermark pass.
+                if watermark_requires_logo_prepass(wm_settings):
+                    setattr(ctx, "watermark_single_pass", False)
 
             # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
@@ -1686,7 +1698,34 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
 
-            if not WATERMARK_SINGLE_PASS:
+            if not WATERMARK_SINGLE_PASS or not getattr(ctx, "watermark_single_pass", False):
+                # Download admin logo for overlay when mode is logo/both.
+                try:
+                    from stages.watermark_stage import (
+                        resolve_watermark_settings,
+                        should_apply_watermark,
+                        watermark_requires_logo_prepass,
+                    )
+                    from stages import r2 as r2_stage
+
+                    if should_apply_watermark(ctx):
+                        _wm = resolve_watermark_settings(ctx)
+                        if watermark_requires_logo_prepass(_wm) and ctx.temp_dir:
+                            key = str(_wm.get("logo_r2_key") or "").strip()
+                            if key:
+                                ext = Path(key).suffix.lower() or ".png"
+                                if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+                                    ext = ".png"
+                                local_logo = ctx.temp_dir / f"wm_logo_{upload_id}{ext}"
+                                await r2_stage.download_file(key, local_logo)
+                                ctx.watermark_logo_local_path = local_logo
+                except Exception as _logo_e:
+                    logger.warning(
+                        "[%s] Watermark logo download failed (continuing text-only if possible): %s",
+                        upload_id,
+                        _logo_e,
+                    )
+
                 diag_step(ctx, stage="watermark", status="started", provider="ffmpeg")
                 try:
                     ctx = await asyncio.wait_for(run_watermark_stage(ctx), timeout=STAGE_TIMEOUT_WATERMARK)

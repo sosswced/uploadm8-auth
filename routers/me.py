@@ -5,6 +5,7 @@ Extracted from app.py.
 
 import json
 import re
+import secrets
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from core.config import (
+    FRONTEND_URL,
     R2_BUCKET_NAME,
     STRIPE_SECRET_KEY,
     STRIPE_SUCCESS_URL,
@@ -47,6 +49,7 @@ from core.sql_allowlist import ACCOUNT_DELETION_COUNT_TABLES, assert_set_fragmen
 from core.models import (
     ProfileUpdate,
     ProfileUpdateSettings,
+    EmailChangeSettings,
     SettingsUpdate,
     PasswordChange,
     PreferencesUpdate,
@@ -56,7 +59,7 @@ from core.models import (
 )
 from pydantic import BaseModel, Field
 from core.oauth import _revoke_platform_token
-from stages.emails import send_account_deleted_email
+from stages.emails import send_account_deleted_email, send_email_change_email
 from stages.entitlements import get_effective_topup_products
 from services.me_profile import (
     apply_me_profile_update,
@@ -416,6 +419,83 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
     async with core.state.db_pool.acquire() as conn:
         _did, message = await apply_settings_profile_update(conn, str(user["id"]), data, dict(user))
     return {"status": "success", "message": message}
+
+
+@router.put("/api/settings/email")
+async def update_email_settings(
+    data: EmailChangeSettings,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Self-serve email change (Settings → Profile).
+
+    Requires current password. Does **not** squat the new address on ``users.email``
+    until the verification link is clicked (pending row in ``email_changes``).
+    """
+    new_email = str(data.new_email).lower().strip()
+    current_email = (user.get("email") or "").lower().strip()
+    if not new_email or "@" not in new_email:
+        raise HTTPException(400, "Enter a valid new email address")
+    if new_email == current_email:
+        raise HTTPException(400, "New email must differ from your current email")
+
+    async with core.state.db_pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id, email, name, password_hash FROM users WHERE id = $1",
+            user["id"],
+        )
+        if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+
+        exists = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
+            new_email,
+            user["id"],
+        )
+        if exists:
+            raise HTTPException(status_code=409, detail="Email already in use")
+
+        verification_token = secrets.token_urlsafe(32)
+        # Drop prior unused self-serve change tokens for this user.
+        await conn.execute(
+            """
+            UPDATE email_changes
+            SET verification_token = NULL
+            WHERE user_id = $1::uuid
+              AND changed_by_admin_id IS NULL
+              AND verification_token IS NOT NULL
+            """,
+            user["id"],
+        )
+        await conn.execute(
+            """
+            INSERT INTO email_changes (user_id, old_email, new_email, changed_by_admin_id, verification_token)
+            VALUES ($1::uuid, $2, $3, NULL, $4)
+            """,
+            user["id"],
+            user_row["email"],
+            new_email,
+            verification_token,
+        )
+
+    verify_link = f"{FRONTEND_URL.rstrip('/')}/verify-email.html?token={verification_token}"
+    background_tasks.add_task(
+        send_email_change_email,
+        new_email,
+        user_row["email"],
+        user_row.get("name") or "there",
+        verify_link,
+    )
+    logger.info("Self-serve email change requested for user %s", user["id"])
+    return {
+        "status": "pending_verification",
+        "email": user_row["email"],
+        "pending_email": new_email,
+        "email_verified": False,
+        "message": "Check your new inbox and click the verification link to finish changing email.",
+    }
+
 
 @router.put("/api/settings/preferences/legacy")
 async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depends(get_current_user)):

@@ -103,7 +103,8 @@ def test_consensus_hud_only_is_medium_not_high():
     assert consensus_peak_mph(ctx) >= 120.0
 
 
-def test_consensus_hud_plus_gps_is_high():
+def test_consensus_hud_plus_gps_stays_medium():
+    """gps_implied corroborates prompts but must not publish lon-bleed peaks."""
     from core.speed_consensus import publishable_peak_mph
 
     ctx = _ctx(
@@ -114,9 +115,31 @@ def test_consensus_hud_plus_gps_is_high():
         },
     )
     c = build_speed_consensus(ctx)
-    assert c["confidence"] == "high"
+    assert c["confidence"] == "medium"
     assert set(c.get("agreeing_families") or []) >= {"hud", "gps"}
-    assert publishable_peak_mph(ctx) >= 98.0
+    assert publishable_peak_mph(ctx) == 0.0
+    assert consensus_peak_mph(ctx) >= 98.0
+
+
+def test_consensus_hud_plus_vision_is_high():
+    from core.speed_consensus import publishable_peak_mph
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 88.0,
+            "speed_series": [{"mph": 86.0, "t_s": 5.0}],
+        },
+        vision_context={
+            "ocr_text": (
+                "2025/03/05 04:50 12 PM 36.136162° -115.178398° 88MPH C Walker\n"
+                "2025/03/05 04:51 12 PM 36.136200° -115.178400° 87MPH C Walker"
+            )
+        },
+    )
+    c = build_speed_consensus(ctx)
+    assert c["confidence"] == "high"
+    assert set(c.get("agreeing_families") or []) >= {"hud", "vision"}
+    assert publishable_peak_mph(ctx) >= 86.0
 
 
 def test_consensus_none_when_no_speed():

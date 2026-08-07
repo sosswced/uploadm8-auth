@@ -39,8 +39,47 @@ def test_parse_osd_ignores_latlon_and_heading_without_unit():
     assert ok.get("speed_unit") == "mph"
 
 
+def test_reject_lon_integer_glued_to_mph():
+    """Classic OCR bleed: western lon (-115 / -122) glued onto a unit."""
+    from core.speed_units import speed_match_is_coordinate_bleed
+
+    assert speed_match_is_coordinate_bleed(
+        "-115MPH", match_start=1, match_end=7, speed_digits="115"
+    )
+    for line in (
+        "2025/03/05 04:50 12 PM 36.136162° -115MPH C Walker",
+        "36.136162° -122MPH",
+        "41.92226° -122.57585°MPH",  # unit glued to lon decimal → fraction/deg bleed
+        "36.136162° -115.178398°115°MPH",  # lon integer + degree + unit
+        "36.136162° -115.178398° 115°MPH",  # degree-bound lon int, not HUD speed
+    ):
+        rec = parse_osd_line(line, t_s=0.0)
+        assert rec.get("speed_mph") is None, line
+
+
+def test_reject_lon_fraction_tail_as_speed():
+    """``115.178398°MPH`` must not become 398 MPH (or any fraction chunk)."""
+    rec = parse_osd_line(
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398°MPH C Walker",
+        t_s=0.0,
+    )
+    assert rec.get("speed_mph") is None
+
+
+def test_real_hud_speed_still_reads_after_full_gps():
+    """Separate HUD sample after a complete lat/lon pair is still valid —
+    including when the speed happens to equal the lon integer (115)."""
+    rec = parse_osd_line(
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115MPH C Walker",
+        t_s=0.0,
+    )
+    assert rec.get("speed_mph") == 115.0
+    assert rec.get("speed_unit") == "mph"
+
+
 def test_vision_ocr_peak_ignores_coordinates_and_headings():
     assert _vision_ocr_peak_mph("36.136162° -115.178398°\n270° HDG") == 0.0
+    assert _vision_ocr_peak_mph("36.136162° -115MPH\n41.9° -122°MPH") == 0.0
     ocr = (
         "2025/03/05 04:50 12 PM 36.136162° -115.178398° 88MPH C Walker\n"
         "2025/03/05 04:51 12 PM 36.136200° -115.178400° 90MPH C Walker"

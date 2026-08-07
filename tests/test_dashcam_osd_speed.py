@@ -123,6 +123,18 @@ def test_bare_number_after_gps_is_never_speed():
         assert rec["speed_unit"] is None, line
 
 
+def test_lon_bleed_never_becomes_hud_speed():
+    """Lon/lat integers and fraction tails must not publish as MPH/KPH."""
+    for line in (
+        "2025/03/05 04:50 12 PM 41.92226° -122.57585°MPH",
+        "2025/03/05 04:50 12 PM 36.136162° -115MPH C Walker",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115°MPH",
+        "41.92226 -122MPH ESCORT.",
+    ):
+        rec = parse_osd_line(line, t_s=0.0)
+        assert rec["speed_mph"] is None, line
+
+
 def test_ocr_garbled_unit_still_reads_when_designation_present():
     """Unit must follow the digits; tolerate OCR separators / M.P.H. spelling."""
     cases = (

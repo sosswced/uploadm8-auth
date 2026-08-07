@@ -231,9 +231,13 @@ def test_m8_ladder_stops_on_quota_without_extra_calls():
                     )
 
     meta = asyncio.run(_run())
-    assert meta.get("ok") is False
+    # Quota stops the LLM ladder after one call; voice template fallback still ships copy.
+    assert meta.get("ok") is True
     assert meta.get("error_class") == "openai_quota"
+    assert meta.get("winner_source") == "voice_fallback"
+    assert meta.get("degraded") is True
     assert len(calls) == 1
+    assert (ctx.m8_platform_captions or {}).get("youtube")
 
 
 def test_prompt_contains_creative_spine_and_authority():

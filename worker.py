@@ -1709,7 +1709,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                         should_apply_watermark,
                         watermark_requires_logo_prepass,
                     )
-                    from stages import r2 as r2_stage
 
                     if should_apply_watermark(ctx):
                         _wm = resolve_watermark_settings(ctx)

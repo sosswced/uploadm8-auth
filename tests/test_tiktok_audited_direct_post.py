@@ -30,14 +30,15 @@ def test_audited_enables_public_direct_post(monkeypatch):
     assert _tiktok_force_private_unaudited_enabled() is False
 
 
-def test_unaudited_clamps_to_self_only(monkeypatch):
+def test_app_audited_zero_does_not_clamp_publish(monkeypatch):
+    """UI may show unaudited, but publish only clamps on FORCE_PRIVATE."""
     monkeypatch.setenv("TIKTOK_APP_AUDITED", "0")
     monkeypatch.delenv("TIKTOK_FORCE_PRIVATE_UNAUDITED", raising=False)
     assert tiktok_app_audited() is False
     assert tiktok_unaudited_mode() is True
-    assert tiktok_force_private_unaudited() is True
-    assert tiktok_direct_post_status()["public_publish_enabled"] is False
-    assert _tiktok_force_private_unaudited_enabled() is True
+    assert tiktok_force_private_unaudited() is False
+    assert tiktok_direct_post_status()["public_publish_enabled"] is True
+    assert _tiktok_force_private_unaudited_enabled() is False
 
 
 def test_unset_env_defaults_to_audited(monkeypatch):

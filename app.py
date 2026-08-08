@@ -692,7 +692,7 @@ async def api_health():
         async with asyncio.timeout(10):
             async with acquire_db(core.state.db_pool, attempts=2) as conn:
                 await conn.fetchval("SELECT 1")
-        return {"status": "ok", "db": True, "timestamp": ts}
+        return {"status": "ok", "db": True, "timestamp": ts, **_tiktok_health_flags()}
     except Exception as e:
         logger.warning("api health db check failed: %s", e)
         return JSONResponse(
@@ -701,9 +701,25 @@ async def api_health():
                 "db": False,
                 "timestamp": ts,
                 "detail": type(e).__name__,
+                **_tiktok_health_flags(),
             },
             status_code=503,
         )
+
+
+def _tiktok_health_flags() -> dict:
+    """Non-secret TikTok Direct Post gate for ops (Render env / deploy checks)."""
+    try:
+        from services.tiktok_api import tiktok_direct_post_status
+
+        st = tiktok_direct_post_status()
+        return {
+            "tiktok_app_audited": bool(st.get("app_audited")),
+            "tiktok_public_publish_enabled": bool(st.get("public_publish_enabled")),
+            "tiktok_force_private": bool(st.get("force_private_env")),
+        }
+    except Exception:
+        return {}
 
 
 # Static HTML/JS/CSS — same process as API (cookie auth, no cross-origin for local dev).

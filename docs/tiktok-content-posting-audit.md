@@ -56,7 +56,8 @@ Requires `META_APP_SECRET` set in production. After deploy, reconnect Facebook/I
 TIKTOK_FORCE_PRIVATE_UNAUDITED=1
 ```
 
-or set `TIKTOK_APP_AUDITED=0`. Restart API + worker.
+Restart API + worker. Publish clamps to ``SELF_ONLY`` only when this force flag is set.
+`TIKTOK_APP_AUDITED=0` affects UI labeling only (does not rewrite privacy at publish).
 
 ## Reviewer / compliance notes
 

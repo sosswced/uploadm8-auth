@@ -59,8 +59,7 @@ def tiktok_app_audited() -> bool:
     """True when Content Posting Direct Post may use public privacy levels.
 
     UploadM8's TikTok Content Posting API audit is approved. Default is audited
-    (public Direct Post). Opt out with ``TIKTOK_APP_AUDITED=0`` or clamp with
-    ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1``.
+    (public Direct Post). Opt out with ``TIKTOK_APP_AUDITED=0``.
 
     Reads the live environment (not a frozen import-time snapshot).
     """
@@ -69,14 +68,17 @@ def tiktok_app_audited() -> bool:
 
 
 def tiktok_unaudited_mode() -> bool:
-    """True only when explicitly opted out of audited Direct Post."""
+    """True only when explicitly opted out of audited Direct Post (UI banner)."""
     return not tiktok_app_audited()
 
 
 def tiktok_force_private_unaudited() -> bool:
-    """Clamp Direct Post privacy to SELF_ONLY when unaudited or force flag set."""
-    if tiktok_unaudited_mode():
-        return True
+    """Clamp Direct Post privacy to SELF_ONLY — emergency flag only.
+
+    After TikTok audit approval, publish must honor the creator's chosen privacy.
+    Do **not** clamp merely because ``TIKTOK_APP_AUDITED`` is unset/mis-set on one
+    Render service; only ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1`` forces SELF_ONLY.
+    """
     v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
@@ -92,6 +94,7 @@ def tiktok_direct_post_status() -> dict:
         "unaudited_mode": not audited,
         "privacy_clamped_to_self_only": force_private,
         "public_publish_enabled": not force_private,
+        "force_private_env": force_private,
     }
 
 def tiktok_video_list_url() -> str:

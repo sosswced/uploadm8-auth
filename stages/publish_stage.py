@@ -1422,8 +1422,24 @@ async def publish_to_tiktok(
                 and _tiktok_unaudited_private_only_error(init_resp.text)
                 and post_info.get("privacy_level") != "SELF_ONLY"
             ):
+                # After audit approval we must not silently rewrite public posts
+                # to Only me — surface TikTok's rejection so ops can fix scopes/app.
+                if not _tiktok_force_private_unaudited_enabled():
+                    return PlatformResult(
+                        platform="tiktok",
+                        success=False,
+                        http_status=init_resp.status_code,
+                        error_code="TIKTOK_PRIVATE_ONLY_REJECTED",
+                        error_message=(
+                            "TikTok rejected non-private Direct Post "
+                            "(unaudited_client_can_only_post_to_private_accounts). "
+                            "Confirm Content Posting API audit is approved in the "
+                            "TikTok Developer Portal, then retry. "
+                            f"Detail: {init_resp.text[:240]}"
+                        ),
+                    )
                 logger.info(
-                    "TikTok: unaudited app — retrying init with privacy_level=SELF_ONLY "
+                    "TikTok: FORCE_PRIVATE — retrying init with privacy_level=SELF_ONLY "
                     "(was %s)",
                     post_info.get("privacy_level"),
                 )

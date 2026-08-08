@@ -294,9 +294,9 @@ OAUTH_CONFIG = {
 # TikTok
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-# Content Posting Direct Post: set to 1 after TikTok Developer Portal audit approval
-# so PUBLIC_TO_EVERYONE / Friends / Followers are allowed (not clamped to SELF_ONLY).
-TIKTOK_APP_AUDITED = (os.environ.get("TIKTOK_APP_AUDITED") or "").strip().lower() in (
+# Content Posting Direct Post: audited by default after TikTok portal approval.
+# Set TIKTOK_APP_AUDITED=0 to revert to private-only UX, or use the force flag below.
+TIKTOK_APP_AUDITED = (os.environ.get("TIKTOK_APP_AUDITED") or "1").strip().lower() in (
     "1",
     "true",
     "yes",

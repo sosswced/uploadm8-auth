@@ -4,17 +4,18 @@ UploadM8 publishes via TikTok **Content Posting API Direct Post**
 (`POST /v2/post/publish/video/init/` + `FILE_UPLOAD` chunks). This is not Share Kit
 or inbox-draft upload mode.
 
-## Production enablement (after TikTok approval)
+## Production enablement (audit approved)
 
-Set on **both** API and worker processes:
+Audited Direct Post is the **default** (unset / `TIKTOK_APP_AUDITED=1`). Pin on
+**both** API and worker for clarity:
 
 | Variable | Value | Effect |
 |----------|-------|--------|
-| `TIKTOK_APP_AUDITED` | `1` | Public Direct Post — honors user privacy (Everyone / Friends / Followers / Only me) |
+| `TIKTOK_APP_AUDITED` | `1` (default) | Public Direct Post — honors user privacy (Everyone / Friends / Followers / Only me) |
 | `TIKTOK_FORCE_PRIVATE_UNAUDITED` | unset | Do not set unless rolling back to private-only |
 
-Without `TIKTOK_APP_AUDITED=1`, the worker clamps privacy to `SELF_ONLY` and the Upload
-UI disables other visibility options (TikTok unaudited-client rule).
+Set `TIKTOK_APP_AUDITED=0` only to revert to private-only UX (worker clamps to
+`SELF_ONLY` and Upload disables other visibility options).
 
 ## App description (Developer Portal)
 
@@ -55,7 +56,7 @@ Requires `META_APP_SECRET` set in production. After deploy, reconnect Facebook/I
 TIKTOK_FORCE_PRIVATE_UNAUDITED=1
 ```
 
-or unset `TIKTOK_APP_AUDITED`. Restart API + worker.
+or set `TIKTOK_APP_AUDITED=0`. Restart API + worker.
 
 ## Reviewer / compliance notes
 

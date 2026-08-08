@@ -1,6 +1,10 @@
 # UploadM8 — pipeline / ML / Redis (paste into Render Environment)
 # HF_TOKEN — keep your existing Render secret (do not duplicate in chat)
 
+# ── TikTok Content Posting (set on API + worker after portal audit approval) ─
+TIKTOK_APP_AUDITED=1
+# Rollback only: TIKTOK_FORCE_PRIVATE_UNAUDITED=1
+
 # ── Memory budget (2 GB Standard worker — raise on Pro / 4 GB) ─────────────
 # Set RENDER_MEMORY_LIMIT_MB to your plan RAM so admission % is accurate.
 RENDER_MEMORY_LIMIT_MB=2048

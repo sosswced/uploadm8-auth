@@ -56,22 +56,25 @@ TIKTOK_BRANDED_CONTENT_POLICY_URL = "https://www.tiktok.com/legal/page/global/bc
 
 
 def tiktok_app_audited() -> bool:
-    """True after TikTok Content Posting API audit passes. Set ``TIKTOK_APP_AUDITED=1``.
+    """True when Content Posting Direct Post may use public privacy levels.
 
-    Reads the live environment (not a frozen import-time snapshot) so API/worker
-    restarts pick up portal approval without code changes.
+    UploadM8's TikTok Content Posting API audit is approved. Default is audited
+    (public Direct Post). Opt out with ``TIKTOK_APP_AUDITED=0`` or clamp with
+    ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1``.
+
+    Reads the live environment (not a frozen import-time snapshot).
     """
-    v = (os.environ.get("TIKTOK_APP_AUDITED") or "").strip().lower()
+    v = (os.environ.get("TIKTOK_APP_AUDITED") or "1").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
 def tiktok_unaudited_mode() -> bool:
-    """Apps pending TikTok audit must show private-only UX and clamp posts to SELF_ONLY."""
+    """True only when explicitly opted out of audited Direct Post."""
     return not tiktok_app_audited()
 
 
 def tiktok_force_private_unaudited() -> bool:
-    """Clamp Direct Post privacy to SELF_ONLY while unaudited (or when force flag set)."""
+    """Clamp Direct Post privacy to SELF_ONLY when unaudited or force flag set."""
     if tiktok_unaudited_mode():
         return True
     v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()

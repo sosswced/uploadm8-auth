@@ -452,8 +452,8 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
 def _tiktok_force_private_unaudited_enabled() -> bool:
     """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of user privacy choice.
 
-    After TikTok Content Posting audit approval, set ``TIKTOK_APP_AUDITED=1`` so
-    public/friends/followers privacy is honored. Optional emergency rollback:
+    Audited by default after TikTok Content Posting approval. Opt out with
+    ``TIKTOK_APP_AUDITED=0``. Optional emergency rollback:
     ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1``.
     """
     return tiktok_force_private_unaudited()

@@ -38,6 +38,9 @@ services:
         value: https://auth.uploadm8.com
       - key: TOKEN_ENC_KEYS
         sync: false
+      # TikTok Content Posting API audit approved — honor user privacy (not SELF_ONLY clamp)
+      - key: TIKTOK_APP_AUDITED
+        value: "1"
 
   # Background Worker (needs Docker for FFmpeg)
   # OOM defense: pin concurrency=1 on Standard (2GB). Autoscaling instances does
@@ -61,6 +64,9 @@ services:
         value: uploadm8-media
       - key: TOKEN_ENC_KEYS
         sync: false
+      # TikTok Content Posting API audit approved — honor user privacy (not SELF_ONLY clamp)
+      - key: TIKTOK_APP_AUDITED
+        value: "1"
       - key: UPLOAD_JOB_QUEUE
         value: uploadm8:jobs
       - key: PRIORITY_JOB_QUEUE
@@ -74,8 +80,7 @@ services:
       - key: ACRCLOUD_ACCESS_SECRET
         sync: false
       # ── Memory / concurrency (keep in sync with render-env-pipeline-additions.txt)
-      - key: RENDER_MEMORY_LIMIT_MB
-        value: "2048"
+      # RENDER_MEMORY_LIMIT_MB is optional — worker reads cgroup (Standard ≈2048).
       - key: MEMORY_ADMIT_PCT
         value: "75"
       - key: MEMORY_HARD_PCT

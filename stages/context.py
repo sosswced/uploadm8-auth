@@ -762,6 +762,20 @@ class JobContext:
             from services.hydration_payload import hydration_brief_strings
 
             for k, v in hydration_brief_strings(hp).items():
+                # Keep richer local Whisper/summary bits; do not replace with a
+                # thinner hydration phrase-only string.
+                if k == "speech_context":
+                    existing = str(out.get("speech_context") or "").strip()
+                    incoming = str(v or "").strip()
+                    if not incoming:
+                        continue
+                    if not existing:
+                        out[k] = incoming
+                    elif incoming.lower() in existing.lower():
+                        continue
+                    else:
+                        out[k] = f"{existing}; {incoming}"[:900]
+                    continue
                 out[k] = v
             c2 = str(hp.get("category") or "").strip().lower()
             if c2:

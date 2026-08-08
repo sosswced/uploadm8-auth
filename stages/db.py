@@ -300,7 +300,19 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
     try:
         from core.upload_baseline_defaults import apply_upload_baseline_defaults
 
-        apply_upload_baseline_defaults(result)
+        role = None
+        tier = None
+        try:
+            ur = await conn.fetchrow(
+                "SELECT role, subscription_tier FROM users WHERE id = $1",
+                user_id,
+            )
+            if ur:
+                role = ur.get("role")
+                tier = ur.get("subscription_tier")
+        except Exception:
+            pass
+        apply_upload_baseline_defaults(result, tier=tier, role=role)
     except Exception as e:
         logger.debug("upload baseline defaults skipped for %s: %s", user_id, e)
 

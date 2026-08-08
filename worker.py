@@ -1791,8 +1791,18 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # STAGE 6–10: Multimodal context (audio, vision, TL, VI, dashcam OSD — feeds M8/captions)
         # ============================================================
         _multimodal_strict_gaps: List[str] = []
+        # On ≤512–768MB Render, serialize multimodal by default (parallel VI+Whisper OOMs).
+        _mm_default = "true"
+        try:
+            from core.process_stats import is_small_memory_plan
+
+            if is_small_memory_plan():
+                _mm_default = "false"
+        except Exception:
+            pass
         _multimodal_parallel = (
-            os.environ.get("MULTIMODAL_PARALLEL", "true").lower() not in ("0", "false", "no", "off")
+            os.environ.get("MULTIMODAL_PARALLEL", _mm_default).lower()
+            not in ("0", "false", "no", "off")
         )
 
         async def _mark_mm_stage(stage: str, *, detail: str | None = None) -> None:
@@ -5084,7 +5094,9 @@ async def _build_process_job_payload(
             sanitize_settings_for_job_payload,
         )
 
-        apply_upload_baseline_defaults(user_settings, tier=ent.tier)
+        apply_upload_baseline_defaults(
+            user_settings, tier=ent.tier, role=str(user_record.get("role") or "")
+        )
         payload = {
             "upload_id": str(upload_id),
             "user_id": str(user_id),
@@ -6606,7 +6618,8 @@ async def run_heartbeat_loop() -> None:
     await _prime_worker_heartbeat()
 
     snap = _heartbeat_runtime_snapshot()
-    mem_warn_pct = float(os.environ.get("MEMORY_WARN_PCT", "85") or 85)
+    _warn_default = "60" if snap["mem"].get("small_plan") else "85"
+    mem_warn_pct = float(os.environ.get("MEMORY_WARN_PCT", _warn_default) or _warn_default)
     last_mem_warn_at = 0.0
 
     logger.info(
@@ -6666,15 +6679,31 @@ async def run_heartbeat_loop() -> None:
                         bool(mem.get("admission_blocked")),
                         mem.get("limit_mb"),
                     )
+            # Ring buffer for Admin KPI memory-debug (survives briefly after OOM).
+            try:
+                from services.worker_memory_telemetry import record_memory_sample
+
+                await record_memory_sample(
+                    redis_client,
+                    worker_id=WORKER_ID,
+                    sample=mem,
+                    jobs=jobs,
+                )
+            except Exception as _mem_telem_err:
+                logger.debug("memory telemetry sample skipped: %s", _mem_telem_err)
+
             pct = mem.get("pct_of_limit")
             if pct is not None and pct >= mem_warn_pct:
                 now = _time.monotonic()
                 if now - last_mem_warn_at >= 60:
                     last_mem_warn_at = now
                     logger.warning(
-                        "Memory pressure | rss=%sMB peak=%sMB limit=%sMB pct=%s%% pressure=%s load1=%s | "
+                        "Memory pressure | rss=%sMB children=%sMB effective=%sMB peak=%sMB "
+                        "limit=%sMB pct=%s%% pressure=%s load1=%s | "
                         "process_slots=%s/%s heavy=%s/%s | active_process=%s active_publish=%s | jobs=%s",
                         mem.get("rss_mb"),
+                        mem.get("children_rss_mb"),
+                        mem.get("effective_rss_mb"),
                         mem.get("peak_rss_mb"),
                         mem.get("limit_mb"),
                         pct,
@@ -6694,7 +6723,9 @@ async def run_heartbeat_loop() -> None:
 
                             sentry_sdk.capture_message(
                                 f"Worker hard memory pressure {pct}% "
-                                f"(rss={mem.get('rss_mb')} limit={mem.get('limit_mb')})",
+                                f"(rss={mem.get('rss_mb')} children={mem.get('children_rss_mb')} "
+                                f"effective={mem.get('effective_rss_mb')} "
+                                f"limit={mem.get('limit_mb')})",
                                 level="warning",
                             )
                         except Exception:

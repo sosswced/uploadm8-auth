@@ -207,10 +207,15 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
     def popup_response(success: bool, platform: str, error_msg: str = None):
         """Generate HTML that posts message to parent window and closes popup"""
         if success:
-            message = f'{{"type": "oauth_success", "platform": "{platform}"}}'
+            payload = {"type": "oauth_success", "platform": str(platform or "")}
         else:
-            safe_error = (error_msg or "Unknown error").replace('"', '\\"').replace('\n', ' ')[:200]
-            message = f'{{"type": "oauth_error", "platform": "{platform}", "error": "{safe_error}"}}'
+            safe_error = (error_msg or "Unknown error").replace('"', '\\"').replace("\n", " ")[:200]
+            payload = {
+                "type": "oauth_error",
+                "platform": str(platform or ""),
+                "error": safe_error,
+            }
+        payload_js = json.dumps(payload)
         target_js = json.dumps(post_target)
 
         return HTMLResponse(f"""
@@ -223,10 +228,21 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 <p style="color: #888; font-size: 14px;">This window will close automatically...</p>
             </div>
             <script>
-                if (window.opener) {{
-                    window.opener.postMessage({message}, {target_js});
-                }}
-                setTimeout(() => window.close(), 1500);
+                (function () {{
+                    var payload = {payload_js};
+                    var target = {target_js};
+                    try {{
+                        payload.ts = Date.now();
+                        localStorage.setItem('uploadm8_oauth_result', JSON.stringify(payload));
+                        localStorage.removeItem('uploadm8_oauth_result');
+                    }} catch (e) {{}}
+                    if (window.opener) {{
+                        try {{ window.opener.postMessage(payload, target); }} catch (e) {{}}
+                        // Fallback when parent_origin drifted (www vs apex) — parent validates message type.
+                        try {{ window.opener.postMessage(payload, '*'); }} catch (e) {{}}
+                    }}
+                    setTimeout(function () {{ try {{ window.close(); }} catch (e) {{}} }}, 1200);
+                }})();
             </script>
         </body>
         </html>

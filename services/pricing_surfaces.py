@@ -172,7 +172,7 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
         ),
         "whisper_note": (
             "Speech-to-text (Whisper) is off by default and included at no extra AIC when "
-            "enabled — turn it on for talking-head and voiceover clips."
+            "enabled — turn it on in Settings (How features work) for talking-head and voiceover clips."
         ),
     }
 

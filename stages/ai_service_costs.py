@@ -304,7 +304,11 @@ def service_catalog(weights: Optional[Dict[str, int]] = None) -> List[Dict[str, 
 
 
 def _pref_true(prefs: Dict[str, Any], key: str, default: bool = True) -> bool:
-    """Read camelCase/snake_case variants from settings payloads."""
+    """Read camelCase/snake_case variants from settings payloads.
+
+    Missing keys and explicit ``None`` use *default* (NULL DB columns must not
+    coerce to False via ``bool(None)``).
+    """
     if not key:
         return default
     snake = key[0].lower()
@@ -312,10 +316,17 @@ def _pref_true(prefs: Dict[str, Any], key: str, default: bool = True) -> bool:
         snake += ("_" + ch.lower()) if ch.isupper() else ch
     variants = [key, snake, snake.replace("_o_s_d", "_osd")]
     raw = default
+    found = False
     for variant in variants:
         if variant in prefs:
-            raw = prefs[variant]
+            cand = prefs[variant]
+            if cand is None:
+                continue
+            raw = cand
+            found = True
             break
+    if not found:
+        return default
     if isinstance(raw, str):
         return raw.strip().lower() not in ("false", "0", "no", "off", "")
     return bool(raw)

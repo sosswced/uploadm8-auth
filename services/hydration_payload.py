@@ -158,7 +158,10 @@ def build_hydration_payload(
     if not speech_phrase:
         t = (ctx.ai_transcript or ac.get("transcript") or "").strip()
         speech_phrase = t[:400] if t else None
-    speech = {"phrase": speech_phrase}
+    speech: Dict[str, Any] = {"phrase": speech_phrase}
+    gas = str(ac.get("gpt_audio_summary") or "").strip()
+    if gas:
+        speech["summary"] = gas[:500]
 
     vc = ctx.vision_context or {}
     raw_labels = list(vc.get("label_names") or [])[:40]
@@ -300,9 +303,15 @@ def hydration_brief_strings(hp: Dict[str, Any]) -> Dict[str, str]:
         out["music_context"] = " — ".join(p for p in (ma, mt) if p)[:260]
 
     sp = ev.get("speech") if isinstance(ev.get("speech"), dict) else {}
+    speech_bits: List[str] = []
     ph = str(sp.get("phrase") or "").strip()
     if ph:
-        out["speech_context"] = ph[:420]
+        speech_bits.append(ph[:420])
+    sm = str(sp.get("summary") or "").strip()
+    if sm:
+        speech_bits.append("speech/audio summary: " + sm[:260])
+    if speech_bits:
+        out["speech_context"] = "; ".join(speech_bits)[:700]
 
     sigs = hp.get("signal_hashtags")
     if isinstance(sigs, list) and sigs:
@@ -386,8 +395,14 @@ def hydration_brief_strings_compact(hp: Dict[str, Any]) -> Dict[str, str]:
 
     sp = ev.get("speech") if isinstance(ev.get("speech"), dict) else {}
     ph = str(sp.get("phrase") or "").strip()
-    if ph:
-        out["speech_context"] = ph[:200]
+    sm = str(sp.get("summary") or "").strip()
+    if ph or sm:
+        bits = []
+        if ph:
+            bits.append(ph[:160])
+        if sm:
+            bits.append(sm[:80])
+        out["speech_context"] = "; ".join(bits)[:200]
 
     vis = ev.get("vision") if isinstance(ev.get("vision"), dict) else {}
     vlabels = vis.get("labels") if isinstance(vis.get("labels"), list) else []

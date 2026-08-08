@@ -321,7 +321,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
         p.get("aiServiceThumbnailDesigner", p.get("ai_service_thumbnail_designer")),
         True,
     )
-    ai_service_speech_to_text = _coerce_bool(p.get("aiServiceSpeechToText", p.get("ai_service_speech_to_text")), False)
+    ai_service_speech_to_text = _coerce_bool(p.get("aiServiceSpeechToText", p.get("ai_service_speech_to_text")), True)
     ai_service_scene_understanding = _coerce_bool(
         p.get("aiServiceSceneUnderstanding", p.get("ai_service_scene_understanding")),
         False,
@@ -740,7 +740,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 for camel, snake in upload_ai_keys:
                     if camel in p or snake in p:
                         val = p.get(camel) if camel in p else p.get(snake)
-                        # Opt-in toggles default False; AI service toggles default True.
+                        # Opt-in toggles default False (free+paid); admin baseline fills ON separately.
                         _opt_in_false = camel in (
                             "youtubeShortsCopyrightTrim",
                             "tiktokBurnStyledCover",
@@ -749,6 +749,13 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                             "aiServiceSpeechToText",
                             "aiServiceSceneUnderstanding",
                             "aiServiceVideoAnalyzer",
+                            "aiServiceAudioSignals",
+                            "aiServiceMusicDetection",
+                            "aiServiceAudioSummary",
+                            "aiServiceCaptionWriter",
+                            "aiServiceThumbnailDesigner",
+                            "aiServiceFrameInspector",
+                            "aiServiceTelemetry",
                         )
                         val = _coerce_bool(val, False if _opt_in_false else True)
                         users_prefs[camel] = users_prefs[snake] = val

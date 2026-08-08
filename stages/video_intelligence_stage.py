@@ -9,7 +9,8 @@ Use cases:
   - Shot change timestamps for editing / highlight detection
   - Feed into caption/thumbnail brief via ctx.video_intelligence_context
 
-Input: inline bytes (local file) when size <= VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB),
+Input: inline bytes (local file) when size <= VIDEO_INTELLIGENCE_MAX_BYTES
+       (default 100 MiB on ≥2GB; 20 MiB on ≤768MB Starter plans),
        OR gs:// URI when VIDEO_INTELLIGENCE_INPUT_URI is set.
 
 GCP: enable the **Video Intelligence API** on the worker service account project
@@ -17,7 +18,7 @@ GCP: enable the **Video Intelligence API** on the worker service account project
 return permission/API-not-enabled errors that surface as ``ctx.video_intelligence_context.error``.
 
 Env:
-  VIDEO_INTELLIGENCE_MAX_BYTES (default 104857600 = 100 MiB; clamped 10 MiB - 1 GiB; loads full file into RAM)
+  VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB / 20 MiB on ≤768MB; clamped 5 MiB - 1 GiB; loads full file into RAM)
   VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 1800)  LRO wait for annotate_video result()
   VIDEO_INTELLIGENCE_INPUT_URI  Optional gs://... (skips local read; best for huge files)
   VIDEO_INTELLIGENCE_MAX_DURATION_SEC  If >0, skip when ffprobe duration exceeds this seconds.
@@ -44,20 +45,33 @@ logger = logging.getLogger("uploadm8-worker")
 
 # Caption-accuracy defaults: fewer inline rejects, long enough LRO wait to match worker stage budget.
 _VI_DEFAULT_MAX_BYTES = 100 * 1024 * 1024  # 100 MiB
-_VI_MIN_MAX_BYTES = 10 * 1024 * 1024  # env floor
+_VI_SMALL_PLAN_MAX_BYTES = 20 * 1024 * 1024  # 20 MiB — 512MB Render cannot hold 100MiB + FFmpeg
+_VI_MIN_MAX_BYTES = 5 * 1024 * 1024  # env floor (allow tighter caps on Starter)
 _VI_ABS_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB ceiling (RAM / safety)
 _VI_DEFAULT_TIMEOUT_SEC = 1800  # 30 min
 _GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC = 3 * 3600  # Google documents ~3h per annotate (label/shots)
 
 
+def _default_vi_max_bytes() -> int:
+    """100 MiB on Standard+; 20 MiB when plan looks ≤768MB (unless env set)."""
+    try:
+        from core.process_stats import is_small_memory_plan, memory_limit_mb
+
+        if is_small_memory_plan(memory_limit_mb()):
+            return _VI_SMALL_PLAN_MAX_BYTES
+    except Exception:
+        pass
+    return _VI_DEFAULT_MAX_BYTES
+
+
 def _parse_vi_max_bytes() -> int:
     raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES") or "").strip()
     if not raw:
-        return _VI_DEFAULT_MAX_BYTES
+        return _default_vi_max_bytes()
     try:
         v = int(raw, 10)
     except ValueError:
-        return _VI_DEFAULT_MAX_BYTES
+        return _default_vi_max_bytes()
     return max(_VI_MIN_MAX_BYTES, min(v, _VI_ABS_MAX_BYTES))
 
 

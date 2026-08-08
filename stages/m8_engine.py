@@ -758,6 +758,8 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "yamnet_events": list(ac.get("yamnet_events") or []),
             "content_signals": list(ac.get("content_signals") or [])[:40],
             "hume_dominant_emotion": hume_d.get("dominant_emotion") or "",
+            # Whisper → GPT prose summary (audio_stage); M8 should paraphrase themes.
+            "gpt_audio_summary": str(ac.get("gpt_audio_summary") or "")[:1600],
         },
         "fusion_narrative": (ac.get("fusion_narrative") or "")[:2000],
         "fusion_summary": fusion_summary_sg,
@@ -1366,7 +1368,9 @@ If dashcam_osd or geo fields are populated, each title/caption pair must include
 real route/HUD/place anchor: a trusted MPH sample, road/city/state, Trill bucket, driver, or song.
 
 CAPTION + HASHTAG AUDIO DISCIPLINE: If transcript.text is non-empty, the caption hook should acknowledge what is
-actually said (themes, names, punchlines) without fabricated quotes. If music.* identifies a track, captions and
+actually said (themes, names, punchlines) without fabricated quotes. If audio_environment.gpt_audio_summary is
+present, use it as a short thematic paraphrase of speech for prose tone — do not invent lines beyond transcript + summary.
+If music.* identifies a track, captions and
 hashtags may reference artist/title/genre tokens for discovery while respecting third-party / copyright semantics in
 ANTI-GENERIC RULES. If audio_environment or fusion_narrative describe ambience, fold 1–2 audible cues into prose
 and hashtag tokens so posts match how the clip sounds, not only how it looks.

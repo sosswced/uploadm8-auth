@@ -586,6 +586,7 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     transcribe_pref = bool(us.get("audio_transcription", us.get("audioTranscription", True)))
     tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
     tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    # Default OFF when unset (opt-in); admin baseline / explicit prefs turn Whisper on.
     want_whisper = transcribe_pref and user_pref_ai_service_enabled(
         us, "audio_whisper", default=False, allowed_services=tier_allowed_set
     )

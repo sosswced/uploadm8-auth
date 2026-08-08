@@ -430,11 +430,13 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 
     # Overlay users.preferences (PUT /api/me/preferences writes here) -- full overlay
     users_prefs_row = await conn.fetchrow(
-        "SELECT preferences, subscription_tier FROM users WHERE id = $1",
+        "SELECT preferences, subscription_tier, role FROM users WHERE id = $1",
         user_id,
     )
+    role = None
     if users_prefs_row:
         tier = users_prefs_row.get("subscription_tier")
+        role = users_prefs_row.get("role")
         up = _parse_users_preferences(users_prefs_row["preferences"])
     else:
         up = {}
@@ -468,7 +470,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 
     if result:
         _hydrate_snake_camel_mirror(result)
-        apply_upload_baseline_defaults(result, tier=tier)
+        apply_upload_baseline_defaults(result, tier=tier, role=role)
         return result
 
     # Fallback: Try legacy JSONB locations
@@ -570,13 +572,18 @@ async def get_user_preferences(
             )
 
             out = {
-                "autoCaptions": d.get("auto_captions", False),
+                # Leave None for NULL/missing so apply_upload_baseline_defaults(tier=…) fills.
+                "autoCaptions": (
+                    None if d.get("auto_captions") is None else bool(d.get("auto_captions"))
+                ),
                 "autoThumbnails": (
-                    True if d.get("auto_thumbnails") is None else bool(d.get("auto_thumbnails"))
+                    None if d.get("auto_thumbnails") is None else bool(d.get("auto_thumbnails"))
                 ),
                 "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
                 "defaultPrivacy": d.get("default_privacy", "public"),
-                "aiHashtagsEnabled": d.get("ai_hashtags_enabled", False),
+                "aiHashtagsEnabled": (
+                    None if d.get("ai_hashtags_enabled") is None else bool(d.get("ai_hashtags_enabled"))
+                ),
                 "aiHashtagCount": str(d.get("ai_hashtag_count", 5)),
                 "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
                 "hashtagPosition": d.get("hashtag_position", "end"),
@@ -587,41 +594,67 @@ async def get_user_preferences(
                 "emailNotifications": d.get("email_notifications", True),
                 "discordWebhook": d.get("discord_webhook"),
                 "trillEnabled": (
-                    True if d.get("trill_enabled") is None else bool(d.get("trill_enabled"))
+                    None if d.get("trill_enabled") is None else bool(d.get("trill_enabled"))
                 ),
                 "trillMinScore": (
                     60 if d.get("trill_min_score") is None else int(d.get("trill_min_score") or 60)
                 ),
                 "trillSkipLowScore": bool(d.get("trill_skip_low_score", False)),
                 "trillAiEnhance": (
-                    True if d.get("trill_ai_enhance") is None else bool(d.get("trill_ai_enhance"))
+                    None if d.get("trill_ai_enhance") is None else bool(d.get("trill_ai_enhance"))
                 ),
                 "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o"),
                 "trillLeaderboardOptIn": bool(d.get("trill_leaderboard_opt_in", False)),
                 "trillMapSharingOptIn": bool(d.get("trill_map_sharing_opt_in", False)),
-                "styledThumbnails": d.get("styled_thumbnails", True),
-                "useAudioContext": bool(d.get("use_audio_context", True)),
+                "styledThumbnails": (
+                    None if d.get("styled_thumbnails") is None else bool(d.get("styled_thumbnails"))
+                ),
+                "useAudioContext": (
+                    None if d.get("use_audio_context") is None else bool(d.get("use_audio_context"))
+                ),
                 "youtubeShortsCopyrightTrim": bool(d.get("youtube_shorts_copyright_trim", False)),
                 "youtube_shorts_copyright_trim": bool(d.get("youtube_shorts_copyright_trim", False)),
-                "audioTranscription": bool(d.get("audio_transcription", True)),
+                "audioTranscription": (
+                    None if d.get("audio_transcription") is None else bool(d.get("audio_transcription"))
+                ),
                 "authSecurityAlerts": bool(d.get("auth_security_alerts", True)),
                 "digestEmails": bool(d.get("digest_emails", True)),
                 "scheduledAlertEmails": bool(d.get("scheduled_alert_emails", True)),
-                "aiServiceTelemetry": bool(d.get("ai_service_telemetry", True)),
+                "aiServiceTelemetry": (
+                    None if d.get("ai_service_telemetry") is None else bool(d.get("ai_service_telemetry"))
+                ),
                 "aiServiceDashcamOSD": bool(d.get("ai_service_dashcam_osd", False)),
                 "defaultVehicleMakeId": d.get("default_vehicle_make_id"),
                 "defaultVehicleModelId": d.get("default_vehicle_model_id"),
                 "default_vehicle_make_id": d.get("default_vehicle_make_id"),
                 "default_vehicle_model_id": d.get("default_vehicle_model_id"),
-                "aiServiceAudioSignals": bool(d.get("ai_service_audio_signals", True)),
-                "aiServiceMusicDetection": bool(d.get("ai_service_music_detection", True)),
-                "aiServiceAudioSummary": bool(d.get("ai_service_audio_summary", True)),
+                "aiServiceAudioSignals": (
+                    None if d.get("ai_service_audio_signals") is None else bool(d.get("ai_service_audio_signals"))
+                ),
+                "aiServiceMusicDetection": (
+                    None
+                    if d.get("ai_service_music_detection") is None
+                    else bool(d.get("ai_service_music_detection"))
+                ),
+                "aiServiceAudioSummary": (
+                    None if d.get("ai_service_audio_summary") is None else bool(d.get("ai_service_audio_summary"))
+                ),
                 "aiServiceEmotionSignals": bool(d.get("ai_service_emotion_signals", False)),
-                "aiServiceCaptionWriter": bool(d.get("ai_service_caption_writer", True)),
-                "aiServiceThumbnailDesigner": bool(d.get("ai_service_thumbnail_designer", True)),
-                "aiServiceSpeechToText": bool(d.get("ai_service_speech_to_text", False)),
+                "aiServiceCaptionWriter": (
+                    None if d.get("ai_service_caption_writer") is None else bool(d.get("ai_service_caption_writer"))
+                ),
+                "aiServiceThumbnailDesigner": (
+                    None
+                    if d.get("ai_service_thumbnail_designer") is None
+                    else bool(d.get("ai_service_thumbnail_designer"))
+                ),
+                "aiServiceSpeechToText": (
+                    None if d.get("ai_service_speech_to_text") is None else bool(d.get("ai_service_speech_to_text"))
+                ),
                 "aiServiceSceneUnderstanding": bool(d.get("ai_service_scene_understanding", False)),
-                "aiServiceFrameInspector": bool(d.get("ai_service_frame_inspector", True)),
+                "aiServiceFrameInspector": (
+                    None if d.get("ai_service_frame_inspector") is None else bool(d.get("ai_service_frame_inspector"))
+                ),
                 "aiServiceVideoAnalyzer": bool(d.get("ai_service_video_analyzer", False)),
             }
             # Overlay users.preferences -- source of truth for hashtags + caption (PUT /api/me/preferences)
@@ -683,11 +716,13 @@ async def get_user_preferences(
                 out.setdefault("thumbnail_selection_mode", "sharpness")
                 out.setdefault("thumbnailRenderPipeline", "auto")
                 out.setdefault("thumbnail_render_pipeline", "auto")
-            apply_upload_baseline_defaults(out)
             tier_row = await conn.fetchrow(
-                "SELECT subscription_tier FROM users WHERE id = $1", user["id"]
+                "SELECT subscription_tier, role FROM users WHERE id = $1", user["id"]
             )
             tier_slug = str((tier_row or {}).get("subscription_tier") or "free")
+            role_slug = str((tier_row or {}).get("role") or "user")
+            # Tier/role-aware fill: free+paid opt-in; admin gets full stack on.
+            apply_upload_baseline_defaults(out, tier=tier_slug, role=role_slug)
             ent = get_entitlements_for_tier(tier_slug)
             pref_explicit = (
                 d.get("tiktok_burn_styled_cover") is not None
@@ -715,24 +750,24 @@ async def get_user_preferences(
         logger.exception("get_user_preferences failed: %s", e)
         # Return defaults so settings page loads; avoid 500 when DB schema mismatch or migration not run
         return apply_upload_baseline_defaults({
-            "autoCaptions": False, "autoThumbnails": True, "thumbnailInterval": "5",
-            "defaultPrivacy": "public", "aiHashtagsEnabled": False, "aiHashtagCount": "5",
+            "autoCaptions": None, "autoThumbnails": None, "thumbnailInterval": "5",
+            "defaultPrivacy": "public", "aiHashtagsEnabled": None, "aiHashtagCount": "5",
             "aiHashtagStyle": "mixed", "hashtagPosition": "end", "maxHashtags": "15",
             "alwaysHashtags": [], "blockedHashtags": [],
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": True, "discordWebhook": None,
-            "trillEnabled": True, "trillMinScore": 60, "trillSkipLowScore": False,
-            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o",
+            "trillEnabled": None, "trillMinScore": 60, "trillSkipLowScore": False,
+            "trillAiEnhance": None, "trillOpenaiModel": "gpt-4o",
             "trillLeaderboardOptIn": False, "trillMapSharingOptIn": False,
-            "styledThumbnails": True,
+            "styledThumbnails": None,
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
             "thumbnailSelectionMode": "sharpness", "thumbnail_selection_mode": "sharpness",
-            "thumbnailRenderPipeline": "auto", "thumbnail_render_pipeline": "auto",
+            "thumbnailRenderPipeline": "none", "thumbnail_render_pipeline": "none",
             "aiServiceDashcamOSD": False, "ai_service_dashcam_osd": False,
             "defaultVehicleMakeId": None, "defaultVehicleModelId": None,
             "default_vehicle_make_id": None, "default_vehicle_model_id": None,
             "thumbnail_personas": [], "thumbnailPersonas": [],
-        })
+        }, tier=str(user.get("subscription_tier") or "free"), role=str(user.get("role") or "user"))
 
 
 @router.post("/api/settings/preferences")
@@ -791,7 +826,9 @@ async def save_user_preferences_put(
     user: dict = Depends(get_current_user)
 ):
     """Backward-compatible alias for clients that still call PUT"""
-    return await save_user_preferences(prefs.model_dump(by_alias=True), user)
+    return await save_user_preferences(
+        prefs.model_dump(by_alias=True, exclude_unset=True), user
+    )
 
 
 # ============================================================

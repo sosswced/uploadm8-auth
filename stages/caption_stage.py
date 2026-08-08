@@ -1000,6 +1000,20 @@ def _build_narrative_prompt(
     audio_enrich_block = ""
     ac = getattr(ctx, "audio_context", None) or {}
     if isinstance(ac, dict):
+        # Belt-and-suspenders: raw Whisper text also lives in transcript_block;
+        # keep a short excerpt here so legacy prose still sees speech when the
+        # dedicated transcript_block was empty (e.g. restored from audio_context only).
+        if not transcript_block:
+            tx_fallback = (
+                str(getattr(ctx, "ai_transcript", None) or "").strip()
+                or str(ac.get("transcript") or "").strip()
+            )
+            if tx_fallback:
+                audio_enrich_block += (
+                    "\n━━ SPOKEN CONTENT (speech-to-text — factual; do not contradict) ━━\n"
+                    f"{tx_fallback[:6000]}\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                )
         gas = (ac.get("gpt_audio_summary") or "").strip()
         if gas:
             audio_enrich_block += (

@@ -30,19 +30,18 @@ PUBLIC_UPLOAD_TIERS: Tuple[str, ...] = tuple(PUBLIC_TIER_SLUGS)
 
 TIER_BASELINE_SUMMARY: Dict[str, str] = {
     "free": (
-        "Starter: autoThumbnails on, autoCaptions off, styled thumbs off, Thumbnail Studio off, "
-        "all AI services off, TikTok burn off, audio context off. Watermark enforced at worker."
+        "Starter: all AI / audio / caption / studio packages off by default. "
+        "Settings walkthrough explains crucial vs optional. Watermark enforced at worker."
     ),
     "creator_lite": (
-        "Creator Lite: light AI on by default (captions/thumbs/Vision); "
-        "Twelve Labs / Video Intelligence / Whisper / dashcam opt-in; TikTok burn opt-in; watermark off."
+        "Creator Lite: same opt-in posture as Starter (features off until enabled in Settings); "
+        "higher caps; watermark off. Admin roles start full-stack on."
     ),
     "creator_pro": (
-        "Creator Pro: same light AI defaults as Lite + styled AI thumbs; "
-        "heavy analyzers still opt-in; TikTok burn default on when unset."
+        "Creator Pro: opt-in AI defaults + higher caps / styled thumbs available when enabled."
     ),
-    "studio": "Studio: Pro-level AI defaults + higher caps (team seats, queue depth).",
-    "agency": "Agency: max caps + white-label + flex.",
+    "studio": "Studio: Pro-level caps + team seats; features still opt-in unless admin.",
+    "agency": "Agency: max caps + white-label; features still opt-in unless admin.",
 }
 
 # Every user-facing boolean that affects upload processing (camelCase keys).

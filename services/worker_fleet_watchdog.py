@@ -230,7 +230,7 @@ def evaluate_render_event_alerts(
 
 
 def dangerous_concurrency_warnings() -> List[str]:
-    """Flag env that historically OOMs a 2GB Render worker."""
+    """Flag env that historically OOMs a 2GB (or 512MB Starter) Render worker."""
     warnings: List[str] = []
     on_render = bool(os.environ.get("RENDER"))
     try:
@@ -245,9 +245,19 @@ def dangerous_concurrency_warnings() -> List[str]:
         mem = float(os.environ.get("RENDER_MEMORY_LIMIT_MB") or 0)
     except ValueError:
         mem = 0.0
+    if not mem:
+        try:
+            from core.process_stats import memory_limit_mb
+
+            detected = memory_limit_mb()
+            if detected:
+                mem = float(detected)
+        except Exception:
+            pass
     # On API web service RENDER may be set too — only warn when this looks like
     # a full/process worker profile or when concurrency is explicitly high.
     lane = (os.environ.get("WORKER_LANE") or "").strip().lower()
+    small = bool(mem and mem <= 768)
     if on_render and conc >= 2 and (not mem or mem <= 2048):
         warnings.append(
             f"WORKER_CONCURRENCY={conc} on ≤2GB risks Instance-failed OOM "
@@ -258,6 +268,27 @@ def dangerous_concurrency_warnings() -> List[str]:
             f"PUBLISH_CONCURRENCY={pub} on ≤2GB can OOM during concurrent downloads "
             "(prefer PUBLISH_CONCURRENCY=1)."
         )
+    if small or (on_render and mem and mem <= 512):
+        mm = (os.environ.get("MULTIMODAL_PARALLEL") or "").strip().lower()
+        if mm in ("1", "true", "yes", "on"):
+            warnings.append(
+                "MULTIMODAL_PARALLEL=true on ≤512–768MB often OOMs "
+                "(set MULTIMODAL_PARALLEL=false)."
+            )
+        vi_raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES") or "").strip()
+        try:
+            vi_bytes = int(vi_raw) if vi_raw else 0
+        except ValueError:
+            vi_bytes = 0
+        if vi_bytes >= 50 * 1024 * 1024:
+            warnings.append(
+                f"VIDEO_INTELLIGENCE_MAX_BYTES={vi_bytes} loads too much RAM on Starter "
+                "(cap ≤20971520 or disable VIDEO_INTELLIGENCE_STAGE_ENABLED)."
+            )
+        if not (os.environ.get("RENDER_MEMORY_LIMIT_MB") or "").strip():
+            warnings.append(
+                "Set RENDER_MEMORY_LIMIT_MB=512 so admit % matches the Starter plan."
+            )
     return warnings
 
 

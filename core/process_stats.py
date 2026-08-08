@@ -33,6 +33,35 @@ def _read_proc_rss_vms_mb() -> tuple[Optional[float], Optional[float]]:
     return None, None
 
 
+def children_rss_mb() -> Optional[float]:
+    """Sum RSS of direct child processes (FFmpeg encode peak often lives here)."""
+    try:
+        import glob
+
+        total_kb = 0
+        self_pid = os.getpid()
+        for path in glob.glob("/proc/[0-9]*/status"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                ppid = None
+                rss_kb = None
+                for line in text.splitlines():
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                    elif line.startswith("VmRSS:"):
+                        rss_kb = int(line.split()[1])
+                if ppid == self_pid and rss_kb:
+                    total_kb += rss_kb
+            except (OSError, ValueError, IndexError):
+                continue
+        if total_kb <= 0:
+            return None
+        return round(total_kb / 1024.0, 1)
+    except Exception:
+        return None
+
+
 def _cgroup_memory_limit_mb() -> Optional[float]:
     """Best-effort container memory limit (cgroup v1/v2) — accurate on Render."""
     paths = (
@@ -78,22 +107,37 @@ def memory_limit_mb() -> Optional[float]:
     return None
 
 
-def memory_admit_pct() -> float:
+def is_small_memory_plan(limit: Optional[float] = None) -> bool:
+    lim = limit if limit is not None else memory_limit_mb()
     try:
-        return float(os.environ.get("MEMORY_ADMIT_PCT", "75") or 75)
+        return lim is not None and float(lim) <= 768.0
+    except (TypeError, ValueError):
+        return False
+
+
+def memory_admit_pct() -> float:
+    # On 512MB Starter, default tighter than 2GB Standard unless env overrides.
+    default = "55" if is_small_memory_plan() else "75"
+    try:
+        return float(os.environ.get("MEMORY_ADMIT_PCT", default) or default)
     except ValueError:
-        return 75.0
+        return 55.0 if is_small_memory_plan() else 75.0
 
 
 def memory_hard_pct() -> float:
+    default = "70" if is_small_memory_plan() else "88"
     try:
-        return float(os.environ.get("MEMORY_HARD_PCT", "88") or 88)
+        return float(os.environ.get("MEMORY_HARD_PCT", default) or default)
     except ValueError:
-        return 88.0
+        return 70.0 if is_small_memory_plan() else 88.0
 
 
 def sample_memory_mb() -> Dict[str, Optional[float]]:
-    """Sample current RSS/VMS; track process peak since import."""
+    """Sample current RSS/VMS; track process peak since import.
+
+    ``effective_rss_mb`` = parent RSS + direct child RSS (FFmpeg). Admission
+    and pct_of_limit use effective when children are visible.
+    """
     global _peak_rss_mb
     rss, vms = _read_proc_rss_vms_mb()
     if rss is None and resource is not None:
@@ -105,16 +149,29 @@ def sample_memory_mb() -> Dict[str, Optional[float]]:
                 rss = usage.ru_maxrss / 1024.0
         except Exception:
             rss = None
-    if rss is not None and rss > _peak_rss_mb:
-        _peak_rss_mb = rss
+    child = children_rss_mb()
+    effective = rss
+    if rss is not None and child is not None:
+        effective = rss + child
+    peak_candidate = effective if effective is not None else rss
+    if peak_candidate is not None and peak_candidate > _peak_rss_mb:
+        _peak_rss_mb = peak_candidate
     limit = memory_limit_mb()
-    pct = round(100.0 * rss / limit, 1) if rss is not None and limit else None
+    pct_base = effective if effective is not None else rss
+    pct = (
+        round(100.0 * pct_base / limit, 1)
+        if pct_base is not None and limit
+        else None
+    )
     return {
         "rss_mb": round(rss, 1) if rss is not None else None,
+        "children_rss_mb": child,
+        "effective_rss_mb": round(effective, 1) if effective is not None else None,
         "vms_mb": round(vms, 1) if vms is not None else None,
         "peak_rss_mb": round(_peak_rss_mb, 1) if _peak_rss_mb else (round(rss, 1) if rss else None),
         "limit_mb": limit,
         "pct_of_limit": pct,
+        "small_plan": is_small_memory_plan(limit),
     }
 
 
@@ -162,6 +219,8 @@ def observability_sample() -> Dict[str, Any]:
         **load,
         "memory_pressure": pressure,
         "admission_blocked": pressure != "ok",
+        "admit_pct": memory_admit_pct(),
+        "hard_pct": memory_hard_pct(),
     }
 
 

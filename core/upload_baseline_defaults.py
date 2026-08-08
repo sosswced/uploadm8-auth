@@ -36,13 +36,13 @@ ENTRY_TIER_SLUGS: FrozenSet[str] = frozenset({"free"})
 
 # Universal floor: publish path succeeds without visiting Settings.
 UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
-    # Captions / hashtags
+    # Captions / hashtags — opt-in (Settings walkthrough)
     "auto_captions": False,
     "autoCaptions": False,
-    "auto_thumbnails": True,
-    "autoThumbnails": True,
-    "styled_thumbnails": True,
-    "styledThumbnails": True,
+    "auto_thumbnails": False,
+    "autoThumbnails": False,
+    "styled_thumbnails": False,
+    "styledThumbnails": False,
     "thumbnail_interval": 5,
     "thumbnailInterval": "5",
     "default_privacy": "public",
@@ -85,67 +85,65 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     # Thumbnail studio
     "thumbnail_selection_mode": "sharpness",
     "thumbnailSelectionMode": "sharpness",
-    "thumbnail_render_pipeline": "auto",
-    "thumbnailRenderPipeline": "auto",
-    "thumbnail_studio_enabled": True,
-    "thumbnailStudioEnabled": True,
-    "thumbnail_studio_engine_enabled": True,
-    "thumbnailStudioEngineEnabled": True,
+    "thumbnail_render_pipeline": "none",
+    "thumbnailRenderPipeline": "none",
+    "thumbnail_studio_enabled": False,
+    "thumbnailStudioEnabled": False,
+    "thumbnail_studio_engine_enabled": False,
+    "thumbnailStudioEngineEnabled": False,
     "thumbnail_persona_enabled": False,
     "thumbnailPersonaEnabled": False,
-    # Audio
-    "use_audio_context": True,
-    "useAudioContext": True,
-    "audio_transcription": True,
-    "audioTranscription": True,
+    # Audio — opt-in (Settings walkthrough explains why to enable)
+    "use_audio_context": False,
+    "useAudioContext": False,
+    "audio_transcription": False,
+    "audioTranscription": False,
     # youtube_shorts_copyright_trim is opt-in (DB default False). Do not inject False
     # here — a missing key lets live Settings win on create_context overlay.
-    # Trill / drive
-    "trill_enabled": True,
-    "trillEnabled": True,
+    # Trill / drive — opt-in
+    "trill_enabled": False,
+    "trillEnabled": False,
     "trill_min_score": 60,
     "trillMinScore": 60,
     "trill_skip_low_score": False,
     "trillSkipLowScore": False,
-    "trill_ai_enhance": True,
-    "trillAiEnhance": True,
+    "trill_ai_enhance": False,
+    "trillAiEnhance": False,
     "trill_openai_model": "gpt-4o",
     "trillOpenaiModel": "gpt-4o",
-    # Per-service AI toggles (Settings page mirrors these keys)
-    "ai_service_telemetry": True,
-    "aiServiceTelemetry": True,
-    # Heavy / minute-metered services default OFF — biggest free margin lever.
-    # Users opt in via Settings; billing only charges what is enabled.
+    # Per-service AI — all opt-in for free + paid; admin baseline turns these on.
+    "ai_service_telemetry": False,
+    "aiServiceTelemetry": False,
     "ai_service_dashcam_osd": False,
     "aiServiceDashcamOSD": False,
-    "ai_service_audio_signals": True,
-    "aiServiceAudioSignals": True,
-    "ai_service_music_detection": True,
-    "aiServiceMusicDetection": True,
-    "ai_service_audio_summary": True,
-    "aiServiceAudioSummary": True,
+    "ai_service_audio_signals": False,
+    "aiServiceAudioSignals": False,
+    "ai_service_music_detection": False,
+    "aiServiceMusicDetection": False,
+    "ai_service_audio_summary": False,
+    "aiServiceAudioSummary": False,
     "ai_service_emotion_signals": False,
     "aiServiceEmotionSignals": False,
-    "ai_service_caption_writer": True,
-    "aiServiceCaptionWriter": True,
-    "ai_service_thumbnail_designer": True,
-    "aiServiceThumbnailDesigner": True,
+    "ai_service_caption_writer": False,
+    "aiServiceCaptionWriter": False,
+    "ai_service_thumbnail_designer": False,
+    "aiServiceThumbnailDesigner": False,
     "ai_service_speech_to_text": False,
     "aiServiceSpeechToText": False,
     "ai_service_scene_understanding": False,
     "aiServiceSceneUnderstanding": False,
-    "ai_service_frame_inspector": True,
-    "aiServiceFrameInspector": True,
+    "ai_service_frame_inspector": False,
+    "aiServiceFrameInspector": False,
     "ai_service_video_analyzer": False,
     "aiServiceVideoAnalyzer": False,
 }
 
-# Free / entry: lighter defaults when keys are unset (faster, fewer API calls).
+# Free / entry: same opt-in posture as universal (all AI/feature masters off when unset).
 FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "auto_captions": False,
     "autoCaptions": False,
-    "auto_thumbnails": True,
-    "autoThumbnails": True,
+    "auto_thumbnails": False,
+    "autoThumbnails": False,
     "styled_thumbnails": False,
     "styledThumbnails": False,
     "use_audio_context": False,
@@ -182,7 +180,66 @@ FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "aiServiceVideoAnalyzer": False,
     "tiktok_burn_styled_cover": False,
     "tiktokBurnStyledCover": False,
+    "trill_enabled": False,
+    "trillEnabled": False,
+    "trill_ai_enhance": False,
+    "trillAiEnhance": False,
 }
+
+# Admin / master_admin only — full stack on when prefs are sparse (ops / QA).
+ADMIN_UPLOAD_BASELINE: Dict[str, Any] = {
+    "auto_captions": True,
+    "autoCaptions": True,
+    "auto_thumbnails": True,
+    "autoThumbnails": True,
+    "styled_thumbnails": True,
+    "styledThumbnails": True,
+    "use_audio_context": True,
+    "useAudioContext": True,
+    "audio_transcription": True,
+    "audioTranscription": True,
+    "thumbnail_studio_enabled": True,
+    "thumbnailStudioEnabled": True,
+    "thumbnail_studio_engine_enabled": True,
+    "thumbnailStudioEngineEnabled": True,
+    "thumbnail_render_pipeline": "auto",
+    "thumbnailRenderPipeline": "auto",
+    "trill_enabled": True,
+    "trillEnabled": True,
+    "trill_ai_enhance": True,
+    "trillAiEnhance": True,
+    "ai_service_telemetry": True,
+    "aiServiceTelemetry": True,
+    "ai_service_dashcam_osd": True,
+    "aiServiceDashcamOSD": True,
+    "ai_service_audio_signals": True,
+    "aiServiceAudioSignals": True,
+    "ai_service_music_detection": True,
+    "aiServiceMusicDetection": True,
+    "ai_service_audio_summary": True,
+    "aiServiceAudioSummary": True,
+    "ai_service_caption_writer": True,
+    "aiServiceCaptionWriter": True,
+    "ai_service_thumbnail_designer": True,
+    "aiServiceThumbnailDesigner": True,
+    "ai_service_speech_to_text": True,
+    "aiServiceSpeechToText": True,
+    "ai_service_scene_understanding": True,
+    "aiServiceSceneUnderstanding": True,
+    "ai_service_frame_inspector": True,
+    "aiServiceFrameInspector": True,
+    "ai_service_video_analyzer": True,
+    "aiServiceVideoAnalyzer": True,
+}
+
+ADMIN_DEFAULT_ROLES: FrozenSet[str] = frozenset({"admin", "master_admin"})
+ADMIN_DEFAULT_TIERS: FrozenSet[str] = frozenset({"master_admin"})
+
+
+def _is_admin_feature_defaults(role: Optional[str], tier: Optional[str]) -> bool:
+    r = str(role or "").strip().lower()
+    t = str(tier or "").strip().lower()
+    return r in ADMIN_DEFAULT_ROLES or t in ADMIN_DEFAULT_TIERS
 
 
 def _fill_missing(settings: Dict[str, Any], defaults: Mapping[str, Any]) -> None:
@@ -195,11 +252,18 @@ def apply_upload_baseline_defaults(
     settings: Optional[Dict[str, Any]],
     *,
     tier: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Merge universal (and optional tier) defaults into *settings* in place."""
+    """Merge baseline defaults into *settings* in place.
+
+    Free + paid: opt-in (features off when unset). Admin / master_admin: full stack on.
+    """
     out: Dict[str, Any] = settings if settings is not None else {}
     slug = str(tier or "").strip().lower()
-    # Free/entry first so universal baseline does not re-enable heavy AI toggles.
+    if _is_admin_feature_defaults(role, slug):
+        _fill_missing(out, ADMIN_UPLOAD_BASELINE)
+        _fill_missing(out, UNIVERSAL_UPLOAD_BASELINE)
+        return out
     if slug in ENTRY_TIER_SLUGS:
         _fill_missing(out, FREE_TIER_PROCESSING_DEFAULTS)
     _fill_missing(out, UNIVERSAL_UPLOAD_BASELINE)

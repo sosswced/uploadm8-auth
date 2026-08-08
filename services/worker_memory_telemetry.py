@@ -147,11 +147,14 @@ def starter_plan_recommendations(limit_mb: Optional[float]) -> List[str]:
     tips.append("Plan is ≤512–768MB — keep WORKER_CONCURRENCY=1 and PUBLISH_CONCURRENCY=1.")
     tips.append("Set MULTIMODAL_PARALLEL=false so audio/vision/VI do not run together.")
     tips.append(
-        "Cap or disable inline Video Intelligence "
-        "(VIDEO_INTELLIGENCE_STAGE_ENABLED=false or VIDEO_INTELLIGENCE_MAX_BYTES≤20971520)."
+        "On Starter, keep VIDEO_INTELLIGENCE_MAX_BYTES≤20971520 (or unset — runtime clamps). "
+        "Users opt out via Settings → Video Analyzer (VI); never set VIDEO_INTELLIGENCE_STAGE_ENABLED=false."
     )
     tips.append("Set FFMPEG_THREADS=1 and prefer WATERMARK_SINGLE_PASS=true.")
-    tips.append("Set RENDER_MEMORY_LIMIT_MB=512 explicitly so admit % matches reality.")
+    tips.append(
+        "RAM is detected from the container cgroup — RENDER_MEMORY_LIMIT_MB is optional "
+        "(only set it if cgroup is wrong)."
+    )
     tips.append("Disable non-essential loops on this instance (WORKER_ENABLE_KPI_COLLECTOR=false, etc.).")
     tips.append("Prefer upgrading the worker to ≥2GB Standard — HD encode + AI does not fit 512MB.")
     return tips

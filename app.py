@@ -39,6 +39,9 @@ try:
 except ImportError:
     pass
 
+# Fleet watchdog runs here — mark as API so worker-only RAM tips are skipped.
+os.environ.setdefault("UPLOADM8_PROCESS", "api")
+
 import asyncpg
 import stripe
 import redis.asyncio as aioredis

@@ -167,6 +167,9 @@ try:
 except ImportError:
     pass
 
+# Distinguish from API (fleet watchdog) so Starter-API RAM never false-alerts Standard workers.
+os.environ.setdefault("UPLOADM8_PROCESS", "worker")
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,

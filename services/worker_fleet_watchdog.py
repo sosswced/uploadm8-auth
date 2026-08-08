@@ -229,6 +229,30 @@ def evaluate_render_event_alerts(
     return alerts
 
 
+def _looks_like_background_worker() -> bool:
+    """True for worker.py; false for the API web service that hosts the fleet watchdog.
+
+    VI / multimodal RAM tips must use the *worker* plan. The API is often Starter
+    while the worker is Standard — never treat API cgroup RAM as the worker's.
+    """
+    proc = (os.environ.get("UPLOADM8_PROCESS") or "").strip().lower()
+    if proc in ("worker", "background_worker"):
+        return True
+    if proc in ("api", "web", "uvicorn"):
+        return False
+    try:
+        import sys
+
+        joined = " ".join(sys.argv).lower()
+        if "uvicorn" in joined or "gunicorn" in joined:
+            return False
+        if "worker.py" in joined:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def dangerous_concurrency_warnings() -> List[str]:
     """Flag env that historically OOMs a 2GB (or 512MB Starter) Render worker."""
     warnings: List[str] = []
@@ -241,19 +265,16 @@ def dangerous_concurrency_warnings() -> List[str]:
         pub = int(os.environ.get("PUBLISH_CONCURRENCY", "1") or 1)
     except ValueError:
         pub = 1
+    # Prefer cgroup (truth on Render). RENDER_MEMORY_LIMIT_MB is optional — not required in dashboard.
+    mem = 0.0
     try:
-        mem = float(os.environ.get("RENDER_MEMORY_LIMIT_MB") or 0)
-    except ValueError:
-        mem = 0.0
-    if not mem:
-        try:
-            from core.process_stats import memory_limit_mb
+        from core.process_stats import memory_limit_mb
 
-            detected = memory_limit_mb()
-            if detected:
-                mem = float(detected)
-        except Exception:
-            pass
+        detected = memory_limit_mb()
+        if detected:
+            mem = float(detected)
+    except Exception:
+        pass
     # On API web service RENDER may be set too — only warn when this looks like
     # a full/process worker profile or when concurrency is explicitly high.
     lane = (os.environ.get("WORKER_LANE") or "").strip().lower()
@@ -268,7 +289,9 @@ def dangerous_concurrency_warnings() -> List[str]:
             f"PUBLISH_CONCURRENCY={pub} on ≤2GB can OOM during concurrent downloads "
             "(prefer PUBLISH_CONCURRENCY=1)."
         )
-    if small or (on_render and mem and mem <= 512):
+    # Starter-only VI / multimodal tips: only when *this* process is the worker.
+    # Fleet watchdog runs on the API — API Starter RAM must not false-alert Standard workers.
+    if _looks_like_background_worker() and (small or (on_render and mem and mem <= 512)):
         mm = (os.environ.get("MULTIMODAL_PARALLEL") or "").strip().lower()
         if mm in ("1", "true", "yes", "on"):
             warnings.append(
@@ -282,12 +305,10 @@ def dangerous_concurrency_warnings() -> List[str]:
             vi_bytes = 0
         if vi_bytes >= 50 * 1024 * 1024:
             warnings.append(
-                f"VIDEO_INTELLIGENCE_MAX_BYTES={vi_bytes} loads too much RAM on Starter "
-                "(cap ≤20971520 or disable VIDEO_INTELLIGENCE_STAGE_ENABLED)."
-            )
-        if not (os.environ.get("RENDER_MEMORY_LIMIT_MB") or "").strip():
-            warnings.append(
-                "Set RENDER_MEMORY_LIMIT_MB=512 so admit % matches the Starter plan."
+                f"VIDEO_INTELLIGENCE_MAX_BYTES={vi_bytes} on a ≤768MB worker risks OOM. "
+                "Delete the override (runtime clamps to 20MiB on Starter) or set ≤20971520. "
+                "Per-user off switch is Settings → Video Analyzer (VI) — do not set "
+                "VIDEO_INTELLIGENCE_STAGE_ENABLED=false."
             )
     return warnings
 

@@ -18,13 +18,19 @@ GCP: enable the **Video Intelligence API** on the worker service account project
 return permission/API-not-enabled errors that surface as ``ctx.video_intelligence_context.error``.
 
 Env:
-  VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB / 20 MiB on ≤768MB; clamped 5 MiB - 1 GiB; loads full file into RAM)
+  VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB / 20 MiB on ≤768MB; clamped 5 MiB - 1 GiB;
+    loads full file into RAM. On ≤768MB plans, env values above 20 MiB are capped unless
+    VIDEO_INTELLIGENCE_MAX_BYTES_FORCE=1 — Starter OOMs on 100 MiB inline loads.)
+  VIDEO_INTELLIGENCE_MAX_BYTES_FORCE  If true, allow env MAX_BYTES above the small-plan cap
   VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 1800)  LRO wait for annotate_video result()
   VIDEO_INTELLIGENCE_INPUT_URI  Optional gs://... (skips local read; best for huge files)
   VIDEO_INTELLIGENCE_MAX_DURATION_SEC  If >0, skip when ffprobe duration exceeds this seconds.
                                        Default 0 = never skip on our side. Google still documents ~3h max
                                        per annotate request; longer clips may fail or need gs:// input.
   VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE  If false, label detection only (often faster than +shots).
+
+Per-user gate: Settings → Video Analyzer (aiServiceVideoAnalyzer). Do not use
+VIDEO_INTELLIGENCE_STAGE_ENABLED=false (deprecated / ignored).
 """
 
 from __future__ import annotations
@@ -52,6 +58,11 @@ _VI_DEFAULT_TIMEOUT_SEC = 1800  # 30 min
 _GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC = 3 * 3600  # Google documents ~3h per annotate (label/shots)
 
 
+def _env_force_vi_max_bytes() -> bool:
+    raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES_FORCE") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _default_vi_max_bytes() -> int:
     """100 MiB on Standard+; 20 MiB when plan looks ≤768MB (unless env set)."""
     try:
@@ -65,6 +76,7 @@ def _default_vi_max_bytes() -> int:
 
 
 def _parse_vi_max_bytes() -> int:
+    """Resolve inline VI byte cap; never allow 100MiB-class loads on Starter by accident."""
     raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES") or "").strip()
     if not raw:
         return _default_vi_max_bytes()
@@ -72,7 +84,22 @@ def _parse_vi_max_bytes() -> int:
         v = int(raw, 10)
     except ValueError:
         return _default_vi_max_bytes()
-    return max(_VI_MIN_MAX_BYTES, min(v, _VI_ABS_MAX_BYTES))
+    v = max(_VI_MIN_MAX_BYTES, min(v, _VI_ABS_MAX_BYTES))
+    try:
+        from core.process_stats import is_small_memory_plan, memory_limit_mb
+
+        small = is_small_memory_plan(memory_limit_mb())
+    except Exception:
+        small = False
+    if small and v > _VI_SMALL_PLAN_MAX_BYTES and not _env_force_vi_max_bytes():
+        logger.warning(
+            "VIDEO_INTELLIGENCE_MAX_BYTES=%s exceeds Starter-safe cap %s — clamping "
+            "(set VIDEO_INTELLIGENCE_MAX_BYTES_FORCE=1 to override, or use gs:// INPUT_URI).",
+            v,
+            _VI_SMALL_PLAN_MAX_BYTES,
+        )
+        return _VI_SMALL_PLAN_MAX_BYTES
+    return v
 
 
 def _parse_vi_timeout_sec() -> int:
@@ -100,9 +127,17 @@ VIDEO_INTELLIGENCE_MAX_BYTES = _parse_vi_max_bytes()
 VIDEO_INTELLIGENCE_TIMEOUT_SEC = _parse_vi_timeout_sec()
 VIDEO_INTELLIGENCE_INPUT_URI = (os.environ.get("VIDEO_INTELLIGENCE_INPUT_URI") or "").strip()
 VIDEO_INTELLIGENCE_MAX_DURATION_SEC = _parse_vi_max_duration_sec()
-VIDEO_INTELLIGENCE_STAGE_ENABLED = (
-    os.environ.get("VIDEO_INTELLIGENCE_STAGE_ENABLED", "true").lower() == "true"
-)
+# Infra kill-switch removed: VI stays available on the worker. Users toggle via
+# Settings → Video Analyzer (aiServiceVideoAnalyzer / video_intelligence pref).
+# Env VIDEO_INTELLIGENCE_STAGE_ENABLED=false is ignored (deprecated).
+_vi_stage_env = (os.environ.get("VIDEO_INTELLIGENCE_STAGE_ENABLED") or "true").strip().lower()
+if _vi_stage_env in ("0", "false", "no", "off"):
+    logger.warning(
+        "VIDEO_INTELLIGENCE_STAGE_ENABLED=%s is deprecated and ignored — "
+        "use Settings → Video Analyzer (VI) to opt out per user.",
+        _vi_stage_env,
+    )
+VIDEO_INTELLIGENCE_STAGE_ENABLED = True
 VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE = (
     os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE", "true").lower() == "true"
 )
@@ -583,9 +618,6 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     Populate ctx.video_intelligence_context with labels + shot boundaries.
     """
     ctx.mark_stage("video_intelligence")
-
-    if not VIDEO_INTELLIGENCE_STAGE_ENABLED:
-        raise SkipStage("Video Intelligence stage disabled via env")
 
     tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
     tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None

@@ -85,6 +85,15 @@ def _cgroup_memory_limit_mb() -> Optional[float]:
 
 
 def memory_limit_mb() -> Optional[float]:
+    """Container RAM limit in MiB.
+
+    Prefer cgroup (accurate on Render). ``RENDER_MEMORY_LIMIT_MB`` is an optional
+    override for local/dev when cgroup is missing — do not require it in the
+    Render dashboard; a stale ``512`` must not override a Standard (2GB) cgroup.
+    """
+    cg = _cgroup_memory_limit_mb()
+    if cg is not None:
+        return cg
     for key in ("RENDER_MEMORY_LIMIT_MB", "MEMORY_LIMIT_MB", "WEB_MEMORY_LIMIT_MB"):
         raw = (os.environ.get(key) or "").strip()
         if raw:
@@ -92,9 +101,6 @@ def memory_limit_mb() -> Optional[float]:
                 return float(raw)
             except ValueError:
                 pass
-    cg = _cgroup_memory_limit_mb()
-    if cg is not None:
-        return cg
     inst = (os.environ.get("RENDER_INSTANCE_TYPE") or "").lower()
     if "performance" in inst or inst.endswith("-8gb"):
         return 8192.0
@@ -102,6 +108,8 @@ def memory_limit_mb() -> Optional[float]:
         return 4096.0
     if "starter" in inst or "512" in inst:
         return 512.0
+    if "standard" in inst or "2gb" in inst:
+        return 2048.0
     if os.environ.get("RENDER"):
         return 2048.0
     return None

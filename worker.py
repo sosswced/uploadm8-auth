@@ -2103,6 +2103,17 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 _yt_copy_e,
             )
 
+        try:
+            from stages.tiktok_music_compliance import apply_tiktok_music_compliance_after_audio
+
+            await apply_tiktok_music_compliance_after_audio(ctx, db_pool)
+        except Exception as _tt_music_e:
+            logger.warning(
+                "[%s] tiktok music compliance step skipped: %s",
+                upload_id,
+                _tt_music_e,
+            )
+
         if resume_stage in (None, "post_telemetry", "post_transcode"):
             try:
                 await pipeline_checkpoint.save_post_audio_checkpoint(db_pool, ctx)

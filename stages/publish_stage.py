@@ -490,6 +490,32 @@ async def _tiktok_init_direct_post(
     )
 
 
+async def _tiktok_init_inbox_upload(
+    client: httpx.AsyncClient,
+    *,
+    access_token: str,
+    file_size: int,
+    chunk_size: int,
+    total_chunk_count: int,
+) -> httpx.Response:
+    """Upload-to-inbox draft (video.upload scope) so creator finishes in TikTok + adds Sound."""
+    return await client.post(
+        "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        },
+        json={
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": file_size,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
+            },
+        },
+    )
+
+
 # =====================================================================
 # Token Encryption (used by this stage + verify_stage)
 # =====================================================================
@@ -1369,6 +1395,26 @@ async def publish_to_tiktok(
             pass
 
     tiktok_title = _resolve_tiktok_publish_title(ctx, (tt_settings.get("title") or "").strip())
+    finish_in_app = bool(tt_settings.get("finish_in_tiktok_app"))
+
+    # ACR mute step wrote a failure — do not upload unprotected catalog audio.
+    try:
+        from stages.tiktok_music_compliance import get_tiktok_music_compliance_notice
+
+        _mc = get_tiktok_music_compliance_notice(ctx)
+        if isinstance(_mc, dict) and _mc.get("status") == "mute_failed":
+            return PlatformResult(
+                platform="tiktok",
+                success=False,
+                error_code="TIKTOK_MUSIC_MUTE_FAILED",
+                error_message=(
+                    _mc.get("message")
+                    or "Could not mute TikTok audio after catalog music was detected. "
+                    "Mute locally, enable Finish in TikTok app, or confirm a license and retry."
+                ),
+            )
+    except Exception:
+        pass
 
     try:
         file_size = video_path.stat().st_size
@@ -1377,53 +1423,64 @@ async def publish_to_tiktok(
         # (floor).  See _tiktok_file_upload_chunk_plan.
         chunk_size, total_chunk_count = _tiktok_file_upload_chunk_plan(file_size)
         logger.info(
-            "TikTok init: video_size=%s chunk_size=%s total_chunk_count=%s",
-            file_size, chunk_size, total_chunk_count,
+            "TikTok init: mode=%s video_size=%s chunk_size=%s total_chunk_count=%s",
+            "inbox" if finish_in_app else "direct_post",
+            file_size,
+            chunk_size,
+            total_chunk_count,
         )
 
         tiktok_privacy = str(tt_settings.get("privacy_level") or "").strip()
         privacy_overridden_unaudited = False
-        if _tiktok_force_private_unaudited_enabled():
-            if tiktok_privacy != "SELF_ONLY":
-                logger.info(
-                    "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY "
-                    "(user was informed of this at upload time; video will be private until audit passes)",
-                    tiktok_privacy,
-                )
-                privacy_overridden_unaudited = True
-            tiktok_privacy = "SELF_ONLY"
+        post_info: dict = {}
+        if not finish_in_app:
+            if _tiktok_force_private_unaudited_enabled():
+                if tiktok_privacy != "SELF_ONLY":
+                    logger.info(
+                        "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY "
+                        "(user was informed of this at upload time; video will be private until audit passes)",
+                        tiktok_privacy,
+                    )
+                    privacy_overridden_unaudited = True
+                tiktok_privacy = "SELF_ONLY"
 
-        cover_ms = _tiktok_cover_timestamp_ms(ctx)
-        post_info = tiktok_post_info_from_settings(tt_settings, title=tiktok_title)
-        post_info["video_cover_timestamp_ms"] = cover_ms
-        # Apply the (possibly clamped) privacy level after building post_info from settings
-        post_info["privacy_level"] = tiktok_privacy
-        logger.info(
-            "TikTok: video_cover_timestamp_ms=%s (%.2fs) privacy=%s unaudited_clamp=%s",
-            cover_ms,
-            cover_ms / 1000.0,
-            post_info.get("privacy_level"),
-            privacy_overridden_unaudited,
-        )
-
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Step 1: Initialize upload
-            init_resp = await _tiktok_init_direct_post(
-                client,
-                access_token=access_token,
-                post_info=post_info,
-                file_size=file_size,
-                chunk_size=chunk_size,
-                total_chunk_count=total_chunk_count,
+            cover_ms = _tiktok_cover_timestamp_ms(ctx)
+            post_info = tiktok_post_info_from_settings(tt_settings, title=tiktok_title)
+            post_info["video_cover_timestamp_ms"] = cover_ms
+            post_info["privacy_level"] = tiktok_privacy
+            logger.info(
+                "TikTok: video_cover_timestamp_ms=%s (%.2fs) privacy=%s unaudited_clamp=%s",
+                cover_ms,
+                cover_ms / 1000.0,
+                post_info.get("privacy_level"),
+                privacy_overridden_unaudited,
             )
 
+        async with httpx.AsyncClient(timeout=120) as client:
+            if finish_in_app:
+                init_resp = await _tiktok_init_inbox_upload(
+                    client,
+                    access_token=access_token,
+                    file_size=file_size,
+                    chunk_size=chunk_size,
+                    total_chunk_count=total_chunk_count,
+                )
+            else:
+                init_resp = await _tiktok_init_direct_post(
+                    client,
+                    access_token=access_token,
+                    post_info=post_info,
+                    file_size=file_size,
+                    chunk_size=chunk_size,
+                    total_chunk_count=total_chunk_count,
+                )
+
             if (
-                init_resp.status_code != 200
+                not finish_in_app
+                and init_resp.status_code != 200
                 and _tiktok_unaudited_private_only_error(init_resp.text)
                 and post_info.get("privacy_level") != "SELF_ONLY"
             ):
-                # After audit approval we must not silently rewrite public posts
-                # to Only me — surface TikTok's rejection so ops can fix scopes/app.
                 if not _tiktok_force_private_unaudited_enabled():
                     return PlatformResult(
                         platform="tiktok",
@@ -1479,8 +1536,6 @@ async def publish_to_tiktok(
                     error_message="No upload URL returned"
                 )
 
-            # Step 2: Upload video — first (N-1) parts are exactly chunk_size bytes
-            # (TikTok); final part is the remainder (may be larger than chunk_size).
             with open(video_path, "rb") as f:
                 offset = 0
                 for chunk_index in range(total_chunk_count):
@@ -1513,20 +1568,33 @@ async def publish_to_tiktok(
 
             logger.info(f"TikTok: uploaded {total_chunk_count} chunk(s), {file_size/1024/1024:.1f}MB total")
 
-            logger.info(f"TikTok publish accepted: publish_id={publish_id}")
+            logger.info(
+                "TikTok %s accepted: publish_id=%s",
+                "inbox draft" if finish_in_app else "publish",
+                publish_id,
+            )
+            payload = {
+                "tiktok_privacy_level": post_info.get("privacy_level") if post_info else None,
+                "tiktok_privacy_overridden_unaudited": privacy_overridden_unaudited,
+                "upload_privacy": (getattr(ctx, "privacy", None) or "public"),
+                "tiktok_disable_comment": post_info.get("disable_comment") if post_info else None,
+                "tiktok_disable_duet": post_info.get("disable_duet") if post_info else None,
+                "tiktok_disable_stitch": post_info.get("disable_stitch") if post_info else None,
+                "tiktok_inbox_draft": finish_in_app,
+                "tiktok_finish_in_app": finish_in_app,
+            }
+            if finish_in_app:
+                payload["tiktok_add_sound_checklist"] = (
+                    "Open TikTok → Inbox notification → edit draft → Add sound "
+                    "(Sounds or Commercial Music Library) → set visibility → Post."
+                )
+                payload["tiktok_open_url"] = "https://www.tiktok.com/"
             return PlatformResult(
                 platform="tiktok",
                 success=True,
                 publish_id=publish_id,
-                verify_status="pending",
-                response_payload={
-                    "tiktok_privacy_level": post_info.get("privacy_level"),
-                    "tiktok_privacy_overridden_unaudited": privacy_overridden_unaudited,
-                    "upload_privacy": (getattr(ctx, "privacy", None) or "public"),
-                    "tiktok_disable_comment": post_info.get("disable_comment"),
-                    "tiktok_disable_duet": post_info.get("disable_duet"),
-                    "tiktok_disable_stitch": post_info.get("disable_stitch"),
-                },
+                verify_status="pending" if not finish_in_app else "inbox_draft",
+                response_payload=payload,
             )
 
     except Exception as e:
@@ -1537,6 +1605,7 @@ async def publish_to_tiktok(
             error_code="PUBLISH_EXCEPTION",
             error_message=str(e)
         )
+
 
 
 async def _refresh_youtube_token(

@@ -16,6 +16,7 @@ from services.upload.list_detail import (
     scene_story_from_artifacts,
     timeline_story_from_artifacts,
     youtube_copyright_shorts_notice_from_artifacts,
+    tiktok_music_compliance_notice_from_artifacts,
 )
 from services.upload.prefs import (
     merge_upload_init_caption_creative,
@@ -127,4 +128,5 @@ __all__ = [
     "upload_card_thumbnail_href",
     "validate_upload_row_tiktok_settings",
     "youtube_copyright_shorts_notice_from_artifacts",
+    "tiktok_music_compliance_notice_from_artifacts",
 ]

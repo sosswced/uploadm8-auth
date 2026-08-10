@@ -150,6 +150,31 @@ def youtube_copyright_shorts_notice_from_artifacts(raw: Any) -> Optional[dict]:
     return None
 
 
+def tiktok_music_compliance_notice_from_artifacts(raw: Any) -> Optional[dict]:
+    """Parse ``tiktok_music_compliance`` blob from uploads.output_artifacts (jsonb)."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    v = raw.get("tiktok_music_compliance")
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            d = json.loads(v)
+            return d if isinstance(d, dict) else None
+        except Exception:
+            return None
+    return None
+
+
 def failure_phase_from_artifacts(raw: Any) -> Optional[str]:
     """Pipeline phase where a terminal failure occurred (``output_artifacts.failure_phase``)."""
     artifacts = _safe_json(raw, {})
@@ -167,6 +192,7 @@ _ARTIFACT_UI_KEYS = (
     "failure_diag",
     "transcode_status",
     "stage_status",
+    "tiktok_music_compliance",
 )
 
 
@@ -533,6 +559,9 @@ def build_upload_list_item(
         else None,
         "trill_metadata": _safe_json(d.get("trill_metadata"), None),
         "youtubeCopyrightShorts": youtube_copyright_shorts_notice_from_artifacts(
+            d.get("output_artifacts")
+        ),
+        "tiktokMusicCompliance": tiktok_music_compliance_notice_from_artifacts(
             d.get("output_artifacts")
         ),
         "thumbnail_render_method": thumbnail_render_method_from_artifacts(
@@ -961,6 +990,9 @@ def build_upload_detail_payload(d: dict) -> dict:
         "speed_bucket": d.get("speed_bucket"),
         "trill_metadata": _safe_json(d.get("trill_metadata"), None),
         "youtubeCopyrightShorts": youtube_copyright_shorts_notice_from_artifacts(
+            d.get("output_artifacts")
+        ),
+        "tiktokMusicCompliance": tiktok_music_compliance_notice_from_artifacts(
             d.get("output_artifacts")
         ),
         "thumbnail_render_method": thumbnail_render_method_from_artifacts(d.get("output_artifacts")),

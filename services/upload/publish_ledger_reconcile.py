@@ -37,6 +37,18 @@ def attempt_row_to_platform_result(row: Dict[str, Any]) -> Dict[str, Any]:
     }
     if tid:
         out["token_row_id"] = str(tid)
+    raw_payload = row.get("response_payload")
+    if isinstance(raw_payload, dict):
+        out["response_payload"] = raw_payload
+    elif isinstance(raw_payload, str) and raw_payload.strip():
+        try:
+            import json
+
+            parsed = json.loads(raw_payload)
+            if isinstance(parsed, dict):
+                out["response_payload"] = parsed
+        except Exception:
+            pass
     return out
 
 

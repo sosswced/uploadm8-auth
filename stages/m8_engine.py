@@ -64,7 +64,7 @@ from services.pipeline_ai_trace import record_ai_pipeline_trace
 
 logger = logging.getLogger("uploadm8-worker.m8")
 
-M8_ENGINE_VERSION = "1.4.0"
+M8_ENGINE_VERSION = "1.4.1"
 
 # When uploads reach caption before platforms are persisted, or transcode was skipped with
 # an empty ``platforms`` row, M8 must still rank + write per-platform captions. Matches
@@ -1102,23 +1102,42 @@ def _build_m8_prompt(
     )
 
     freestyle = (caption_style or "").lower().strip() == "freestyle"
+    has_speed_peak = False
+    try:
+        _pk = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
+        has_speed_peak = _pk is not None and float(_pk) >= 5
+    except (TypeError, ValueError):
+        has_speed_peak = False
+    general_footage_title_block = ""
+    if not has_speed_peak:
+        general_footage_title_block = """
+GENERAL / NON-DASHCAM TITLE MANDATE (no trusted MPH peak):
+- Lead with video_understanding.scene, fusion_narrative, video_intelligence object tracks,
+  vision landmarks/logos, transcript themes, and music — NOT roads or invented speeds.
+- Style / Tone / Voice from the CREATIVE SPINE MUST shape the title the same way as captions.
+- Example shapes (do not copy): cooking+story → "Garlic hits the pan before the guests do";
+  vlog+best_friend → "We finally opened the mystery box on camera";
+  tutorial+teacher → "Three cuts that salvage a muddy outdoor clip".
+- Never invent MPH, highways, or dashcam HUD facts when speed_consensus / dashcam_osd are empty.
+"""
     if freestyle:
-        title_evidence_contract = """
+        title_evidence_contract = f"""
 TITLE BUILD CONTRACT (FREESTYLE — invent SHAPE, not FACTS; VOICE STILL REQUIRED):
 1. Titles MUST obey the CREATIVE SPINE (style/tone/voice) — same writing personality as captions.
    Invent any title STRUCTURE (question, mid-scene entry, music braid, diary stamp).
 2. FACTS still come ONLY from scene_graph / HYDRATION + TIMELINE BRIEF:
      geo, trusted HUD MPH samples, trill.bucket, vision/OCR/landmarks, music artist/title,
-     driver, HUD date/time, timeline beats.
+     driver, HUD date/time, timeline beats, video_understanding.scene, fusion_narrative.
 3. NEVER invent place, speed, song, or driver. NEVER use generic wrappers
      ("The video is a high-energy first-person dashcam…").
 4. Prefer a real HUD speed SAMPLE when present; do not escalate a lone OCR spike.
 5. FORBIDDEN as the whole title: checklist stacks like "110 MPH · Road · Artist" or
    "Anchored in 110 MPH, Road". Weave facts into spoken voice.
 6. TikTok title = null. YouTube/IG/FB titles must feel platform-native and distinct.
+{general_footage_title_block}
 """
     else:
-        title_evidence_contract = """
+        title_evidence_contract = f"""
 TITLE BUILD CONTRACT (VOICE + EVIDENCE — REJECTION RULES APPLY):
 1. Titles MUST sound like the CREATIVE SPINE (Caption Style / Tone / Voice) — not a noun checklist.
    Delivery = style/tone/voice; facts = Scene Graph only. Example shape (do not copy):
@@ -1130,6 +1149,7 @@ TITLE BUILD CONTRACT (VOICE + EVIDENCE — REJECTION RULES APPLY):
      - trusted HUD / telemetry MPH (prefer samples over a lone peak)
      - trill.bucket (Cruise / Active / Spirited / Aggressive / Reckless)
      - vision / video_intelligence landmarks, logos, on-screen text, object tracks
+     - video_understanding.scene / title_suggestion / fusion_narrative (general footage backbone)
      - music.artist, music.title (ARTIST/TITLE words ONLY — never lyric paraphrases)
      - dashcam_osd.driver_name / date; timeline beats
 3. TITLES MUST NOT CONTAIN:
@@ -1138,12 +1158,13 @@ TITLE BUILD CONTRACT (VOICE + EVIDENCE — REJECTION RULES APPLY):
      - Generic dashcam wrappers ("The video is a…", "high-energy first-person dashcam…")
      - Checklist-only titles: "110 MPH · Place · Artist", "Anchored in …" as the entire title
 4. PLATFORM TITLE SHAPES (voice-first, evidence-grounded):
-     - YouTube: 40–90 chars; hook in the CREATIVE SPINE register; front-load a concrete evidence token
+     - YouTube: 40–90 chars when speed evidence exists; ≥12 chars of voiced prose otherwise
      - TikTok: title = null (caption-led)
      - Instagram / Facebook: 30–70 chars; same voice as captions — short prose or punchy line, not · stacks
 5. PER-PLATFORM VARIANCE:
      - YouTube vs IG/FB titles share ≤30% token overlap; change angle/hook, not just token order
 6. If no allowed evidence exists, title = null. Never invent place, speed, song, or driver.
+{general_footage_title_block}
 """
 
     if not generate_caption:
@@ -2455,11 +2476,37 @@ def rank_and_select(
                             title_validation_meta["caption_voice_title_used"] = True
                             title_set = True
                     if not title_set:
-                        fallback = _deterministic_evidence_title(scene_graph, platform=pl)
-                        if fallback:
-                            winner["title"] = fallback
-                            title_validation_meta["evidence_fallback_used"] = True
-                        else:
+                        # Prefer VU / fusion prose before speed formula — general
+                        # footage has no MPH peak and must not inherit dashcam templates.
+                        scene_hook = _scene_prose_hook(scene_graph)
+                        if scene_hook:
+                            ok_sc, _ = _validate_title(scene_hook, scene_graph, platform=pl)
+                            if ok_sc:
+                                winner["title"] = scene_hook
+                                title_validation_meta["scene_prose_title_used"] = True
+                                title_set = True
+                    if not title_set:
+                        peak = _speed_peak_mph(scene_graph)
+                        mus = scene_graph.get("music") or {}
+                        geo = scene_graph.get("geo") or {}
+                        strong_geo = bool(
+                            geo.get("city")
+                            or geo.get("gazetteer_place")
+                            or geo.get("road")
+                            or geo.get("place_sign")
+                        )
+                        allow_evidence = peak is not None or (
+                            strong_geo and bool(mus.get("artist") or mus.get("title"))
+                        )
+                        if allow_evidence:
+                            fallback = _deterministic_evidence_title(
+                                scene_graph, platform=pl
+                            )
+                            if fallback:
+                                winner["title"] = fallback
+                                title_validation_meta["evidence_fallback_used"] = True
+                                title_set = True
+                        if not title_set:
                             winner["title"] = None
                             title_validation_meta["evidence_fallback_used"] = False
                             title_validation_meta["title_set_to_null"] = True
@@ -2703,18 +2750,28 @@ def build_voice_fallback_selection(
     elif mus.get("artist") or mus.get("title"):
         music_bit = str(mus.get("artist") or mus.get("title"))
 
+    scene_prose = _scene_prose_hook(scene_graph)
+
     pov = str(vf.get("pov") or "").lower()
-    if "second" in pov or "you" in pov:
-        lead = "You're in it"
-    elif "first" in pov or "shotgun" in pov:
-        lead = "I'm riding shotgun"
+    if mph or place:
+        if "second" in pov or "you" in pov:
+            lead = "You're in it"
+        elif "first" in pov or "shotgun" in pov:
+            lead = "I'm riding shotgun"
+        else:
+            lead = "The road keeps the receipts"
     else:
-        lead = "The road keeps the receipts"
+        if "second" in pov or "you" in pov:
+            lead = "You're watching this land"
+        elif "first" in pov or "shotgun" in pov:
+            lead = "I'm still on this beat"
+        else:
+            lead = "This clip keeps the receipts"
 
     intensity = int(tf.get("intensity") or 2)
     bang = "!" if intensity >= 4 else ""
-    bits = [b for b in (mph, place, music_bit) if b]
-    mid = ", ".join(bits[:2]) if bits else (anchors[0] if anchors else "this stretch")
+    bits = [b for b in (mph, place, music_bit, scene_prose) if b]
+    mid = ", ".join(bits[:2]) if bits else (anchors[0] if anchors else "this moment")
     hook = str(sf.get("hook") or "scene").split("—")[0].strip()[:40]
 
     caption = f"{lead} — {mid}{bang} {hook} energy, still grounded in what the clip shows."
@@ -2727,15 +2784,26 @@ def build_voice_fallback_selection(
     if re.match(r"(?i)^\s*anchored\s+in\b", caption) or " · " in caption:
         caption = f"{lead} through {place or mid}{bang}".strip()
 
+    # Voice-shaped titles — never ship bare "N MPH through Place" when persona is set.
     title = ""
     if mph and place:
-        title = f"{mph} through {place}"[:100]
+        title = f"{mph} — {lead} through {place}"[:100]
+    elif mph and scene_prose:
+        title = f"{mph} — {scene_prose}"[:100]
+    elif scene_prose and music_bit:
+        title = f"{lead}: {scene_prose} — with {music_bit}"[:100]
+    elif scene_prose:
+        title = f"{lead}: {scene_prose}"[:100]
     elif place:
         title = f"{lead} near {place}"[:100]
     elif mph:
         title = f"{mph} — {lead}"[:100]
     else:
         title = (caption.split(".")[0] or lead)[:100]
+    # Prefer lifting the caption hook when it already carries voice + evidence.
+    from_cap = _platform_title_from_caption("youtube", caption)
+    if from_cap and len(from_cap) >= max(20, len(title) - 10):
+        title = from_cap[:100]
 
     plats = [str(p).lower() for p in (platforms or scene_graph.get("platforms") or ["tiktok"])]
     if not plats:
@@ -2805,6 +2873,57 @@ def _title_tokens(text: str) -> List[str]:
     return [t.lower() for t in _TITLE_TOKEN_RE.findall(str(text or ""))]
 
 
+def _speed_peak_mph(scene_graph: Dict[str, Any]) -> Optional[float]:
+    """Trusted consensus peak when present; None for general / non-dashcam footage."""
+    try:
+        mph_val = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
+        if mph_val is None and "speed_consensus" not in scene_graph:
+            geo = scene_graph.get("geo") or {}
+            osd = scene_graph.get("dashcam_osd") or {}
+            mph_val = geo.get("max_speed_mph")
+            if mph_val is None:
+                mph_val = osd.get("max_speed_mph")
+        if mph_val is None:
+            return None
+        mph = float(mph_val)
+        return mph if mph >= 5 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _scene_prose_hook(scene_graph: Dict[str, Any]) -> str:
+    """First publishable sentence from VU / fusion — feeds non-dashcam title voice."""
+    vu = scene_graph.get("video_understanding") or {}
+    candidates = [
+        str(vu.get("title_suggestion") or "").strip(),
+        str(vu.get("scene") or "").strip(),
+        str(scene_graph.get("fusion_narrative") or "").strip(),
+        str(scene_graph.get("hydration_story") or "").strip(),
+    ]
+    for raw in candidates:
+        if not raw or len(raw) < 12:
+            continue
+        # Skip checklist / Captured-at dumps — those are not persona titles.
+        if " · " in raw and not re.search(
+            r"\b(through|near|on|at|with|into|while|when)\b", raw, re.I
+        ):
+            continue
+        if "captured at" in raw.lower():
+            continue
+        try:
+            from services.m8_grounding_pass import is_formula_stub_caption
+
+            if is_formula_stub_caption(raw):
+                continue
+        except Exception:
+            if re.match(r"(?i)^\s*anchored\s+in\b", raw):
+                continue
+        first = re.split(r"(?<=[.!?])\s+", raw, maxsplit=1)[0].strip()
+        if len(first) >= 12:
+            return first[:90]
+    return ""
+
+
 def _validate_title(
     candidate: str,
     scene_graph: Dict[str, Any],
@@ -2868,9 +2987,11 @@ def _validate_title(
 
     # Platform-specific length sanity (HARD floors/ceilings — the contract
     # already asks for shape but the LLM sometimes ignores it).
+    # General footage (no trusted MPH): allow shorter persona hooks.
     plat = (platform or "").lower()
     L = len(title)
-    if plat == "youtube" and (L < 20 or L > 100):
+    yt_min = 20 if _speed_peak_mph(scene_graph) is not None else 12
+    if plat == "youtube" and (L < yt_min or L > 100):
         return False, f"youtube_length:{L}"
     if plat in ("instagram", "facebook") and (L < 12 or L > 100):
         return False, f"{plat}_length:{L}"
@@ -2943,13 +3064,18 @@ def _deterministic_evidence_title(
             if not isinstance(ot, dict):
                 continue
             d = str(ot.get("description") or "").strip()
-            if d:
+            if d and not is_generic_vision_label(d):
                 visual_token = d.title()
                 break
     if not visual_token:
         landmarks = vision.get("landmarks") or []
         if landmarks:
             visual_token = str(landmarks[0]).strip().title()
+    # General footage: prefer a spoken VU / fusion hook over bare geo.
+    if not speed_token:
+        scene_hook = _scene_prose_hook(scene_graph)
+        if scene_hook and len(scene_hook) >= 12:
+            visual_token = scene_hook
 
     music_token = ""
     artist = str(music.get("artist") or "").strip()
@@ -2968,7 +3094,8 @@ def _deterministic_evidence_title(
         # Dashcam / telemetry: never lead with place-only when speed exists.
         cluster_order = ["speed", "geo", "music", "trill", "visual"]
     else:
-        cluster_order = ["geo", "speed", "trill", "visual", "music"]
+        # Non-dashcam: visual / VU prose first, then music / place.
+        cluster_order = ["visual", "music", "geo", "trill", "speed"]
 
     cluster_token: Dict[str, str] = {
         "geo": place_token,
@@ -3001,12 +3128,13 @@ def _deterministic_evidence_title(
         core = f"{speed} through {place}"
     elif speed:
         core = f"{speed} run"
+    elif visual and not speed:
+        # General footage: VU / VI prose leads — never force "Through {place}".
+        core = visual
     elif place:
         core = f"Through {place}"
     elif music_bit:
         core = music_bit
-    elif visual:
-        core = visual
     else:
         core = ordered[0][1]
 
@@ -3015,6 +3143,8 @@ def _deterministic_evidence_title(
         extras.append(f"with {music_bit}")
     elif bucket and bucket not in core:
         extras.append(f"{bucket} run")
+    elif place and place not in core and not speed:
+        extras.append(f"near {place}")
     elif visual and visual not in core and not place:
         extras.append(visual)
     if extras:
@@ -3402,6 +3532,10 @@ def apply_selection_to_context(
                 if rebuilt and rebuilt.lower() == str(title_lo).lower():
                     rebuilt = None
                 if not rebuilt:
+                    scene_hook = _scene_prose_hook(scene_for_variance)
+                    if scene_hook and scene_hook.lower() != str(title_lo).lower():
+                        rebuilt = scene_hook
+                if not rebuilt and _speed_peak_mph(scene_for_variance) is not None:
                     rebuilt = _deterministic_evidence_title(
                         scene_for_variance, platform=pl_lo, preferred_cluster=next_cluster
                     )

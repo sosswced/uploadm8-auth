@@ -1338,8 +1338,81 @@ def _title_has_grounded_voice(title: str, pool: EvidencePool) -> bool:
     return _title_mentions_place_or_music(t, pool)
 
 
+def _title_cites_scene_evidence(title: str, pool: EvidencePool) -> bool:
+    """True when title cites place/music/VU/VI/landmark/logo — works without MPH."""
+    if _title_mentions_place_or_music(title, pool):
+        return True
+    blob = scrub_machine_publish_dump(title or "").strip().lower()
+    if not blob:
+        return False
+    for phrase in (
+        pool.video_understanding_phrase,
+        pool.video_summary_phrase,
+        pool.place_sign,
+        pool.transcript_phrase,
+    ):
+        p = scrub_machine_publish_dump(str(phrase or "")).strip().lower()
+        if len(p) >= 6 and (p in blob or any(tok in blob for tok in re.findall(r"[a-z0-9]{4,}", p)[:6])):
+            return True
+    for lm in (pool.vision_landmarks or [])[:4]:
+        s = str(lm or "").strip().lower()
+        if len(s) >= 4 and s in blob:
+            return True
+    for logo in (pool.vision_logos or [])[:4]:
+        s = str(logo or "").strip().lower()
+        if len(s) >= 4 and s in blob:
+            return True
+    for row in (pool.vi_object_tracks or [])[:6]:
+        if not isinstance(row, dict):
+            continue
+        d = str(row.get("description") or "").strip().lower()
+        if len(d) >= 4 and d in blob:
+            return True
+    for lbl in (pool.video_labels or [])[:8]:
+        s = str(lbl or "").strip().lower()
+        if len(s) >= 5 and s in blob and not is_generic_vision_label(s):
+            return True
+    return False
+
+
+def _title_has_publishable_voice(title: str, pool: EvidencePool) -> bool:
+    """Non-stub creative title worth keeping for dashcam *or* general footage."""
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t or len(t) < 16:
+        return False
+    place = _format_place(pool)
+    if place and t.lower() == place.lower():
+        return False
+    # Wrong MPH claims must stay thin so scrub/rebuild can run.
+    if re.search(r"\b\d{2,3}\s*mph\b", t, re.I) and not _title_mentions_trusted_speed(
+        t, pool
+    ):
+        return False
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(t):
+            return False
+    except Exception:
+        if re.match(r"(?i)^\s*anchored\s+in\b", t):
+            return False
+    checklist = bool(
+        " · " in t
+        and not re.search(
+            r"\b(through|near|on|at|with|into|under|over|from|while|when|along|past)\b",
+            t,
+            re.I,
+        )
+    )
+    if checklist or _is_generic_caption(t) or _is_machine_label_dump(t):
+        return False
+    if _title_has_grounded_voice(t, pool):
+        return True
+    return _title_cites_scene_evidence(t, pool)
+
+
 def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
-    """Creative copy with place/music but missing peak — soft-merge MPH, don't formula-wipe."""
+    """Creative copy with place/music/scene but missing peak — soft-merge MPH, don't formula-wipe."""
     t = scrub_machine_publish_dump(title or "").strip()
     if not t or len(t) < 20:
         return False
@@ -1354,7 +1427,9 @@ def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
         return False
     if _is_generic_caption(t) or _is_machine_label_dump(t):
         return False
-    if not _title_mentions_place_or_music(t, pool):
+    if not (
+        _title_mentions_place_or_music(t, pool) or _title_cites_scene_evidence(t, pool)
+    ):
         return False
     # Needs a trusted peak we can inject.
     return bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
@@ -1397,14 +1472,16 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     Place-only titles are always thin when richer beats exist — including titles
     longer than 36 chars that are still just geo prose without MPH/music.
     Creative titles that already cite trusted peak speed and place/music are kept.
-    Place/music creative voice missing MPH is *not* thin — soft-inject MPH instead
-    of wiping to a · checklist formula.
+    Place/music/scene creative voice missing MPH is *not* thin — soft-inject MPH
+    instead of wiping to a compact formula.
+    General (non-dashcam) footage: publishable scene voice is never wiped just
+    for being short — only stubs/checklists/generics are thin.
     """
     t = scrub_machine_publish_dump(title or "").strip()
     if not t:
         return True
-    # Grounded voice wins over the compact speed·place·music template.
-    if _title_has_grounded_voice(t, pool):
+    # Grounded / publishable voice wins over the compact speed·place·music template.
+    if _title_has_grounded_voice(t, pool) or _title_has_publishable_voice(t, pool):
         return False
     has_speed = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
     has_music = bool(pool.music_artist or pool.music_title)
@@ -1428,7 +1505,7 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     place = _format_place(pool)
     if place and blob == place.lower():
         return True
-    # Soft MPH gate: salvageable place/music prose survives; inject MPH later.
+    # Soft MPH gate: salvageable place/music/scene prose survives; inject MPH later.
     # Wrong MPH claims stay thin so scrub/rebuild can run.
     if has_speed and not mentions_speed:
         if re.search(r"\b\d{2,3}\s*mph\b", t, re.I):
@@ -1436,7 +1513,10 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
         if _title_is_salvageable_voice(t, pool):
             return False
         if (
-            _title_mentions_place_or_music(t, pool)
+            (
+                _title_mentions_place_or_music(t, pool)
+                or _title_cites_scene_evidence(t, pool)
+            )
             and len(t) >= 20
             and " · " not in t
             and not _is_generic_caption(t)
@@ -1444,6 +1524,22 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
         ):
             return False
         return True
+    # No trusted peak: keep short persona/scene titles; only wipe empty/generic stubs.
+    if not has_speed:
+        if _is_generic_caption(t) or _is_machine_label_dump(t):
+            return True
+        try:
+            from services.m8_grounding_pass import is_formula_stub_caption
+
+            if is_formula_stub_caption(t):
+                return True
+        except Exception:
+            if re.match(r"(?i)^\s*anchored\s+in\b", t):
+                return True
+        # Music available but unused — only thin when title is also short + weak.
+        if has_music and not mentions_music and len(t) < 24:
+            return True
+        return False
     if has_music and not mentions_music and not mentions_speed and len(t) < 40:
         return True
     if has_scene and len(t) < 28 and not mentions_speed:
@@ -2342,16 +2438,39 @@ def enforce_hydration(
             if _title_is_salvageable_voice(working, pool) or _title_is_salvageable_voice(
                 pre_scrub or working, pool
             ):
-                base = working if _title_mentions_place_or_music(working, pool) else (
+                base = working if (
+                    _title_mentions_place_or_music(working, pool)
+                    or _title_cites_scene_evidence(working, pool)
+                ) else (
                     pre_scrub or working
                 )
                 # Prefer post-scrub text; if scrub emptied place tokens, use pre.
-                if not _title_mentions_place_or_music(base, pool):
+                if not (
+                    _title_mentions_place_or_music(base, pool)
+                    or _title_cites_scene_evidence(base, pool)
+                ):
                     base = pre_scrub or working
                 new = _inject_peak_mph_into_title(base, pool)
                 return new if new and new != raw.strip() else (
                     working if working != raw.strip() else None
                 )
+            # Keep publishable persona/scene voice — soft-inject MPH when peak exists
+            # instead of wiping to compact "N MPH through Place — with Artist".
+            keep_base = working
+            if _title_has_publishable_voice(pre_scrub or "", pool) and not _title_has_publishable_voice(
+                working, pool
+            ):
+                keep_base = pre_scrub or working
+            if _title_has_publishable_voice(keep_base, pool):
+                if pool.max_speed_mph and pool.max_speed_mph >= 5:
+                    new = _inject_peak_mph_into_title(keep_base, pool)
+                    return new if new and new != raw.strip() else (
+                        keep_base if keep_base != raw.strip() else None
+                    )
+                return keep_base if keep_base != raw.strip() else None
+            # Formula wipe only when we have a real speed peak (dashcam grounding).
+            if not (pool.max_speed_mph and pool.max_speed_mph >= 5):
+                return working if working != raw.strip() else None
             new = title_anchor[:100]
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None

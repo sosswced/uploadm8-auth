@@ -447,6 +447,7 @@ def _platform_results_payload(ctx: JobContext) -> Optional[list]:
             "http_status": r.http_status,
             "views": r.views,
             "likes": r.likes,
+            "response_payload": getattr(r, "response_payload", None),
         }
         for r in ctx.platform_results
     ]

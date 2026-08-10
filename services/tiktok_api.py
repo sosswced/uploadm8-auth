@@ -395,7 +395,15 @@ def normalize_tiktok_post_settings(raw: Any) -> dict:
         "brand_content": _coerce_bool(raw.get("brand_content"), False),
         "title": str(raw.get("title") or "").strip(),
         "user_consent": _coerce_bool(raw.get("user_consent"), False),
+        "mute_audio_for_tiktok": _coerce_bool(raw.get("mute_audio_for_tiktok"), False),
+        "keep_catalog_audio_licensed": _coerce_bool(
+            raw.get("keep_catalog_audio_licensed"), False
+        ),
+        "finish_in_tiktok_app": _coerce_bool(raw.get("finish_in_tiktok_app"), False),
     }
+    # Mute / inbox-draft wins over keep-licensed attestation.
+    if out["mute_audio_for_tiktok"] or out["finish_in_tiktok_app"]:
+        out["keep_catalog_audio_licensed"] = False
     pac = str(
         raw.get("platform_account_id") or raw.get("open_id") or raw.get("account_id") or ""
     ).strip()
@@ -414,14 +422,17 @@ def validate_tiktok_post_settings(settings: Mapping[str, Any]) -> list[str]:
     """Return human-readable validation errors (empty list = OK)."""
     s = normalize_tiktok_post_settings(settings)
     errors: list[str] = []
-    if not s.get("privacy_level"):
-        errors.append("Select who can view this TikTok post.")
-    elif s["privacy_level"] not in TIKTOK_KNOWN_PRIVACY_LEVELS:
-        errors.append("Invalid TikTok privacy level.")
-    else:
-        allowed = s.get("allowed_privacy_levels") or []
-        if allowed and s["privacy_level"] not in allowed:
-            errors.append("Selected privacy level is not available for this TikTok account.")
+    finish_in_app = bool(s.get("finish_in_tiktok_app"))
+    # Inbox/draft: creator finishes privacy + Sound in TikTok — privacy optional here.
+    if not finish_in_app:
+        if not s.get("privacy_level"):
+            errors.append("Select who can view this TikTok post.")
+        elif s["privacy_level"] not in TIKTOK_KNOWN_PRIVACY_LEVELS:
+            errors.append("Invalid TikTok privacy level.")
+        else:
+            allowed = s.get("allowed_privacy_levels") or []
+            if allowed and s["privacy_level"] not in allowed:
+                errors.append("Selected privacy level is not available for this TikTok account.")
     if not s.get("user_consent"):
         errors.append("Confirm TikTok posting consent before publishing.")
     if s.get("commercial_disclosure_enabled"):

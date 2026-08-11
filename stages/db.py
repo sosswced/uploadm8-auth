@@ -302,17 +302,24 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
 
         role = None
         tier = None
+        subscription_status = None
         try:
             ur = await conn.fetchrow(
-                "SELECT role, subscription_tier FROM users WHERE id = $1",
+                "SELECT role, subscription_tier, subscription_status FROM users WHERE id = $1",
                 user_id,
             )
             if ur:
                 role = ur.get("role")
                 tier = ur.get("subscription_tier")
+                subscription_status = ur.get("subscription_status")
         except Exception:
             pass
-        apply_upload_baseline_defaults(result, tier=tier, role=role)
+        apply_upload_baseline_defaults(
+            result,
+            tier=tier,
+            role=role,
+            subscription_status=subscription_status,
+        )
     except Exception as e:
         logger.debug("upload baseline defaults skipped for %s: %s", user_id, e)
 
@@ -979,6 +986,9 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
         "hydration_report",
         "hydration_payload",
         "grounding_score_v1",
+        "fact_ledger_v1",
+        "fact_ledger_apply",
+        "fact_ledger_gap",
         "coach_hints",
         "place_evidence_v1",
         "shot_list_v1",

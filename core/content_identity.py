@@ -286,6 +286,9 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
     consensus = get_speed_consensus(ctx)
     peak_mph = float(consensus.get("peak_mph") or 0)
     speed_conf = str(consensus.get("confidence") or "none")
+    # Scrub against publishable peak only — medium HUD must not keep ghost MPH
+    # in hero facts / subject (fail closed when not high).
+    scrub_peak = peak_mph if speed_conf == "high" else 0.0
 
     groups = _group_tokens(tokens)
     providers_seen = sorted({t["provider"] for t in tokens})
@@ -302,7 +305,7 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
 
     hero_facts: List[Dict[str, Any]] = []
     for g in ranked[:8]:
-        text = scrub_untrusted_speed_claims(g["text"], peak_mph)
+        text = scrub_untrusted_speed_claims(g["text"], scrub_peak)
         if not text:
             continue
         hero_facts.append({
@@ -327,7 +330,7 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
     subject = _first_sentence(scene_txt) if scene_txt else ""
     if not subject and hero_facts:
         subject = hero_facts[0]["text"]
-    subject = scrub_untrusted_speed_claims(subject, peak_mph)
+    subject = scrub_untrusted_speed_claims(subject, scrub_peak)
 
     multi_provider = [g for g in groups if len(g["providers"]) >= 2]
     if not tokens:
@@ -340,8 +343,12 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
         confidence = "low"
 
     do_not_invent: List[str] = []
-    if peak_mph >= 10 and speed_conf in ("high", "medium"):
+    if peak_mph >= 10 and speed_conf == "high":
         do_not_invent.append(f"the only publishable speed is {peak_mph:.0f} MPH")
+    elif peak_mph >= 10 and speed_conf == "medium":
+        do_not_invent.append(
+            f"HUD suggests ~{peak_mph:.0f} MPH but it is unverified — omit from titles"
+        )
     else:
         do_not_invent.append("no verified speed data — never state a speed")
     vc = getattr(ctx, "vision_context", None) or {}

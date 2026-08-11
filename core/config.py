@@ -101,6 +101,12 @@ def _env_active_default_true(name: str) -> bool:
 # Default active; set UPLOADM8_HYDRATION_PAYLOAD=false / off / 0 / no / 2 to disable.
 HYDRATION_PAYLOAD_ENABLED = _env_active_default_true("UPLOADM8_HYDRATION_PAYLOAD")
 
+# FactLedger v1 — AND-class soft-weave + hashtag pad (titles stay LLM-led).
+# Default active; set UPLOADM8_FACT_LEDGER=false / off / 0 / no / 2 to disable.
+FACT_LEDGER_ENABLED = _env_active_default_true("UPLOADM8_FACT_LEDGER")
+# When true, publish skips platforms if publishable classes remain missing after weave.
+FACT_LEDGER_STRICT = _env_truthy("UPLOADM8_FACT_LEDGER_STRICT")
+
 # Optional signup email confirmation (stores rows in signup_verifications).
 SIGNUP_EMAIL_VERIFICATION = _env_truthy("SIGNUP_EMAIL_VERIFICATION")
 # Legacy env: unverified users (email_verified=false) are always blocked at login, refresh,
@@ -294,18 +300,10 @@ OAUTH_CONFIG = {
 # TikTok
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-# Content Posting Direct Post: audited by default after TikTok portal approval.
-# Set TIKTOK_APP_AUDITED=0 to revert to private-only UX, or use the force flag below.
-TIKTOK_APP_AUDITED = (os.environ.get("TIKTOK_APP_AUDITED") or "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-# Emergency rollback: force SELF_ONLY even when audited.
-TIKTOK_FORCE_PRIVATE_UNAUDITED = (
-    os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or ""
-).strip().lower() in ("1", "true", "yes", "on")
+# Content Posting Direct Post: audited hardcoded True (ignore Render env).
+TIKTOK_APP_AUDITED = True
+# Emergency rollback disabled in code (see tiktok_force_private_unaudited()).
+TIKTOK_FORCE_PRIVATE_UNAUDITED = False
 # Separate secret used to verify TikTok webhook payloads (HMAC-SHA256).
 # Set this to the value shown in TikTok Developer Portal -> your app ->
 # Webhooks -> "Client Secret". Falls back to TIKTOK_CLIENT_SECRET if

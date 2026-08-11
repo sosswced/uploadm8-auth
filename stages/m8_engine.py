@@ -256,7 +256,7 @@ def _sanitize_evidence_matrix(raw: Any, expected_max: int) -> Optional[Dict[str,
             cap_raw = item.get("caption")
         cap = strip_stray_hashtag_json_blob(str(cap_raw or "").strip())[:520]
         tags = item.get("hashtags") or []
-        tl = [str(x).strip().lstrip("#") for x in (tags if isinstance(tags, list) else []) if str(x).strip()][:12]
+        tl = [str(x).strip().lstrip("#") for x in (tags if isinstance(tags, list) else []) if str(x).strip()][:15]
         if not cap:
             continue
         clean.append(
@@ -327,8 +327,6 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
     if story:
         lines.append(f"SCENE STORY: {story[:1100]}")
 
-    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
-
     osd = scene_graph.get("dashcam_osd") or {}
     geo = scene_graph.get("geo") or {}
     music = scene_graph.get("music") or {}
@@ -345,15 +343,10 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
                 peak = float(cons.get("peak_mph") or 0)
                 if peak < 5 and conf == "medium":
                     peak = float(cons.get("candidate_peak_mph") or 0)
-            elif "speed_consensus" not in scene_graph and isinstance(osd, dict):
-                geo_peak = float((geo or {}).get("max_speed_mph") or 0) if isinstance(geo, dict) else 0.0
-                raw_osd_peak = float(osd.get("max_speed_mph") or 0)
-                peak, _ = trusted_peak_speed_mph(
-                    telemetry_max=geo_peak,
-                    osd_max=raw_osd_peak,
-                    series_peak=osd_series_peak_mph(osd),
-                )
-                conf = "high" if peak >= 5 else "none"
+            elif "speed_consensus" not in scene_graph:
+                # Fail closed — never promote raw geo/OSD into SPEED CONTRACT.
+                peak = 0.0
+                conf = "none"
         except (TypeError, ValueError):
             peak = 0.0
         if peak >= 5 and conf == "high":
@@ -375,20 +368,28 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
             )
         series = osd.get("speed_series") if isinstance(osd.get("speed_series"), list) else []
         sample_bits: List[str] = []
-        for entry in series[:6]:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                mph = float(entry.get("mph") or entry.get("speed_mph") or 0)
-            except (TypeError, ValueError):
-                continue
-            if mph < 5:
-                continue
-            try:
-                t_s = float(entry.get("t_s") or 0)
-            except (TypeError, ValueError):
-                t_s = 0.0
-            sample_bits.append(f"{int(round(mph))}mph@{t_s:.0f}s")
+        # Only dump HUD samples when consensus is high — candidate/medium
+        # would re-inject lon/lat ghosts into the prompt.
+        allow_hud_samples = bool(
+            cons
+            and str(cons.get("confidence") or "") == "high"
+            and float(cons.get("peak_mph") or 0) >= 5
+        )
+        if allow_hud_samples:
+            for entry in series[:6]:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    mph = float(entry.get("mph") or entry.get("speed_mph") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if mph < 5:
+                    continue
+                try:
+                    t_s = float(entry.get("t_s") or 0)
+                except (TypeError, ValueError):
+                    t_s = 0.0
+                sample_bits.append(f"{int(round(mph))}mph@{t_s:.0f}s")
         if sample_bits:
             fact_bits.append("HUD speeds: " + ", ".join(sample_bits))
         fs = osd.get("first_seen") or {}
@@ -539,6 +540,14 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         _place_signs = []
     if tel:
         n_pts = len(getattr(tel, "points", None) or [])
+        # Publishable peak only on geo — raw tel/OSD MPH must not leak into
+        # must_use / evidence titles via geo.max_speed_mph.
+        try:
+            from core.speed_consensus import publishable_peak_mph
+
+            _geo_peak = publishable_peak_mph(ctx)
+        except Exception:
+            _geo_peak = 0.0
         geo = {
             "display": getattr(tel, "location_display", None),
             "start_display": getattr(tel, "location_start_display", None),
@@ -552,8 +561,8 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "mid_lon": getattr(tel, "mid_lon", None),
             "start_lat": getattr(tel, "start_lat", None),
             "start_lon": getattr(tel, "start_lon", None),
-            "max_speed_mph": getattr(tel, "max_speed_mph", None),
-            "avg_speed_mph": getattr(tel, "avg_speed_mph", None),
+            "max_speed_mph": round(_geo_peak, 1) if _geo_peak >= 5 else None,
+            "avg_speed_mph": getattr(tel, "avg_speed_mph", None) if _geo_peak >= 5 else None,
             "total_distance_miles": getattr(tel, "total_distance_miles", None),
             "duration_seconds": getattr(tel, "duration_seconds", None),
             "max_altitude_ft": getattr(tel, "max_altitude_ft", None),
@@ -590,7 +599,7 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "score": getattr(tr, "score", None),
             "bucket": getattr(tr, "bucket", None),
             "title_modifier": getattr(tr, "title_modifier", None),
-            "hashtags": list(getattr(tr, "hashtags", None) or [])[:12],
+            "hashtags": list(getattr(tr, "hashtags", None) or [])[:15],
         }
 
     osd_ctx = ctx.dashcam_osd_context or {}
@@ -746,11 +755,18 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "segments": ac.get("transcript_segments") or [],
         },
         "music": {
-            "detected": bool(ac.get("music_detected")),
+            "detected": bool(ac.get("music_detected"))
+            or bool(ac.get("music_artist") or ac.get("music_title")),
             "title": ac.get("music_title") or "",
             "artist": ac.get("music_artist") or "",
             "genre": ac.get("music_genre") or "",
             "copyright_risk": bool(ac.get("copyright_risk")),
+        },
+        "vehicle": {
+            "make": str(getattr(ctx, "vehicle_make_name", None) or "").strip(),
+            "model": str(getattr(ctx, "vehicle_model_name", None) or "").strip(),
+            "make_id": getattr(ctx, "vehicle_make_id", None),
+            "model_id": getattr(ctx, "vehicle_model_id", None),
         },
         "audio_environment": {
             "sound_profile": ac.get("sound_profile") or "",
@@ -898,8 +914,9 @@ def _platform_constraints(platform: str) -> str:
     p = (platform or "").lower()
     if p == "tiktok":
         return (
-            "TikTok: caption ONLY (no separate title field). "
-            "First line must hook hard in the first 3–5 words. "
+            "TikTok: require a short TITLE (max 80 chars) AND a caption body. "
+            "Title is a hook headline (stored for all platforms); caption is the feed body. "
+            "First line of the caption must hook hard in the first 3–5 words. "
             "Prefer 80–220 chars for the main caption body before hashtags. "
             "Hashtags: separate words without # in JSON; we add # at publish."
         )
@@ -1093,10 +1110,12 @@ def _build_m8_prompt(
         hashtag_rule = "Use empty [] for hashtags in every variant."
 
     title_rule = (
-        "Include a non-empty title for YouTube when generate_title is true. "
+        "Include a non-empty title for EVERY target platform when generate_title is true "
+        "(YouTube, TikTok, Instagram, Facebook). "
         "Titles: specific to scene graph evidence; conversational capitalization; "
         "no emojis; avoid generic AI/clickbait openers (POV:, Wait until, This is why, You need to see). "
-        "For TikTok use null title. For IG/FB title may be null or a 2–5 word headline."
+        "TikTok title = short hook headline (max 80 chars), distinct from the caption body. "
+        "IG/FB title = 2–8 word headline or short prose line."
         if generate_title
         else "Set title to null for all platforms that do not need titles."
     )
@@ -1131,9 +1150,10 @@ TITLE BUILD CONTRACT (FREESTYLE — invent SHAPE, not FACTS; VOICE STILL REQUIRE
 3. NEVER invent place, speed, song, or driver. NEVER use generic wrappers
      ("The video is a high-energy first-person dashcam…").
 4. Prefer a real HUD speed SAMPLE when present; do not escalate a lone OCR spike.
-5. FORBIDDEN as the whole title: checklist stacks like "110 MPH · Road · Artist" or
-   "Anchored in 110 MPH, Road". Weave facts into spoken voice.
-6. TikTok title = null. YouTube/IG/FB titles must feel platform-native and distinct.
+5. FORBIDDEN as the whole title: checklist stacks like "110 MPH · Road · Artist",
+   "Anchored in 110 MPH, Road", "128 MPH through Place — with Artist", or
+   "128 MPH recorded in Place…". Weave facts into spoken Style/Tone/Voice.
+6. EVERY platform needs a distinct voice-led title (YouTube / TikTok / IG / FB).
 {general_footage_title_block}
 """
     else:
@@ -1156,13 +1176,14 @@ TITLE BUILD CONTRACT (VOICE + EVIDENCE — REJECTION RULES APPLY):
      - Any 4-word window from transcript.text / segments (lyrics stay off-limits for titles)
      - Profanity; clickbait openers (POV:, Wait until, You won't believe, Watch this, OMG…)
      - Generic dashcam wrappers ("The video is a…", "high-energy first-person dashcam…")
-     - Checklist-only titles: "110 MPH · Place · Artist", "Anchored in …" as the entire title
-4. PLATFORM TITLE SHAPES (voice-first, evidence-grounded):
+     - Receipt-only titles: "110 MPH · Place · Artist", "Anchored in …",
+       "128 MPH through Place — with Artist", "128 MPH recorded in Place…" as the entire title
+4. PLATFORM TITLE SHAPES (voice-first, evidence-grounded) — ALL platforms get a title:
      - YouTube: 40–90 chars when speed evidence exists; ≥12 chars of voiced prose otherwise
-     - TikTok: title = null (caption-led)
+     - TikTok: 30–80 char hook headline (NOT null) — different angle from the caption body
      - Instagram / Facebook: 30–70 chars; same voice as captions — short prose or punchy line, not · stacks
 5. PER-PLATFORM VARIANCE:
-     - YouTube vs IG/FB titles share ≤30% token overlap; change angle/hook, not just token order
+     - YouTube vs TikTok vs IG/FB titles share ≤30% token overlap; change angle/hook, not just token order
 6. If no allowed evidence exists, title = null. Never invent place, speed, song, or driver.
 {general_footage_title_block}
 """
@@ -1426,15 +1447,21 @@ TASK:
 For EACH platform listed in scene_graph.platforms, output EXACTLY 5 variants ranked as "variant_index" 1..5.
 Each variant must feel meaningfully different (hook style, angle, emotion), not minor word swaps.
 Audible Style / Tone / Voice from the CREATIVE SPINE must be present in every variant —
-including titles (YouTube / Instagram / Facebook), not captions alone.
+including titles for EVERY platform (YouTube / TikTok / Instagram / Facebook), not captions alone.
 Captions MUST keep persona voice: at least 2 sentences / ≥80 characters of prose for
 Instagram/TikTok/Facebook — never a checklist stub like "110 MPH, Road Name" alone.
 Titles MUST also carry that voice while citing ≥1 concrete evidence token — never ship
-"110 MPH · Place · Artist" or "Anchored in …" as the whole title when prose is possible.
+"110 MPH · Place · Artist", "Anchored in …", "128 MPH through Place — with Artist",
+or "128 MPH recorded in Place…" as the whole title when prose is possible.
 Weave MUST_USE facts into voice; do not replace the title or caption with a fact stack.
 
+RECEIPT BAN (hard reject — Style/Tone/Voice must still be audible):
+- Forbidden sole titles/captions: "N MPH through Place — with Artist", "N MPH recorded in…",
+  "Captured at N MPH…", "Anchored in…", "N MPH · Place · Artist".
+- Allowed: "N MPH — <creative prose with verbs/persona>" when remainder is real voice.
+
 Fields per variant:
-- title: string or null (YouTube needs title; TikTok null)
+- title: non-empty string for every platform when generate_title is true (TikTok included)
 - caption: string (required for platforms that use captions)
 - hashtags: array of strings without # (or empty array)
 - claims: array of {{text, evidence_ids, confidence}} when the EVIDENCE CATALOG section is present
@@ -1645,10 +1672,8 @@ def _missing_primary_hydration(text: str, scene_graph: Dict[str, Any]) -> bool:
     cons = scene_graph.get("speed_consensus") if isinstance(scene_graph.get("speed_consensus"), dict) else {}
     try:
         pub_peak = float(cons.get("peak_mph") or 0) if cons else 0.0
-        if pub_peak < 5 and "speed_consensus" not in scene_graph:
-            osd = scene_graph.get("dashcam_osd") or {}
-            pub_peak = float(osd.get("max_speed_mph") or 0)
-        if pub_peak >= 5:
+        conf = str(cons.get("confidence") or "")
+        if pub_peak >= 5 and (not conf or conf == "high"):
             anchors.append(str(int(round(pub_peak))))
     except (TypeError, ValueError):
         pass
@@ -1691,41 +1716,21 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
         seen.add(key)
         out.append(s)
 
-    # 1. Speed — prefer canonical speed_consensus (telemetry > OSD). Never let a
-    # raw OSD/OCR spike (e.g. 88) override consensus into MUST_USE / titles.
-    from core.caption_creative import osd_series_peak_mph, trusted_peak_speed_mph
-
+    # 1. Speed — canonical speed_consensus only (high confidence). Never fall
+    # back to raw OSD/OCR spikes when the consensus key is missing.
     osd = scene_graph.get("dashcam_osd") or {}
     geo = scene_graph.get("geo") or {}
     cons = scene_graph.get("speed_consensus") if isinstance(scene_graph.get("speed_consensus"), dict) else {}
     peak_f = 0.0
     try:
-        # Prefer hard-publish peak (high confidence). peak_mph on SG is already
-        # gated; never promote candidate_peak_mph into MUST_USE.
         if cons and cons.get("peak_mph") is not None:
             peak_f = float(cons.get("peak_mph") or 0)
         conf = str(cons.get("confidence") or "")
+        # Explicit non-high demotes; missing confidence trusts SG-gated peak_mph.
         if peak_f >= 5 and conf and conf != "high":
             peak_f = 0.0
     except (TypeError, ValueError):
         peak_f = 0.0
-    # Empty consensus block ({}) means fail closed — do not fall back to raw OSD.
-    if peak_f < 5 and "speed_consensus" not in scene_graph:
-        series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
-        try:
-            geo_peak = float(geo.get("max_speed_mph") or 0)
-        except (TypeError, ValueError):
-            geo_peak = 0.0
-        try:
-            osd_peak = float(osd.get("max_speed_mph") or 0) if isinstance(osd, dict) else 0.0
-        except (TypeError, ValueError):
-            osd_peak = 0.0
-        # Legacy graphs without consensus: geo.max_speed_mph ≈ telemetry when present.
-        peak_f, _src = trusted_peak_speed_mph(
-            telemetry_max=geo_peak,
-            osd_max=osd_peak,
-            series_peak=series_peak,
-        )
     if peak_f >= 5:
         _push(f"{int(round(peak_f))} MPH")
     # Do NOT push a second mid-series MPH that disagrees with consensus — that
@@ -1772,6 +1777,14 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
         _push(str(music.get("artist")))
     elif music.get("title"):
         _push(str(music.get("title")))
+
+    # 3b. Garage / Trill vehicle (user-selected — was missing from must_use)
+    veh = scene_graph.get("vehicle") or {}
+    if isinstance(veh, dict):
+        if veh.get("make"):
+            _push(str(veh.get("make")))
+        if veh.get("model"):
+            _push(str(veh.get("model")))
 
     # 4. Trill bucket (driving energy)
     trill = scene_graph.get("trill") or {}
@@ -2077,10 +2090,16 @@ def _facet_adherence_score(
         if re.search(r"\b(i|i'm|we|we're)\b", low):
             score += 2.0
 
-    return max(-12.0, min(14.0, score))
+    return max(-20.0, min(14.0, score))
 
 
-def _quality_gate_penalty(platform: str, title: str, caption: str) -> float:
+def _quality_gate_penalty(
+    platform: str,
+    title: str,
+    caption: str,
+    *,
+    persona_required: bool = False,
+) -> float:
     blob = f"{title} {caption}".strip().lower()
     if not blob:
         return 20.0
@@ -2093,13 +2112,16 @@ def _quality_gate_penalty(platform: str, title: str, caption: str) -> float:
         from services.m8_grounding_pass import is_formula_stub_caption
 
         if is_formula_stub_caption(caption) or is_formula_stub_caption(title):
-            # Must land below the ≥45 winner gate so checklist stubs cannot publish.
+            # Must land below the ≥45 winner gate so checklist/receipt stubs cannot publish.
             penalty += 40.0
+            if persona_required:
+                penalty += 25.0  # hard reject under Style/Tone/Voice prefs
     except Exception:
         if re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()):
             penalty += 40.0
-    if platform == "youtube" and len((title or "").strip()) < 12:
-        penalty += 6.0
+    if platform in ("youtube", "tiktok", "instagram", "facebook") and len((title or "").strip()) < 12:
+        # All platforms now require titles; empty/short titles are weak.
+        penalty += 6.0 if platform == "youtube" else 4.0
     if len((caption or "").strip()) < 35:
         penalty += 8.0
     return penalty
@@ -2207,7 +2229,11 @@ def _repair_artifacts_selective(
                 continue
             seen.add(slug)
             cleaned.append(slug)
-        repaired["hashtags"] = cleaned[:12]
+        repaired["hashtags"] = cleaned[: max(1, min(30, int(
+            (strategy_target or {}).get("hashtag_count")
+            or len(cleaned)
+            or 15
+        )))]
     if not checks.get("persona_ok", True):
         cap = str(repaired.get("caption") or "")
         cap = re.sub(r"\b(bro|frfr|no cap)\b", "", cap, flags=re.IGNORECASE).strip()
@@ -2247,6 +2273,19 @@ def score_variant(
     caption = str(variant.get("caption") or "")
     title = str(variant.get("title") or "") if variant.get("title") is not None else ""
 
+    try:
+        from services.m8_grounding_pass import persona_voice_required as _persona_req
+
+        persona_required = _persona_req(
+            style_ui=caption_style, tone_ui=caption_tone, voice_ui=caption_voice
+        )
+    except Exception:
+        persona_required = bool(
+            (caption_style and caption_style not in ("story", ""))
+            or (caption_tone and caption_tone not in ("authentic", ""))
+            or (caption_voice and caption_voice not in ("default", ""))
+        )
+
     base = 50.0
     base += _length_score(platform, caption, title)
     base += _hook_strength_score(caption or title)
@@ -2267,7 +2306,9 @@ def score_variant(
     ):
         base -= 10.0
     base -= _attribution_penalty(caption, title, scene_graph)
-    base -= _quality_gate_penalty(platform, title, caption)
+    base -= _quality_gate_penalty(
+        platform, title, caption, persona_required=persona_required
+    )
     base -= _primary_hydration_penalty(caption, title, scene_graph)
     # Prefer audible voice prose over · checklist / formula stubs when both
     # touch evidence (zero-evidence still dies at −200 via coverage score).
@@ -2314,6 +2355,25 @@ def score_variant(
         coverage_note = f" (evidence_coverage={cov:+.0f})"
     else:
         coverage_note = ""
+
+    # FactLedger AND-of-classes: missing any publishable class hard-rejects.
+    try:
+        from services.fact_ledger import (
+            class_coverage_score,
+            fact_ledger_enabled,
+            publishable_facts_from_scene_graph,
+        )
+
+        if fact_ledger_enabled():
+            fl_facts = publishable_facts_from_scene_graph(scene_graph)
+            fl_cov = class_coverage_score(
+                title, caption, fl_facts, hashtags=tags if isinstance(tags, list) else None
+            )
+            if fl_cov:
+                base += fl_cov
+                coverage_note = (coverage_note or "") + f" (fact_ledger={fl_cov:+.0f})"
+    except Exception:
+        pass
 
     hist_note = ""
     if historical_signals and platform in historical_signals:
@@ -2364,6 +2424,21 @@ def rank_and_select(
     if not voice_ui:
         voice_ui = str(((strategy or {}).get("outputs") or {}).get("voice_persona") or "").lower()
     min_must = 1 if style_ui == "freestyle" else 2
+    try:
+        from services.m8_grounding_pass import persona_voice_required as _persona_req
+
+        persona_required = _persona_req(
+            (getattr(ctx, "user_settings", None) or {}) if ctx is not None else {},
+            style_ui=style_ui,
+            tone_ui=tone_ui,
+            voice_ui=voice_ui,
+        )
+    except Exception:
+        persona_required = bool(
+            style_ui not in ("", "story")
+            or tone_ui not in ("", "authentic")
+            or voice_ui not in ("", "default")
+        )
 
     for pl in scene_graph.get("platforms") or []:
         pl = str(pl).lower()
@@ -2438,9 +2513,10 @@ def rank_and_select(
             # ── Title hard-ban filter ────────────────────────────────────
             # Walk candidates in score order; first one whose title passes
             # _validate_title wins. If every candidate fails AND we still need
-            # a title for this platform, fall back to a deterministic
-            # evidence-only title built from allowed scene_graph fields.
-            need_title = pl in ("youtube", "instagram", "facebook")
+            # a title for this platform, fall back to caption lift / scene prose /
+            # voice_fallback — never compact receipt when persona prefs are set.
+            # Titles required for ALL platforms (including TikTok).
+            need_title = pl in ("youtube", "instagram", "facebook", "tiktok")
             if need_title:
                 for cand in ranked:
                     if _is_stub_cand(cand):
@@ -2485,7 +2561,33 @@ def rank_and_select(
                                 winner["title"] = scene_hook
                                 title_validation_meta["scene_prose_title_used"] = True
                                 title_set = True
-                    if not title_set:
+                    if not title_set and persona_required:
+                        # Voice-shaped fallback before compact receipt.
+                        try:
+                            fb = build_voice_fallback_selection(
+                                scene_graph,
+                                caption_style=style_ui or "story",
+                                caption_tone=tone_ui or "authentic",
+                                caption_voice=voice_ui or "default",
+                                platforms=[pl],
+                                ctx=ctx,
+                            )
+                            fb_title = (
+                                ((fb.get("platforms") or {}).get(pl) or {})
+                                .get("winner", {})
+                                .get("title")
+                            )
+                            if fb_title:
+                                ok_fb, _ = _validate_title(
+                                    str(fb_title), scene_graph, platform=pl
+                                )
+                                if ok_fb:
+                                    winner["title"] = str(fb_title)[:120]
+                                    title_validation_meta["voice_fallback_title_used"] = True
+                                    title_set = True
+                        except Exception:
+                            pass
+                    if not title_set and not persona_required:
                         peak = _speed_peak_mph(scene_graph)
                         mus = scene_graph.get("music") or {}
                         geo = scene_graph.get("geo") or {}
@@ -2510,11 +2612,10 @@ def rank_and_select(
                             winner["title"] = None
                             title_validation_meta["evidence_fallback_used"] = False
                             title_validation_meta["title_set_to_null"] = True
-            elif pl == "tiktok":
-                # Caption-led platform — null out any title to enforce contract.
-                if winner is not None:
-                    winner = dict(winner)
-                    winner["title"] = None
+                    elif not title_set:
+                        winner["title"] = None
+                        title_validation_meta["title_set_to_null"] = True
+                        title_validation_meta["persona_blocked_evidence_fallback"] = True
 
         preflight_meta: Dict[str, bool] = {}
         if winner:
@@ -2529,12 +2630,19 @@ def rank_and_select(
             "runner_up": runner_up,
             "preflight": preflight_meta,
             "title_validation": title_validation_meta,
+            "persona_required": persona_required,
         }
 
     return {
         "m8_version": parsed.get("m8_version") or M8_ENGINE_VERSION,
         "platforms": out_plat,
         "must_use": must_use,
+        "selection_meta": {
+            "persona_required": persona_required,
+            "style_ui": style_ui,
+            "tone_ui": tone_ui,
+            "voice_ui": voice_ui,
+        },
     }
 
 
@@ -2600,7 +2708,7 @@ def merge_matrix_cells_into_ranked(
                 "variant_index": f"matrix_{i}",
                 "title": title or None,
                 "caption": cap,
-                "hashtags": list(cell.get("hashtags") or [])[:12],
+                "hashtags": list(cell.get("hashtags") or [])[:15],
                 "claims": [],
             }
             sc, why = score_variant(
@@ -2639,7 +2747,7 @@ def merge_matrix_cells_into_ranked(
             except Exception:
                 if re.match(r"(?i)^\s*anchored\s+in\b", cap):
                     continue
-            if pl_l in ("youtube", "instagram", "facebook"):
+            if pl_l in ("youtube", "tiktok", "instagram", "facebook"):
                 ok_t, _ = _validate_title(title or "", scene_graph, platform=pl_l)
                 if not ok_t:
                     # Keep cell as ranked candidate with null title; don't crown yet.
@@ -2661,10 +2769,7 @@ def merge_matrix_cells_into_ranked(
             winner, preflight = _repair_artifacts_selective(
                 pl_l, winner, ranked_list, scene_graph, strategy_target
             )
-            if pl_l == "tiktok" and isinstance(winner, dict):
-                winner = dict(winner)
-                winner["title"] = None
-            elif pl_l in ("youtube", "instagram", "facebook") and isinstance(winner, dict):
+            if pl_l in ("youtube", "tiktok", "instagram", "facebook") and isinstance(winner, dict):
                 ok_w, _ = _validate_title(str(winner.get("title") or ""), scene_graph, platform=pl_l)
                 if not ok_w:
                     from_cap = _platform_title_from_caption(pl_l, str(winner.get("caption") or ""))
@@ -2813,7 +2918,7 @@ def build_voice_fallback_selection(
     for pl in plats:
         w = {
             "variant_index": "voice_fallback",
-            "title": None if pl == "tiktok" else title,
+            "title": title,
             "caption": caption,
             "hashtags": tags,
             "score": 40.0,
@@ -2874,15 +2979,15 @@ def _title_tokens(text: str) -> List[str]:
 
 
 def _speed_peak_mph(scene_graph: Dict[str, Any]) -> Optional[float]:
-    """Trusted consensus peak when present; None for general / non-dashcam footage."""
+    """High-confidence consensus peak only; None when unverified / absent."""
     try:
-        mph_val = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
-        if mph_val is None and "speed_consensus" not in scene_graph:
-            geo = scene_graph.get("geo") or {}
-            osd = scene_graph.get("dashcam_osd") or {}
-            mph_val = geo.get("max_speed_mph")
-            if mph_val is None:
-                mph_val = osd.get("max_speed_mph")
+        cons = scene_graph.get("speed_consensus") if isinstance(scene_graph.get("speed_consensus"), dict) else {}
+        if not cons:
+            return None
+        conf = str(cons.get("confidence") or "")
+        if conf and conf != "high":
+            return None
+        mph_val = cons.get("peak_mph")
         if mph_val is None:
             return None
         mph = float(mph_val)
@@ -3038,17 +3143,14 @@ def _deterministic_evidence_title(
 
     speed_token = ""
     try:
-        # Consensus peak only — raw geo/OSD peaks can disagree with the
-        # published speed. Legacy graphs without the block fall back.
-        mph_val = (scene_graph.get("speed_consensus") or {}).get("peak_mph")
-        if mph_val is None and "speed_consensus" not in scene_graph:
-            mph_val = geo.get("max_speed_mph")
-            if mph_val is None:
-                mph_val = osd.get("max_speed_mph")
-        if mph_val is not None:
-            mph = int(round(float(mph_val)))
-            if mph >= 5:
-                speed_token = f"{mph} MPH"
+        cons = scene_graph.get("speed_consensus") if isinstance(scene_graph.get("speed_consensus"), dict) else {}
+        conf = str(cons.get("confidence") or "") if cons else ""
+        if cons and (not conf or conf == "high"):
+            mph_val = cons.get("peak_mph")
+            if mph_val is not None:
+                mph = int(round(float(mph_val)))
+                if mph >= 5:
+                    speed_token = f"{mph} MPH"
     except (TypeError, ValueError):
         pass
 
@@ -3189,13 +3291,22 @@ def _platform_title_from_caption(platform: str, caption: str) -> Optional[str]:
         if len(first) > 90:
             first = first[:90].rstrip(" .,!?:;") + "..."
         return first
+    if p == "tiktok":
+        if len(first) > 80:
+            first = first[:80].rstrip(" .,!?:;")
+            if len(first) > 77:
+                first = first[:77].rstrip() + "..."
+        return first
     if p in ("instagram", "facebook"):
         if len(first) > 70:
             first = first[:70].rstrip(" .,!?:;")
             if len(first) > 67:
                 first = first[:67].rstrip() + "..."
         return first
-    return None
+    # Unknown platform — still return a clipped hook so titles are never null.
+    if len(first) > 80:
+        first = first[:80].rstrip(" .,!?:;")
+    return first
 
 
 def _ensure_platform_completeness(
@@ -3240,7 +3351,7 @@ def _ensure_platform_completeness(
         hashtags = donor.get("hashtags") or []
         synth = {
             "variant_index": donor.get("variant_index") or 999,
-            "title": title if title else (None if pl == "tiktok" else ""),
+            "title": title if title else "",
             "caption": caption,
             "hashtags": list(hashtags) if isinstance(hashtags, list) else [],
             "score": round(max(45.0, donor_score - 3.0), 4),
@@ -3494,7 +3605,8 @@ def apply_selection_to_context(
     for pl in platforms:
         if fallback_caption and pl not in ctx.m8_platform_captions:
             ctx.m8_platform_captions[pl] = strip_stray_hashtag_json_blob(fallback_caption)[:2200]
-        if fallback_title and pl not in ctx.m8_platform_titles and pl == "youtube":
+        if fallback_title and pl not in ctx.m8_platform_titles:
+            # Titles for ALL platforms (including TikTok) — never leave empty.
             ctx.m8_platform_titles[pl] = fallback_title[:120]
         if fallback_tags and pl not in ctx.m8_platform_hashtags:
             ctx.m8_platform_hashtags[pl] = list(fallback_tags[: max(1, hashtag_count)])
@@ -3502,11 +3614,18 @@ def apply_selection_to_context(
     # ── Per-platform title variance enforcement ─────────────────────────
     # If two platform titles share more than 70% token overlap, rebuild the
     # lower-priority one from a different evidence cluster. Priority order:
-    # youtube > instagram > facebook (tiktok title is always null by contract).
+    # youtube > tiktok > instagram > facebook.
     scene_for_variance = getattr(ctx, "m8_scene_graph", None) or selection.get("scene_graph") or {}
-    priority = ["youtube", "instagram", "facebook"]
+    priority = ["youtube", "tiktok", "instagram", "facebook"]
     used_clusters: List[str] = []
     cluster_cycle = ["geo", "speed", "trill", "visual", "music"]
+    persona_required = False
+    try:
+        from services.m8_grounding_pass import persona_voice_required as _persona_req
+
+        persona_required = _persona_req(getattr(ctx, "user_settings", None) or {})
+    except Exception:
+        persona_required = False
     for i, pl_hi in enumerate(priority):
         title_hi = (ctx.m8_platform_titles or {}).get(pl_hi)
         if not title_hi:
@@ -3535,7 +3654,7 @@ def apply_selection_to_context(
                     scene_hook = _scene_prose_hook(scene_for_variance)
                     if scene_hook and scene_hook.lower() != str(title_lo).lower():
                         rebuilt = scene_hook
-                if not rebuilt and _speed_peak_mph(scene_for_variance) is not None:
+                if not rebuilt and not persona_required and _speed_peak_mph(scene_for_variance) is not None:
                     rebuilt = _deterministic_evidence_title(
                         scene_for_variance, platform=pl_lo, preferred_cluster=next_cluster
                     )
@@ -3548,6 +3667,8 @@ def apply_selection_to_context(
     # Legacy single fields — pick defaults for UI / non-platform consumers
     if "youtube" in ctx.m8_platform_titles:
         ctx.ai_title = ctx.m8_platform_titles["youtube"]
+    elif "tiktok" in ctx.m8_platform_titles:
+        ctx.ai_title = ctx.m8_platform_titles["tiktok"]
     elif ctx.m8_platform_titles:
         ctx.ai_title = next(iter(ctx.m8_platform_titles.values()))
 

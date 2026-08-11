@@ -349,9 +349,11 @@ def apply_scenic_trill_boost(ctx: JobContext) -> Optional[TrillScore]:
 
     try:
         from stages.telemetry_stage import get_trill_modifiers
+        from core.speed_consensus import publishable_peak_mph, prompt_peak_mph
 
-        tel = ctx.telemetry_data or ctx.telemetry
-        max_mph = float(getattr(tel, "max_speed_mph", 0) or 0) if tel else 0.0
+        max_mph = float(publishable_peak_mph(ctx) or 0)
+        if max_mph < 5:
+            max_mph = float(prompt_peak_mph(ctx) or 0)
         modifier, hashtags = get_trill_modifiers(new_score, max_mph, trill.bucket)
         trill.title_modifier = modifier
         trill.hashtags = hashtags

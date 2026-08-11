@@ -5108,7 +5108,10 @@ async def _build_process_job_payload(
         )
 
         apply_upload_baseline_defaults(
-            user_settings, tier=ent.tier, role=str(user_record.get("role") or "")
+            user_settings,
+            tier=ent.tier,
+            role=str(user_record.get("role") or ""),
+            subscription_status=str(user_record.get("subscription_status") or ""),
         )
         payload = {
             "upload_id": str(upload_id),

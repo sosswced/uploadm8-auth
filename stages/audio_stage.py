@@ -580,7 +580,10 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     us = ctx.user_settings or {}
     use_audio = bool(us.get("use_audio_context", us.get("useAudioContext", True)))
     if not use_audio:
-        raise SkipStage("Audio context disabled by user setting (use_audio_context=false)")
+        raise SkipStage(
+            "Audio context disabled by user setting "
+            f"(useAudioContext={us.get('useAudioContext', us.get('use_audio_context'))!r})"
+        )
 
     env_audio = billing_env_from_os()
     transcribe_pref = bool(us.get("audio_transcription", us.get("audioTranscription", True)))

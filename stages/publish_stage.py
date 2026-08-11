@@ -452,9 +452,9 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
 def _tiktok_force_private_unaudited_enabled() -> bool:
     """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of user privacy choice.
 
-    Audited by default after TikTok Content Posting approval. Opt out with
-    ``TIKTOK_APP_AUDITED=0``. Optional emergency rollback:
-    ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1``.
+    Always False after Content Posting audit approval — env rollback flags are
+    ignored so a sticky Render ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` cannot clamp
+    public posts to Only me.
     """
     return tiktok_force_private_unaudited()
 
@@ -2541,6 +2541,27 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
     from services.deferred_publish_schedule import publish_target_already_done
     from services.upload.publish_ledger_reconcile import hydrate_ctx_from_accepted_ledger
+
+    # FactLedger: final soft-weave/pad; STRICT may block platform APIs.
+    try:
+        from services.fact_ledger import ensure_fact_ledger_at_publish, fact_ledger_enabled
+
+        if fact_ledger_enabled():
+            fl_pub = ensure_fact_ledger_at_publish(ctx)
+            if fl_pub.get("blocked") or getattr(ctx, "fact_ledger_block_publish", False):
+                logger.error(
+                    "[%s] FactLedger STRICT block — missing classes %s",
+                    ctx.upload_id,
+                    fl_pub.get("missing"),
+                )
+                raise PublishError(
+                    f"FactLedger STRICT: missing publishable classes {fl_pub.get('missing')}",
+                    code=ErrorCode.UPLOAD_FAILED,
+                )
+    except PublishError:
+        raise
+    except Exception as fl_e:
+        logger.warning("[%s] fact_ledger publish ensure skipped: %s", ctx.upload_id, fl_e)
 
     pending_targets = [
         (p, tid)

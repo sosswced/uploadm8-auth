@@ -180,22 +180,150 @@ _FORMULA_STUB_RE = re.compile(
     r"(?is)^\s*(?:anchored\s+in\s+)?\d{1,3}\s*mph\s*[,·]\s*.{0,80}\s*$"
 )
 
+# Compact timeline / hydration receipt — no audible persona.
+_RECEIPT_THROUGH_RE = re.compile(
+    r"(?is)^\s*\d{1,3}\s*mph\s+through\b.{0,90}$"
+)
+# Speed-less compact: "Through Livermore, CA — with A Boogie Wit da Hoodie"
+_RECEIPT_THROUGH_GEO_RE = re.compile(
+    r"(?is)^\s*through\s+[^!?]{2,60}\s*[—\-]\s*with\s+\S.{0,60}$"
+)
+_RECEIPT_RECORDED_RE = re.compile(
+    r"(?is)^\s*\d{1,3}\s*mph\s+recorded\s+in\b"
+)
+_RECEIPT_CAPTURED_RE = re.compile(r"(?is)^\s*captured\s+at\b")
+# Soft-inject remainder that is still just geo + optional "— with Artist".
+# Kept for reference / callers; live stub logic uses _is_receipt_remainder().
+_RECEIPT_REMAINDER_RE = re.compile(
+    r"(?is)^\s*(?:through|near|on)\s+"
+    r"[A-Za-z0-9][\w.'\-]*(?:\s+[A-Za-z0-9][\w.'\-]*){0,4}"
+    r"(?:\s*,\s*[A-Za-z]{2,})?"
+    r"(?:\s*[—\-]\s*with\s+[^!?]{2,40})?\s*$"
+)
+# "C Walker drives with 'Song' by Artist" fact weave after a speed lead.
+_RECEIPT_DRIVES_WITH_RE = re.compile(
+    r"(?is)^\s*\d{1,3}\s*mph\b.{0,40}\b(?:recorded\s+in|drives\s+with)\b"
+)
+
+
+def _is_receipt_remainder(rem: str) -> bool:
+    """True when text after ``N MPH —`` is still a geo/music receipt, not voice.
+
+    Compact receipts: short ``through/near/on Place`` or ``through Place — with Artist``.
+    Spoken paraphrase that uses bare ``with`` (no em-dash music cue) is voice, not a stub.
+    """
+    r = (rem or "").strip()
+    if not r:
+        return True
+    if " · " in r:
+        return True
+    # Music cue must use em/en dash before ``with`` (timeline receipt).
+    if re.match(
+        r"(?is)^\s*(?:through|near|on)\s+[^!?]{2,50}\s*[—\-]\s*with\s+[^!?]{2,40}\s*$",
+        r,
+    ):
+        return True
+    # Bare ``with`` without the dash music pattern → conversational prose.
+    if re.search(r"(?i)\bwith\b", r):
+        return False
+    # Short geo-only remainder (no music, no extra clauses).
+    if re.match(
+        r"(?is)^\s*(?:through|near|on)\s+"
+        r"[A-Za-z0-9][\w.'\-]*(?:\s+[A-Za-z0-9][\w.'\-]*){0,4}"
+        r"(?:\s*,\s*[A-Za-z]{2,})?\s*$",
+        r,
+    ):
+        return True
+    return False
+
 
 def is_formula_stub_caption(text: str) -> bool:
-    """True for checklist stubs like 'Anchored in 88 MPH, Garlock Road' (no persona voice).
+    """True for evidence *receipt templates* with no audible persona voice.
 
-    Soft-inject titles ``154 MPH — <creative prose>`` are NOT stubs.
+    Receipts (reject when Style/Tone/Voice prefs are set):
+      - ``Anchored in 88 MPH, Garlock Road`` / ``110 MPH, Road`` / ``110 MPH · Place``
+      - ``128 MPH through Allendale, CA — with iLoveMakonnen`` (compact timeline)
+      - ``128 MPH recorded in Allendale…`` / ``Captured at 128 MPH…``
+
+    Soft-inject titles ``154 MPH — <creative prose>`` are NOT stubs when the
+    remainder is real voice (not ``through Place — with Artist``).
     """
     t = (text or "").strip()
-    if not t or len(t) > 120:
+    if not t:
         return False
+    # Prefix receipts — flag even when the caption continues past 120 chars.
     if re.match(r"(?i)^\s*anchored\s+in\b", t):
         return True
-    # Em-dash / long hyphen voice inject: keep as prose when remainder is long.
+    if _RECEIPT_CAPTURED_RE.match(t):
+        return True
+    if _RECEIPT_RECORDED_RE.match(t) or _RECEIPT_DRIVES_WITH_RE.match(t):
+        return True
+
+    # Em-dash / long hyphen soft-inject: creative remainder keeps; receipt remainder rejects.
     m = re.match(r"(?is)^\s*\d{1,3}\s*mph\s*[—\-]\s*(.+)$", t)
-    if m and len(m.group(1).strip()) >= 20 and " · " not in t:
+    if m:
+        rem = m.group(1).strip()
+        if " · " in t or _is_receipt_remainder(rem):
+            return True
+        if len(rem) >= 20:
+            return False
+
+    # Compact ``N MPH through Place…`` (with or without ``— with Artist``).
+    head = t if len(t) <= 140 else t[:140]
+    if _RECEIPT_THROUGH_RE.match(head):
+        return True
+    # Speed-less compact timeline: ``Through Place — with Artist``.
+    if len(t) <= 120 and _RECEIPT_THROUGH_GEO_RE.match(t):
+        return True
+
+    if len(t) > 120:
         return False
     return bool(_FORMULA_STUB_RE.match(t))
+
+
+def persona_voice_required(
+    user_settings: Optional[Dict[str, Any]] = None,
+    *,
+    style_ui: str = "",
+    tone_ui: str = "",
+    voice_ui: str = "",
+) -> bool:
+    """True when Style/Tone/Voice ask for audible persona (not stock defaults).
+
+    When true, compact timeline / Captured-at / recorded-in receipts must not
+    ship as the final title or caption — prefer voice variants or voice_fallback.
+    """
+    try:
+        from core.caption_creative import (
+            DEFAULT_CAPTION_STYLE,
+            DEFAULT_CAPTION_TONE,
+            DEFAULT_CAPTION_VOICE,
+            normalize_caption_style,
+            normalize_caption_tone,
+            normalize_caption_voice,
+        )
+    except Exception:
+        return bool(style_ui or tone_ui or voice_ui)
+
+    us = user_settings or {}
+    s = normalize_caption_style(
+        style_ui or us.get("captionStyle") or us.get("caption_style") or ""
+    )
+    t = normalize_caption_tone(
+        tone_ui or us.get("captionTone") or us.get("caption_tone") or ""
+    )
+    v = normalize_caption_voice(
+        voice_ui or us.get("captionVoice") or us.get("caption_voice") or ""
+    )
+    if s != DEFAULT_CAPTION_STYLE or t != DEFAULT_CAPTION_TONE or v != DEFAULT_CAPTION_VOICE:
+        return True
+    if us.get("captionCreativeResolvedFrom") or us.get("caption_creative_resolved_from"):
+        return True
+    if us.get("captionCreativeComboIndex") is not None or us.get(
+        "caption_creative_combo_index"
+    ) is not None:
+        return True
+    return False
 
 
 def strip_ungrounded_sentences(
@@ -322,8 +450,8 @@ def apply_grounding_pass2_to_ranked(
             report["must_use_injected"] += 1
 
         variants = block.get("variants_ranked") or block.get("variants") or []
-        # Voice salvage: if winner collapsed to a fact stub, prefer the best
-        # non-stub variant and soft-weave must_use into that voice.
+        # Voice salvage: if winner collapsed to a fact stub/receipt, prefer the
+        # best non-stub variant and soft-weave must_use into that voice.
         voice_repaired = False
         if is_formula_stub_caption(new_cap) and isinstance(variants, list):
             for v in variants:
@@ -340,7 +468,7 @@ def apply_grounding_pass2_to_ranked(
                     report["must_use_injected"] = int(report.get("must_use_injected") or 0) + 1
                     break
 
-        # Never publish Anchored-in / · checklist as the whole caption.
+        # Never publish Anchored-in / · / through-Place receipts as the whole caption.
         if is_formula_stub_caption(new_cap):
             toks = [str(t).strip() for t in (must_use or []) if str(t).strip()][:3]
             if toks:
@@ -357,8 +485,43 @@ def apply_grounding_pass2_to_ranked(
                 voice_repaired = True
                 report["stub_replaced"] = int(report.get("stub_replaced") or 0) + 1
 
+        # Title salvage: reject compact/receipt titles when a voice variant exists.
+        new_title = title
+        if is_formula_stub_caption(new_title) and isinstance(variants, list):
+            for v in variants:
+                if not isinstance(v, dict):
+                    continue
+                alt_t = str(v.get("title") or "").strip()
+                if alt_t and not is_formula_stub_caption(alt_t) and len(alt_t) >= 12:
+                    new_title = alt_t[:120]
+                    voice_repaired = True
+                    report["title_receipt_repaired"] = int(
+                        report.get("title_receipt_repaired") or 0
+                    ) + 1
+                    break
+            else:
+                # Lift from repaired caption when title is still a receipt.
+                first = re.split(r"(?<=[.!?])\s+", new_cap, maxsplit=1)[0].strip()
+                if (
+                    first
+                    and len(first) >= 12
+                    and not is_formula_stub_caption(first)
+                ):
+                    new_title = first[:120]
+                    voice_repaired = True
+                    report["title_from_caption"] = int(
+                        report.get("title_from_caption") or 0
+                    ) + 1
+
         selected = dict(selected)
         selected["caption"] = new_cap
+        if new_title:
+            selected["title"] = new_title[:120]
+        elif selected.get("title") is not None and is_formula_stub_caption(
+            str(selected.get("title") or "")
+        ):
+            # Drop receipt title rather than ship it; downstream will fill voice.
+            selected["title"] = None
         selected["claims"] = claims
         block["winner"] = selected
         block["selected"] = selected  # alias for newer consumers
@@ -406,7 +569,9 @@ CLAIMS CONTRACT (required when catalog is non-empty):
 - Every factual noun phrase (speed, place, song, landmark) in caption/title should appear in some claim.text.
 - evidence_ids MUST reference catalog ids above; never invent ids.
 - Keep style/tone/voice prose — only omit sentences that invent false facts not in the catalog.
-- Never write checklist stubs like "Anchored in 110 MPH, Road Name" as the whole caption; weave facts into voice.
+- Never write checklist stubs like "Anchored in 110 MPH, Road Name",
+  "128 MPH through Place — with Artist", or "128 MPH recorded in Place…" as the
+  whole caption/title; weave facts into Style/Tone/Voice prose.
 """
 
 
@@ -419,4 +584,5 @@ __all__ = [
     "ensure_must_use_coverage",
     "strip_ungrounded_sentences",
     "is_formula_stub_caption",
+    "persona_voice_required",
 ]

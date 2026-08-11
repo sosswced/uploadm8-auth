@@ -292,13 +292,14 @@ def build_sticker_pack(ctx: Any, frame_offset_s: float, *, max_stickers: int = 4
         if trill_lbl:
             _add(kind="trill", label=trill_lbl[:40], source="hydration_trill", text_only=True)
 
-    osd = ev.get("osd") if isinstance(ev.get("osd"), dict) else {}
     try:
-        mph = float(osd.get("max_speed_mph") or 0)
-    except (TypeError, ValueError):
+        from core.speed_consensus import publishable_peak_mph
+
+        mph = float(publishable_peak_mph(ctx) or 0)
+    except Exception:
         mph = 0.0
     if mph >= 10 and niche in ("automotive", "travel", "general", "sports", "dashcam"):
-        _add(kind="text_badge", label=f"{mph:.0f} MPH", source="hydration_osd", text_only=True)
+        _add(kind="text_badge", label=f"{mph:.0f} MPH", source="speed_consensus", text_only=True)
 
     for line in _ocr_sticker_candidates(ctx):
         _add(kind="text_badge", label=line, source="vision_ocr", text_only=True)

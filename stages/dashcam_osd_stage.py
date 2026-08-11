@@ -347,9 +347,9 @@ def _parse_speed(line: str) -> Tuple[Optional[float], Optional[str]]:
 
     Prefers the HUD speed token that follows a lat/lon pair (Escort/M8 order:
     date → time → GPS → speed → driver). Rejects roadside speed-limit copy,
-    lat/lon integer bleed (``-115MPH``, ``122°MPH``), and values outside a
-    plausible dashcam range so OCR of signs / GPS noise cannot become the
-    published peak.
+    lat/lon integer bleed (``-115MPH``, ``122°MPH``, ``… -122.57° 122 MPH``),
+    and values outside a plausible dashcam range so OCR of signs / GPS noise
+    cannot become the published peak.
     """
     if not line or _SPEED_LIMIT_CONTEXT_RE.search(line):
         return None, None
@@ -919,9 +919,9 @@ def _aggregate(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _backfill_telemetry(ctx: JobContext, osd: Dict[str, Any]) -> bool:
     """When no .map telemetry, populate ctx.telemetry_data from OSD GPS.
 
-    Returns True if backfill happened. Downstream stages (telemetry trill,
-    digest, reverse-geocoding) will then treat the OSD-derived points as if
-    they came from a .map file.
+    Returns True if backfill happened. Points/geo are usable downstream, but
+    ``tel.max_speed_mph`` is **HUD-sourced** (``osd_backfilled=True``) — speed
+    consensus must never treat it as true ``.map`` telemetry.
     """
     existing = ctx.telemetry_data or ctx.telemetry
     has_existing_points = bool(existing and getattr(existing, "points", None))
@@ -949,8 +949,24 @@ def _backfill_telemetry(ctx: JobContext, osd: Dict[str, Any]) -> bool:
 
     tel = TelemetryData()
     tel.points = points
-    tel.max_speed_mph = float(osd.get("max_speed_mph") or 0.0)
-    tel.avg_speed_mph = float(osd.get("avg_speed_mph") or 0.0)
+    # SSOT: never mint publishable speed onto telemetry from OSD. Geo/points
+    # stay; HUD peak lives only on dashcam_osd_context for consensus to fuse
+    # as the HUD family (not .map telemetry).
+    try:
+        hud_peak = float(osd.get("max_speed_mph") or 0.0)
+    except (TypeError, ValueError):
+        hud_peak = 0.0
+    tel.max_speed_mph = 0.0
+    tel.avg_speed_mph = 0.0
+    # Strip path-carried MPH unless a trusted HUD aggregate exists (still not
+    # copied onto tel.max_speed_mph — consensus reads osd.max_speed_mph).
+    if hud_peak < 5:
+        for p in points:
+            p["speed_mph"] = 0.0
+    try:
+        tel.osd_backfilled = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
     if len(points) >= 2:
         # Cumulative miles along the OSD-sampled path.
         total = 0.0
@@ -988,12 +1004,48 @@ def _apply_trill_from_backfilled_telemetry(ctx: JobContext) -> None:
             calculate_trill_score,
             get_trill_modifiers,
         )
+        from core.speed_consensus import build_speed_consensus
 
         us = ctx.user_settings or {}
         speeding_mph = int(us.get("speeding_mph") or us.get("speedingMph") or DEFAULT_SPEEDING_MPH)
         euphoria_mph = int(us.get("euphoria_mph") or us.get("euphoriaMph") or DEFAULT_EUPHORIA_MPH)
-        trill = calculate_trill_score(tel, speeding_mph, euphoria_mph)
-        modifier, hashtags = get_trill_modifiers(trill.score, tel.max_speed_mph, trill.bucket)
+
+        # tel.max_speed_mph stays 0 for publish SSOT (osd_backfilled). Score Trill
+        # from HUD aggregate / point speeds without promoting them to map telemetry.
+        osd = getattr(ctx, "dashcam_osd_context", None) or {}
+        try:
+            hud_peak = float(osd.get("max_speed_mph") or 0.0) if isinstance(osd, dict) else 0.0
+        except (TypeError, ValueError):
+            hud_peak = 0.0
+        try:
+            hud_avg = float(osd.get("avg_speed_mph") or 0.0) if isinstance(osd, dict) else 0.0
+        except (TypeError, ValueError):
+            hud_avg = 0.0
+        if hud_peak < 5:
+            try:
+                hud_peak = max(
+                    float(p.get("speed_mph") or 0.0)
+                    for p in (getattr(tel, "points", None) or [])
+                )
+            except ValueError:
+                hud_peak = 0.0
+        prev_max = float(getattr(tel, "max_speed_mph", 0) or 0)
+        prev_avg = float(getattr(tel, "avg_speed_mph", 0) or 0)
+        try:
+            if hud_peak >= 5:
+                tel.max_speed_mph = hud_peak
+                tel.avg_speed_mph = hud_avg if hud_avg >= 5 else hud_peak * 0.7
+            trill = calculate_trill_score(tel, speeding_mph, euphoria_mph)
+        finally:
+            tel.max_speed_mph = prev_max
+            tel.avg_speed_mph = prev_avg
+
+        # Prefer consensus peak for modifiers — never a raw HUD/coord ghost.
+        cons = build_speed_consensus(ctx)
+        mod_mph = float(cons.get("peak_mph") or 0.0)
+        if str(cons.get("confidence") or "") not in ("high", "medium"):
+            mod_mph = 0.0
+        modifier, hashtags = get_trill_modifiers(trill.score, mod_mph, trill.bucket)
         trill.title_modifier = modifier
         trill.hashtags = hashtags
         ctx.trill_score = trill

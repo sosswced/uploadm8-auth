@@ -87,8 +87,16 @@ def _derive_scene_tags(ctx: JobContext) -> List[str]:
 
 
 def _derive_motion_intensity(ctx: JobContext) -> str:
-    tel = ctx.telemetry or ctx.telemetry_data
-    mph = float(getattr(tel, "max_speed_mph", 0.0) or 0.0) if tel else 0.0
+    try:
+        from core.speed_consensus import publishable_peak_mph, prompt_peak_mph
+
+        mph = float(publishable_peak_mph(ctx) or 0.0)
+        if mph < 5:
+            # Soft HUD peak may still imply motion without publishing MPH.
+            mph = float(prompt_peak_mph(ctx) or 0.0)
+    except Exception:
+        tel = ctx.telemetry or ctx.telemetry_data
+        mph = float(getattr(tel, "max_speed_mph", 0.0) or 0.0) if tel else 0.0
     if mph >= 70:
         return "high"
     if mph >= 25:

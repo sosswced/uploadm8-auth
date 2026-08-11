@@ -225,7 +225,9 @@ class EvidencePool:
     location_start_display: Optional[str] = None
 
     # Speed (canonical: .map telemetry > OSD HUD > Vision OCR — see collect_evidence)
-    max_speed_mph: float = 0.0
+    max_speed_mph: float = 0.0  # high-confidence publishable peak only
+    # Candidate peak for wrong-MPH scrub (includes medium HUD). Never force into titles.
+    scrub_speed_mph: float = 0.0
     avg_speed_mph: float = 0.0
     speed_source: str = ""  # "telemetry" | "osd" | "vision_ocr"
 
@@ -240,6 +242,10 @@ class EvidencePool:
     music_artist: Optional[str] = None
     music_title: Optional[str] = None
     music_genre: Optional[str] = None
+
+    # Garage / Trill vehicle (user-selected make/model on the upload)
+    vehicle_make: Optional[str] = None
+    vehicle_model: Optional[str] = None
 
     # Whisper / transcript
     transcript_nouns: List[str] = field(default_factory=list)
@@ -293,6 +299,7 @@ class EvidencePool:
                 self.vi_object_tracks, self.vi_text_detections,
                 self.vi_person_segments, self.vi_logos,
                 self.recognition_entities,
+                self.vehicle_make, self.vehicle_model,
                 getattr(self, "place_beaches", None),
                 getattr(self, "place_monuments", None),
                 getattr(self, "place_stadiums", None),
@@ -324,6 +331,10 @@ class EvidencePool:
                 "artist": self.music_artist,
                 "title": self.music_title,
                 "genre": self.music_genre,
+            },
+            "vehicle": {
+                "make": self.vehicle_make,
+                "model": self.vehicle_model,
             },
             "transcript": {
                 "phrase": self.transcript_phrase,
@@ -607,11 +618,13 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
     )
 
     # Hard publish (titles/anchors/hashtag MPH) requires high confidence.
-    # Candidate peak still drives wrong-MPH scrub via consensus_peak_mph.
+    # Candidate / consensus peak drives wrong-MPH scrub so medium HUD does
+    # not "eat all" claims (scrubbing against 0 drops every MPH mention).
     peak = publishable_peak_mph(ctx)
     candidate = consensus_peak_mph(ctx)
     cons = get_speed_consensus(ctx)
     src = str((cons or {}).get("source") or "")
+    pool.scrub_speed_mph = candidate if candidate >= 5 else 0.0
     if peak >= 5:
         pool.max_speed_mph = peak
         pool.avg_speed_mph = (
@@ -619,6 +632,7 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             else (osd_avg if src.startswith("osd") and osd_avg > 0 else peak)
         )
         pool.speed_source = src or "consensus"
+        pool.scrub_speed_mph = peak
     elif candidate >= 5:
         # Keep source label for diagnostics; do not force MPH into anchors.
         pool.speed_source = f"{src or 'consensus'}:{cons.get('confidence') or 'low'}"
@@ -640,11 +654,25 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             pool.trill_bucket = bucket.strip() or None
 
     # ── ACRCloud music ID ───────────────────────────────────────────────
+    # Prefer music_detected; still accept artist/title when ACR set names but
+    # forgot the flag (work with flake risk — don't drop real IDs).
     ac = getattr(ctx, "audio_context", None) or {}
-    if isinstance(ac, dict) and ac.get("music_detected"):
-        pool.music_artist = (ac.get("music_artist") or "").strip() or None
-        pool.music_title = (ac.get("music_title") or "").strip() or None
-        pool.music_genre = (ac.get("music_genre") or "").strip() or None
+    if isinstance(ac, dict):
+        artist = (ac.get("music_artist") or "").strip() or None
+        title = (ac.get("music_title") or "").strip() or None
+        genre = (ac.get("music_genre") or "").strip() or None
+        if ac.get("music_detected") or artist or title:
+            pool.music_artist = artist
+            pool.music_title = title
+            pool.music_genre = genre
+
+    # ── Garage / Trill vehicle ───────────────────────────────────────────
+    make = getattr(ctx, "vehicle_make_name", None)
+    model = getattr(ctx, "vehicle_model_name", None)
+    if isinstance(make, str) and make.strip():
+        pool.vehicle_make = make.strip()
+    if isinstance(model, str) and model.strip():
+        pool.vehicle_model = model.strip()
 
     # ── Whisper / transcript ────────────────────────────────────────────
     transcript = (getattr(ctx, "ai_transcript", "") or "").strip()
@@ -792,7 +820,9 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             # trusted peak before the phrase can reach titles/captions.
             from core.speed_consensus import scrub_untrusted_speed_claims
 
-            scene = scrub_untrusted_speed_claims(scene, pool.max_speed_mph or 0.0)
+            scene = scrub_untrusted_speed_claims(
+                scene, pool.scrub_speed_mph or pool.max_speed_mph or 0.0
+            )
             if scene:
                 pool.video_understanding_phrase = _first_sentence(scene, max_chars=140)
 
@@ -1317,18 +1347,56 @@ def _title_mentions_place_or_music(title: str, pool: EvidencePool) -> bool:
         return True
     if pool.gazetteer_place and str(pool.gazetteer_place).lower() in blob:
         return True
-    if pool.music_artist and str(pool.music_artist).lower() in blob:
-        return True
-    if pool.music_title and str(pool.music_title).lower() in blob:
+    if _music_tokens_mentioned(blob, pool):
         return True
     return False
 
 
+_MUSIC_STOP = frozenset(
+    {"wit", "da", "the", "feat", "ft", "featuring", "and", "with", "a", "an"}
+)
+
+
+def _music_tokens_mentioned(blob: str, pool: EvidencePool) -> bool:
+    """True when title cites artist/title — including short forms like 'A Boogie'."""
+    artist = str(pool.music_artist or "").strip().lower()
+    track = str(pool.music_title or "").strip().lower()
+    if artist and artist in blob:
+        return True
+    if track and track in blob:
+        return True
+    for raw in (artist, track):
+        if not raw:
+            continue
+        toks = [
+            t
+            for t in re.findall(r"[a-z0-9]+", raw)
+            if len(t) >= 2 and t not in _MUSIC_STOP
+        ]
+        if len(toks) >= 2 and all(t in blob for t in toks[:2]):
+            return True
+        if len(toks) == 1 and toks[0] in blob and len(toks[0]) >= 4:
+            return True
+    return False
+
+
 def _title_has_grounded_voice(title: str, pool: EvidencePool) -> bool:
-    """Creative M8 title that already cites peak MPH plus place or music."""
+    """Creative M8 title that already cites peak MPH plus place or music.
+
+    Compact timeline / Captured-at / recorded-in *receipts* are never grounded
+    voice — even when they cite every evidence token.
+    """
     t = scrub_machine_publish_dump(title or "").strip()
     if not t or len(t) < 12:
         return False
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(t):
+            return False
+    except Exception:
+        if re.match(r"(?i)^\s*(?:anchored\s+in|captured\s+at)\b", t):
+            return False
     # Place-only geo strings are never "voice" even if long.
     place = _format_place(pool)
     if place and t.lower() == place.lower():
@@ -1416,6 +1484,13 @@ def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
     t = scrub_machine_publish_dump(title or "").strip()
     if not t or len(t) < 20:
         return False
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(t):
+            return False
+    except Exception:
+        pass
     if " · " in t and re.search(r"\b\d{2,3}\s*mph\b", t, re.I):
         # Already the compact formula — not salvage voice.
         return False
@@ -1448,8 +1523,119 @@ def _inject_peak_mph_into_title(title: str, pool: EvidencePool, *, max_chars: in
     return _sanitize_anchor_fragment(out, max_chars=max_chars) or out[:max_chars]
 
 
+def _voice_shaped_title_from_pool(
+    pool: EvidencePool,
+    ctx: Optional[JobContext] = None,
+    *,
+    max_chars: int = 100,
+) -> str:
+    """Persona-shaped title when compact receipt would otherwise ship.
+
+    Prefer VU/scene prose + soft MPH, then music braid — never
+    ``N MPH through Place — with Artist``.
+    """
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+    except Exception:
+        is_formula_stub_caption = lambda _t: False  # type: ignore
+
+    scene = _publishable_closing(pool.video_understanding_phrase)
+    if scene and len(scene) >= 12 and not is_formula_stub_caption(scene):
+        if pool.max_speed_mph and pool.max_speed_mph >= 5:
+            return _inject_peak_mph_into_title(scene, pool, max_chars=max_chars)
+        return _sanitize_anchor_fragment(scene, max_chars=max_chars) or scene[:max_chars]
+
+    place = _format_place(pool)
+    music = ""
+    if pool.music_artist and pool.music_title:
+        music = f"{pool.music_artist} — {pool.music_title}"
+    elif pool.music_artist or pool.music_title:
+        music = str(pool.music_artist or pool.music_title).strip()
+
+    us = (getattr(ctx, "user_settings", None) or {}) if ctx is not None else {}
+    voice = str(us.get("captionVoice") or us.get("caption_voice") or "default").lower()
+    if "teacher" in voice:
+        lead = "Reading the road"
+    elif "hype" in voice or "best_friend" in voice or "bestfriend" in voice:
+        lead = "We're locked in"
+    elif "coach" in voice:
+        lead = "Stay on the line"
+    else:
+        lead = "The cabin holds the beat"
+
+    bits = [b for b in (place, music) if b]
+    mid = " with ".join(bits[:2]) if bits else "this run"
+    core = f"{lead} through {mid}" if place else f"{lead} — {mid}"
+    if pool.max_speed_mph and pool.max_speed_mph >= 5:
+        return _inject_peak_mph_into_title(core, pool, max_chars=max_chars)
+    out = _sanitize_anchor_fragment(core, max_chars=max_chars) or core[:max_chars]
+    if out and not is_formula_stub_caption(out):
+        return out
+    # Last resort: MPH — lead (still not compact through-Place receipt).
+    if pool.max_speed_mph and pool.max_speed_mph >= 5:
+        mph = f"{int(round(pool.max_speed_mph))} MPH"
+        return _sanitize_anchor_fragment(f"{mph} — {lead}", max_chars=max_chars) or f"{mph} — {lead}"
+    return lead[:max_chars]
+
+
+def _voice_shaped_caption_from_pool(
+    pool: EvidencePool,
+    ctx: Optional[JobContext] = None,
+    *,
+    max_chars: int = 520,
+) -> str:
+    """Replace receipt captions when persona prefs require audible voice."""
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+    except Exception:
+        is_formula_stub_caption = lambda _t: False  # type: ignore
+
+    titleish = _voice_shaped_title_from_pool(pool, ctx, max_chars=90)
+    speech = _publishable_closing(pool.transcript_phrase)
+    if not speech and ctx is not None:
+        speech = _publishable_closing(_transcript_fragment_for_anchor(ctx))
+    scene = _publishable_closing(pool.video_understanding_phrase)
+    music = ""
+    if pool.music_artist and pool.music_title:
+        music = f"{pool.music_artist}'s {pool.music_title}"
+    elif pool.music_artist or pool.music_title:
+        music = str(pool.music_artist or pool.music_title).strip()
+    place = _format_place(pool)
+    driver = str(pool.driver_name or "").strip()
+
+    parts: List[str] = []
+    # Prefer spoken evidence so captions "hear" conversations when Whisper ran.
+    if speech and not is_formula_stub_caption(speech):
+        parts.append(speech.rstrip(" ."))
+    elif titleish and not is_formula_stub_caption(titleish):
+        parts.append(titleish.rstrip(" ."))
+    elif scene and not is_formula_stub_caption(scene):
+        parts.append(scene.rstrip(" ."))
+    detail_bits = []
+    if driver and (not speech or driver.lower() not in speech.lower()):
+        detail_bits.append(f"{driver} on the wheel")
+    if music and (not speech or music.lower() not in (speech or "").lower()):
+        detail_bits.append(f"{music} in the cabin")
+    if place and (
+        not (speech or titleish)
+        or place.lower() not in (speech or titleish or "").lower()
+    ):
+        detail_bits.append(f"near {place}")
+    if detail_bits:
+        parts.append(", ".join(detail_bits[:3]))
+    cap = ". ".join(p for p in parts if p).strip()
+    if not cap:
+        cap = speech or titleish or "Out here with what the clip actually shows."
+    if not cap.endswith((".", "!", "?")):
+        cap += "."
+    return scrub_machine_publish_dump(cap)[:max_chars]
+
+
 def _caption_has_grounded_voice(caption: str, pool: EvidencePool) -> bool:
-    """Non-boilerplate caption that already cites peak MPH plus place or music."""
+    """Non-boilerplate caption that already cites peak MPH plus place or music.
+
+    Receipt templates (compact / Captured-at / recorded-in) never count as voice.
+    """
     c = scrub_machine_publish_dump(caption or "").strip()
     if not c or len(c) < 40:
         return False
@@ -1459,7 +1645,7 @@ def _caption_has_grounded_voice(caption: str, pool: EvidencePool) -> bool:
         if is_formula_stub_caption(c):
             return False
     except Exception:
-        if re.match(r"(?i)^\s*anchored\s+in\b", c):
+        if re.match(r"(?i)^\s*(?:anchored\s+in|captured\s+at)\b", c):
             return False
     if not _title_mentions_trusted_speed(c, pool):
         return False
@@ -1496,11 +1682,7 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     blob = t.lower()
     mentions_speed = _title_mentions_trusted_speed(t, pool)
 
-    mentions_music = False
-    if pool.music_artist and str(pool.music_artist).lower() in blob:
-        mentions_music = True
-    if pool.music_title and str(pool.music_title).lower() in blob:
-        mentions_music = True
+    mentions_music = _music_tokens_mentioned(blob, pool)
 
     place = _format_place(pool)
     if place and blob == place.lower():
@@ -1720,6 +1902,11 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         _push(pool.music_artist)
     if pool.music_title:
         _push(pool.music_title)
+
+    if getattr(pool, "vehicle_make", None):
+        _push(pool.vehicle_make)
+    if getattr(pool, "vehicle_model", None):
+        _push(pool.vehicle_model)
 
     road_tokens = _road_hashtag_tokens(pool.road)
     for tok in road_tokens:
@@ -2257,11 +2444,26 @@ def enforce_hydration(
 
     evidence_tags = build_evidence_hashtags(pool, max_extra=max_extra_hashtags)
 
+    try:
+        from services.m8_grounding_pass import (
+            is_formula_stub_caption,
+            persona_voice_required,
+        )
+
+        persona_required = persona_voice_required(
+            getattr(ctx, "user_settings", None) or {}
+        )
+    except Exception:
+        is_formula_stub_caption = lambda _t: False  # type: ignore
+        persona_required = False
+
     report: Dict[str, Any] = {
         "evidence_present": has_evidence,
         "used_fallback_anchor": used_fallback,
         "rewrote_caption": False,
         "rewrote_title": False,
+        "persona_required": persona_required,
+        "receipt_rejected": False,
         "purged_seed_tags": 0,
         "added_evidence_tags": 0,
         "anchor": anchor,
@@ -2270,6 +2472,9 @@ def enforce_hydration(
         "evidence_tags": list(evidence_tags),
         "evidence": pool.to_report(),
         "warnings": [],
+        "title_before": str(getattr(ctx, "ai_title", "") or "")[:120],
+        "title_after": "",
+        "wipe_reason": "unchanged",
     }
 
     # ── Loud warning when no signals at all ──────────────────────────────
@@ -2352,19 +2557,28 @@ def enforce_hydration(
 
         Grounded M8 voice (peak MPH + place/music) is kept — never append
         Captured-at. Generic / dump captions still REPLACE with the anchor.
-        Fallback (filename/category) anchor → only REPLACE when caption is generic.
+        Receipt templates under persona prefs → voice-shaped rebuild.
         """
         raw = cap_str or ""
         scrubbed = scrub_machine_publish_dump(raw)
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
+            if persona_required:
+                voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
+                report["receipt_rejected"] = True
+                return voice_cap or scrubbed or None
             if anchor:
                 return _hydrate_caption("", anchor)
             return scrubbed or None
         # Wrong-MPH claims (LLM inventions) never survive into published copy.
         from core.speed_consensus import scrub_untrusted_speed_claims
 
-        scrubbed = scrub_untrusted_speed_claims(scrubbed, pool.max_speed_mph or 0.0) or scrubbed
+        scrub_peak = pool.scrub_speed_mph or pool.max_speed_mph or 0.0
+        scrubbed = scrub_untrusted_speed_claims(scrubbed, scrub_peak) or scrubbed
         working = scrubbed
+        if persona_required and is_formula_stub_caption(working):
+            voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
+            report["receipt_rejected"] = True
+            return voice_cap if voice_cap else None
         if not anchor:
             return working if working != raw.strip() else None
         if _caption_has_grounded_voice(working, pool):
@@ -2374,6 +2588,10 @@ def enforce_hydration(
         if used_fallback:
             if not _is_generic_caption(working):
                 return working if working != raw.strip() else None
+            if persona_required:
+                voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
+                report["receipt_rejected"] = True
+                return voice_cap if voice_cap and voice_cap != raw.strip() else None
             new = _hydrate_caption(working, anchor)
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None
@@ -2382,6 +2600,10 @@ def enforce_hydration(
         # missed evidence token alone.
         if not _is_generic_caption(working) and len(working.strip()) >= 40:
             return working if working != raw.strip() else None
+        if persona_required:
+            voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
+            report["receipt_rejected"] = True
+            return voice_cap if voice_cap and voice_cap != raw.strip() else None
         new = _hydrate_caption(working, anchor)
         return new if new and new != raw.strip() else (
             working if working != raw.strip() else None
@@ -2390,19 +2612,54 @@ def enforce_hydration(
     def _maybe_rewrite_title(ttl_str: str) -> Optional[str]:
         """Titles never get caption-style Captured-at / VI dump anchors.
 
-        Place-only / empty / dump → compact evidence anchor.
-        Salvageable voice (place/music, missing or scrubbed peak) → inject MPH.
-        Grounded M8 voice is kept as-is.
+        Place-only / empty / dump → compact evidence anchor (or voice-shaped
+        when persona prefs are set). Salvageable voice → soft-inject MPH.
+        Receipt templates under persona prefs never ship.
         """
         raw = ttl_str or ""
         scrubbed = scrub_machine_publish_dump(raw)
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
+            if persona_required:
+                voice_t = _voice_shaped_title_from_pool(pool, ctx)
+                report["receipt_rejected"] = True
+                return voice_t or title_anchor or scrubbed or None
             return title_anchor or scrubbed or None
         from core.speed_consensus import scrub_untrusted_speed_claims
 
         pre_scrub = scrubbed
-        scrubbed = scrub_untrusted_speed_claims(scrubbed, pool.max_speed_mph or 0.0) or scrubbed
+        scrub_peak = pool.scrub_speed_mph or pool.max_speed_mph or 0.0
+        scrubbed = scrub_untrusted_speed_claims(scrubbed, scrub_peak) or scrubbed
+        # Titles never carry medium/unverified MPH — strip remaining claims
+        # when there is no publishable peak (anchors inject only from max_speed).
+        if not (pool.max_speed_mph and pool.max_speed_mph >= 5):
+            scrubbed = scrub_untrusted_speed_claims(scrubbed, 0.0) or scrubbed
         working = scrubbed
+        if persona_required and (not working or is_formula_stub_caption(working)):
+            for cand_cap in (
+                getattr(ctx, "ai_caption", None),
+                *((getattr(ctx, "m8_platform_captions", None) or {}).values()),
+            ):
+                first = re.split(
+                    r"(?<=[.!?])\s+",
+                    scrub_machine_publish_dump(str(cand_cap or "")),
+                    maxsplit=1,
+                )[0].strip()
+                if (
+                    first
+                    and len(first) >= 12
+                    and not is_formula_stub_caption(first)
+                    and not _is_generic_caption(first)
+                ):
+                    lifted = first[:100]
+                    if pool.max_speed_mph and pool.max_speed_mph >= 5:
+                        if not _title_mentions_trusted_speed(lifted, pool):
+                            lifted = _inject_peak_mph_into_title(lifted, pool)
+                    if lifted and not is_formula_stub_caption(lifted):
+                        report["receipt_rejected"] = True
+                        return lifted
+            voice_t = _voice_shaped_title_from_pool(pool, ctx)
+            report["receipt_rejected"] = True
+            return voice_t if voice_t else None
         if not title_anchor:
             return working if working != raw.strip() else None
         # Soft-inject peak MPH into place/music voice before thin/wipe decisions.
@@ -2419,11 +2676,12 @@ def enforce_hydration(
                     and len(salvage_base) >= 20
                     and " · " not in salvage_base
                     and not _is_generic_caption(salvage_base)
+                    and not is_formula_stub_caption(salvage_base)
                 )
             )
         ):
             new = _inject_peak_mph_into_title(salvage_base, pool)
-            if new and new != raw.strip():
+            if new and not is_formula_stub_caption(new) and new != raw.strip():
                 return new
         # Wrong-MPH scrub removed the number but left creative place/music prose
         # → inject trusted peak instead of · formula wipe.
@@ -2444,7 +2702,6 @@ def enforce_hydration(
                 ) else (
                     pre_scrub or working
                 )
-                # Prefer post-scrub text; if scrub emptied place tokens, use pre.
                 if not (
                     _title_mentions_place_or_music(base, pool)
                     or _title_cites_scene_evidence(base, pool)
@@ -2454,8 +2711,6 @@ def enforce_hydration(
                 return new if new and new != raw.strip() else (
                     working if working != raw.strip() else None
                 )
-            # Keep publishable persona/scene voice — soft-inject MPH when peak exists
-            # instead of wiping to compact "N MPH through Place — with Artist".
             keep_base = working
             if _title_has_publishable_voice(pre_scrub or "", pool) and not _title_has_publishable_voice(
                 working, pool
@@ -2468,25 +2723,51 @@ def enforce_hydration(
                         keep_base if keep_base != raw.strip() else None
                     )
                 return keep_base if keep_base != raw.strip() else None
-            # Formula wipe only when we have a real speed peak (dashcam grounding).
             if not (pool.max_speed_mph and pool.max_speed_mph >= 5):
                 return working if working != raw.strip() else None
+            if persona_required:
+                voice_t = _voice_shaped_title_from_pool(pool, ctx)
+                report["receipt_rejected"] = True
+                return voice_t if voice_t else None
             new = title_anchor[:100]
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None
             )
         if _title_has_grounded_voice(working, pool):
             return working if working != raw.strip() else None
+        # Keep short LLM prose that already cites place/music/scene — never
+        # wipe to ``Through Place — with Artist`` via _hydrate_title.
+        if _title_has_publishable_voice(working, pool) and not is_formula_stub_caption(
+            working
+        ):
+            return working if working != raw.strip() else None
         if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
             return working if working != raw.strip() else None
         if used_fallback:
             if not _is_generic_caption(working) and working:
                 return working if working != raw.strip() else None
+            if persona_required:
+                voice_t = _voice_shaped_title_from_pool(pool, ctx)
+                report["receipt_rejected"] = True
+                return voice_t if voice_t else None
             new = _hydrate_title(working, title_anchor)
             return new if new and new != raw.strip() else (
                 working if working != raw.strip() else None
             )
+        if persona_required and (
+            not working or is_formula_stub_caption(working) or _is_generic_caption(working)
+        ):
+            voice_t = _voice_shaped_title_from_pool(pool, ctx)
+            report["receipt_rejected"] = True
+            return voice_t if voice_t else None
+        # Persona prefs: never ship the compact timeline as a hydrate result.
+        if persona_required and is_formula_stub_caption(title_anchor):
+            return working if working != raw.strip() else None
         new = _hydrate_title(working, title_anchor)
+        if new and persona_required and is_formula_stub_caption(new):
+            voice_t = _voice_shaped_title_from_pool(pool, ctx)
+            report["receipt_rejected"] = True
+            return voice_t if voice_t else (working if working else new)
         return new if new and new != raw.strip() else (
             working if working != raw.strip() else None
         )
@@ -2508,12 +2789,19 @@ def enforce_hydration(
                 report["rewrote_title"] = True
 
     # ── Per-platform M8 hashtags: replace seed-only with evidence ────────
+    us_htag = getattr(ctx, "user_settings", None) or {}
+    try:
+        _max_htags = int(us_htag.get("maxHashtags") or us_htag.get("max_hashtags") or 15)
+    except (TypeError, ValueError):
+        _max_htags = 15
+    _max_htags = max(1, min(30, _max_htags))
+
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
             tags = list(raw_list) if isinstance(raw_list, list) else []
             seed_only, _seed_n, _total_n = _hashtags_are_seed_only(tags)
             purged = _purge_seed_tags_when_evidence(tags, evidence_tags)
-            cap = max(len(tags), len(evidence_tags))
+            cap = max(len(tags), len(evidence_tags), _max_htags)
             merged = _merge_hashtag_lists(evidence_tags, purged, cap=cap)
             if merged != tags:
                 report["purged_seed_tags"] += len(tags) - len(purged)
@@ -2539,7 +2827,7 @@ def enforce_hydration(
         existing = list(getattr(ctx, "ai_hashtags", None) or [])
         seed_only, _s, _t = _hashtags_are_seed_only(existing)
         purged = _purge_seed_tags_when_evidence(existing, evidence_tags)
-        cap = max(len(existing), len(evidence_tags))
+        cap = max(len(existing), len(evidence_tags), _max_htags)
         merged = _merge_hashtag_lists(evidence_tags, purged, cap=cap)
         if merged != existing:
             report["purged_seed_tags"] += len(existing) - len(purged)
@@ -2552,6 +2840,58 @@ def enforce_hydration(
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
             m8_hashtags[pl] = _scrub_leaked_junk_hashtags(list(raw_list or []))
+
+    # ── FactLedger: soft-weave missing classes + pad hashtags (LLM titles stay) ─
+    try:
+        from services.fact_ledger import apply_fact_ledger_to_ctx, fact_ledger_enabled
+
+        if fact_ledger_enabled():
+            fl_report = apply_fact_ledger_to_ctx(ctx, pool)
+            report["fact_ledger"] = fl_report
+            if fl_report.get("woven_classes"):
+                report["rewrote_caption"] = True
+            # Re-scrub after pad (ledger slugs are already sanitized).
+            ctx.ai_hashtags = _scrub_leaked_junk_hashtags(
+                list(getattr(ctx, "ai_hashtags", None) or [])
+            )
+            if isinstance(m8_hashtags, dict):
+                for pl, raw_list in list(m8_hashtags.items()):
+                    m8_hashtags[pl] = _scrub_leaked_junk_hashtags(list(raw_list or []))
+    except Exception as fl_exc:
+        report.setdefault("warnings", []).append(f"fact_ledger_error:{fl_exc}")
+
+    # Title mutation trail (LLM-keep vs soft-mph vs receipt rebuild).
+    title_final = str(getattr(ctx, "ai_title", "") or "")
+    if isinstance(getattr(ctx, "m8_platform_titles", None), dict):
+        yt = (ctx.m8_platform_titles or {}).get("youtube")
+        if yt:
+            title_final = str(yt)
+    report["title_after"] = title_final[:120]
+    if report.get("receipt_rejected"):
+        report["wipe_reason"] = "receipt_rejected"
+    elif report.get("rewrote_title"):
+        before = str(report.get("title_before") or "")
+        after = str(report.get("title_after") or "")
+        if before == after:
+            report["wipe_reason"] = "unchanged"
+        elif re.match(r"(?i)^\s*\d{2,3}\s*mph\s*[—\-]", after) and before and before in after:
+            report["wipe_reason"] = "soft_mph"
+        elif after and title_anchor and after.strip() == str(title_anchor).strip()[:100]:
+            report["wipe_reason"] = "compact_fallback"
+        else:
+            try:
+                from services.m8_grounding_pass import is_formula_stub_caption as _stub_chk
+
+                if _stub_chk(before) and not _stub_chk(after):
+                    report["wipe_reason"] = "receipt_rejected"
+                elif _title_has_publishable_voice(after, pool):
+                    report["wipe_reason"] = "keep_publishable"
+                else:
+                    report["wipe_reason"] = "rewrote"
+            except Exception:
+                report["wipe_reason"] = "rewrote"
+    else:
+        report["wipe_reason"] = "unchanged"
 
     # ── Metadata quality notes (surfaced in hydration_report / admin trace) ─
     qual: List[str] = []
@@ -2592,6 +2932,11 @@ def enforce_hydration(
             "evidence_present": report["evidence_present"],
             "rewrote_caption": report["rewrote_caption"],
             "rewrote_title": report["rewrote_title"],
+            "persona_required": report.get("persona_required", False),
+            "receipt_rejected": report.get("receipt_rejected", False),
+            "title_before": report.get("title_before"),
+            "title_after": report.get("title_after"),
+            "wipe_reason": report.get("wipe_reason"),
             "purged_seed_tags": report["purged_seed_tags"],
             "added_evidence_tags": report["added_evidence_tags"],
             "anchor": report["anchor"],
@@ -2602,9 +2947,28 @@ def enforce_hydration(
             "metadata_quality": report.get("metadata_quality") or {},
             "grounding_score": report.get("grounding_score"),
             "grounding": report.get("grounding") or {},
+            "fact_ledger": report.get("fact_ledger") or {},
         }
         if report.get("grounding"):
             ctx.output_artifacts["grounding_score_v1"] = report["grounding"]
+        fl_art = (report.get("fact_ledger") or {}).get("ledger")
+        if fl_art:
+            ctx.output_artifacts["fact_ledger_v1"] = fl_art
+        if report.get("fact_ledger"):
+            ctx.output_artifacts["fact_ledger_apply"] = {
+                k: report["fact_ledger"].get(k)
+                for k in (
+                    "woven_classes",
+                    "missing_before",
+                    "missing_after",
+                    "missing_after_with_tags",
+                    "hashtags_padded",
+                    "hashtag_target",
+                    "second_weave",
+                    "quality_notes",
+                )
+                if k in (report.get("fact_ledger") or {})
+            }
     except (AttributeError, TypeError):
         pass
 

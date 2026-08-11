@@ -475,15 +475,12 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
     out["headline_options"] = options[:3]
 
     badge = clean_thumbnail_headline(out.get("badge_text"), max_words=2)[:14]
-    tel = ctx.telemetry_data or ctx.telemetry
-    osd = ctx.dashcam_osd_context or {}
-    osd_speed = 0.0
-    if isinstance(osd, dict):
-        try:
-            osd_speed = float(osd.get("max_speed_mph") or osd.get("peak_speed_mph") or 0)
-        except (TypeError, ValueError):
-            osd_speed = 0.0
-    has_speed = bool((tel and (getattr(tel, "max_speed_mph", 0) or 0) > 0) or osd_speed > 0)
+    try:
+        from core.speed_consensus import publishable_peak_mph
+
+        has_speed = publishable_peak_mph(ctx) >= 5
+    except Exception:
+        has_speed = False
     if badge in {"NEW", "FAST", "SPEED"} and not has_speed:
         badge = ""
     out["badge_text"] = badge

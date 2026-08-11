@@ -163,24 +163,11 @@ def _speed_mph(ctx: JobContext) -> float:
     are omitted so fusion cannot mint uncorroborated MPH into VU.
     """
     try:
-        from core.speed_consensus import build_speed_consensus
+        from core.speed_consensus import publishable_peak_mph
 
-        cons = build_speed_consensus(ctx)
-        if str(cons.get("confidence") or "") == "high":
-            return float(cons.get("peak_mph") or 0.0)
-        return 0.0
+        return float(publishable_peak_mph(ctx) or 0.0)
     except Exception:
-        pass
-    # Fail closed without a consensus helper — never invent from raw OSD alone.
-    tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-    if tel is not None:
-        try:
-            tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
-            if tel_max >= 5:
-                return tel_max
-        except (TypeError, ValueError):
-            pass
-    return 0.0
+        return 0.0
 
 
 def _place_bits(ctx: JobContext, place_signs: List[str]) -> Tuple[str, str]:
@@ -217,17 +204,19 @@ def _music_bits(ctx: JobContext) -> Tuple[str, str]:
 def _timeline_hook_lines(ctx: JobContext, *, limit: int = 4) -> List[str]:
     events = build_video_story_timeline(ctx, max_events=40) or []
     prefer = (
+        "welcome_sign",
+        "landmark",
+        "logo",
+        "object",
+        "vi_label",
+        "vision_label",
+        "on_screen_text",
         "telemetry_speed",
         "osd_speed",
-        "welcome_sign",
         "geo_place",
         "geo_road",
         "music",
-        "landmark",
-        "on_screen_text",
         "transcript",
-        "object",
-        "vi_label",
         "yamnet",
     )
     picked: List[str] = []

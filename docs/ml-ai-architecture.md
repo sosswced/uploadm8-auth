@@ -85,6 +85,7 @@ Customer brand is **Smart** (`smart-insights.html`, `smart-coach.js`). Legacy **
 | TL skip invert | `stages/twelvelabs_stage.py` | Do not skip TL when Vision weak |
 | Place without `.map` | `services/place_evidence.py` | Landmarks → Nominatim; OCR beaches/monuments/plates/teams |
 | Auto Whisper on speech | `stages/audio_stage.py` | RMS energy → Whisper when STT not explicitly off |
+| Paid baselines | `core/upload_baseline_defaults.py` | Paid active: Whisper + captions + Vision + TL + VI + Studio on; free/trial opt-in |
 | Shot list | `worker.py` → `output_artifacts.shot_list_v1` | Temporal spine for M8 digest |
 | Grounding score | `services/grounding_eval.py` | Deterministic overlap on `hydration_report` |
 | M8 pass 2 claims | `services/m8_grounding_pass.py` | `claims[]` + evidence catalog; strip/inject must_use |

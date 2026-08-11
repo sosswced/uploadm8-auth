@@ -236,7 +236,8 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     # Keep this high priority: artist/track tags are exact catalogue signals and
     # can otherwise be crowded out by geo/vision-heavy dashcam clips.
     ac = (ctx.audio_context or {}) if isinstance(ctx.audio_context, dict) else {}
-    if ac.get("music_detected"):
+    # Flake-tolerant: ACR often sets artist/title but forgets music_detected.
+    if ac.get("music_detected") or ac.get("music_artist") or ac.get("music_title"):
         artist = ac.get("music_artist") or ""
         title = ac.get("music_title") or ""
         _push(tags, seen, artist)

@@ -309,12 +309,10 @@ AMBIENT_REDUNDANT_SLUGS_BY_PROFILE: dict[str, frozenset[str]] = {
             "tyres",
             "wheels",
             "rims",
+            # Keep bare "gas"/"fuel" as weak furniture noise; do NOT strip
+            # gasstation / fuelpump / petrol station — those are scene POIs.
             "gas",
-            "gasoline",
-            "gasstation",
             "fuel",
-            "petrol",
-            "fuelpump",
             "carwindow",
             "carwindows",
             "windows",

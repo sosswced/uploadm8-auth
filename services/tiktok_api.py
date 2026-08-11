@@ -58,13 +58,10 @@ TIKTOK_BRANDED_CONTENT_POLICY_URL = "https://www.tiktok.com/legal/page/global/bc
 def tiktok_app_audited() -> bool:
     """True when Content Posting Direct Post may use public privacy levels.
 
-    UploadM8's TikTok Content Posting API audit is approved. Default is audited
-    (public Direct Post). Opt out with ``TIKTOK_APP_AUDITED=0``.
-
-    Reads the live environment (not a frozen import-time snapshot).
+    UploadM8's TikTok Content Posting API audit is approved. Hardcoded True so a
+    mis-set Render ``TIKTOK_APP_AUDITED`` cannot flip UI/publish into unaudited mode.
     """
-    v = (os.environ.get("TIKTOK_APP_AUDITED") or "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return True
 
 
 def tiktok_unaudited_mode() -> bool:
@@ -73,14 +70,13 @@ def tiktok_unaudited_mode() -> bool:
 
 
 def tiktok_force_private_unaudited() -> bool:
-    """Clamp Direct Post privacy to SELF_ONLY — emergency flag only.
+    """Clamp Direct Post privacy to SELF_ONLY — permanently disabled.
 
     After TikTok audit approval, publish must honor the creator's chosen privacy.
-    Do **not** clamp merely because ``TIKTOK_APP_AUDITED`` is unset/mis-set on one
-    Render service; only ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1`` forces SELF_ONLY.
+    Hardcoded False: ignore ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` (Render has been
+    sticky with a stale ``=1`` that privately published public selections).
     """
-    v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return False
 
 
 def tiktok_direct_post_status() -> dict:

@@ -125,14 +125,19 @@ def _parse_nmea_datetime(date_raw: str, time_raw: str, fallback_ts: float) -> fl
         return fallback_ts
 
 
+# Escort Redline / M2-style .map speed column is km/h (not MPH).
+# Verified against burned-in HUD: map 128.49 ↔ OSD 79MPH (128.49 * 0.621371 ≈ 79.8).
+_KMH_TO_MPH = 0.621371
+
+
 def _parse_nmea_point_from_row(row: List[str], *, fallback_ts: float) -> Optional[Dict[str, float]]:
-    """Parse one Escort/NMEA-style .map CSV row."""
+    """Parse one Escort/NMEA-style .map CSV row (speed column is km/h → mph)."""
     if not _looks_like_nmea_row(row):
         return None
     lat = _nmea_to_decimal(row[3], row[4])
     lon = _nmea_to_decimal(row[5], row[6])
-    speed = _to_float(str(row[7]).rstrip(";"))
-    if lat is None or lon is None or speed is None:
+    speed_kmh = _to_float(str(row[7]).rstrip(";"))
+    if lat is None or lon is None or speed_kmh is None:
         return None
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return None
@@ -142,7 +147,7 @@ def _parse_nmea_point_from_row(row: List[str], *, fallback_ts: float) -> Optiona
         "timestamp": float(ts),
         "lat": float(lat),
         "lon": float(lon),
-        "speed_mph": float(speed),
+        "speed_mph": float(speed_kmh) * _KMH_TO_MPH,
         "altitude": float(alt or 0.0),
     }
 

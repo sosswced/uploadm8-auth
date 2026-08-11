@@ -125,6 +125,8 @@ def speed_match_is_coordinate_bleed(
     Catches:
       * ``-115MPH`` / ``-122MPH`` (signed lon glued to a unit)
       * ``115°MPH`` when 115 is the lon integer on the same HUD line
+      * ``… -122.57585° 122 MPH`` / ``… 36.136° 36MPH`` — OCR ghosts the
+        lat/lon *integer* as a separate unit-labeled speed after the GPS pair
       * any speed match whose span overlaps a coordinate token
       * speed digits that are the integer prefix of a decimal coord on the line
         *and* sit inside/adjacent to that coord (not a separate HUD sample)
@@ -141,6 +143,8 @@ def speed_match_is_coordinate_bleed(
     if match_start > 0 and t[match_start - 1] in "-−–—‐-":
         return True
 
+    coord_ints = coordinate_integer_parts(t)
+
     for a, b in coordinate_spans(t):
         # Overlap with a GPS token.
         if match_start < b and match_end > a:
@@ -150,11 +154,19 @@ def speed_match_is_coordinate_bleed(
             return True
         if match_start == b:
             return True
+        # Lat/lon integer echoed as a "speed" right after the GPS pair
+        # (only whitespace / degree junk between). Real HUD speeds that
+        # happen to equal a coord integer are fail-closed here — prefer a
+        # distinct reading (88 MPH after -115.17) over publishing lon as MPH.
+        if match_start > b and n in coord_ints:
+            gap = t[b:match_start]
+            if gap == "" or re.fullmatch(r"[\s°ºo*]+", gap or ""):
+                return True
 
     # Degree used as OCR "separator" but number is the lon/lat integer on-line.
     window = t[max(0, match_start - 1) : min(len(t), match_end + 1)]
     if "°" in window or "º" in window:
-        if n in coordinate_integer_parts(t):
+        if n in coord_ints:
             return True
 
     # Digits are the integer part of a decimal coordinate that contains this span.

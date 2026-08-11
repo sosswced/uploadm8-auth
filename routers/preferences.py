@@ -430,13 +430,15 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 
     # Overlay users.preferences (PUT /api/me/preferences writes here) -- full overlay
     users_prefs_row = await conn.fetchrow(
-        "SELECT preferences, subscription_tier, role FROM users WHERE id = $1",
+        "SELECT preferences, subscription_tier, role, subscription_status FROM users WHERE id = $1",
         user_id,
     )
     role = None
+    subscription_status = None
     if users_prefs_row:
         tier = users_prefs_row.get("subscription_tier")
         role = users_prefs_row.get("role")
+        subscription_status = users_prefs_row.get("subscription_status")
         up = _parse_users_preferences(users_prefs_row["preferences"])
     else:
         up = {}
@@ -470,7 +472,12 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 
     if result:
         _hydrate_snake_camel_mirror(result)
-        apply_upload_baseline_defaults(result, tier=tier, role=role)
+        apply_upload_baseline_defaults(
+            result,
+            tier=tier,
+            role=role,
+            subscription_status=subscription_status,
+        )
         return result
 
     # Fallback: Try legacy JSONB locations
@@ -523,7 +530,12 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     if isinstance(prefs, dict):
         _overlay_users_prefs_on_result(out, prefs)
     _hydrate_snake_camel_mirror(out)
-    apply_upload_baseline_defaults(out)
+    apply_upload_baseline_defaults(
+        out,
+        tier=tier,
+        role=role,
+        subscription_status=subscription_status,
+    )
     return out
 
 
@@ -717,12 +729,19 @@ async def get_user_preferences(
                 out.setdefault("thumbnailRenderPipeline", "auto")
                 out.setdefault("thumbnail_render_pipeline", "auto")
             tier_row = await conn.fetchrow(
-                "SELECT subscription_tier, role FROM users WHERE id = $1", user["id"]
+                "SELECT subscription_tier, role, subscription_status FROM users WHERE id = $1",
+                user["id"],
             )
             tier_slug = str((tier_row or {}).get("subscription_tier") or "free")
             role_slug = str((tier_row or {}).get("role") or "user")
-            # Tier/role-aware fill: free+paid opt-in; admin gets full stack on.
-            apply_upload_baseline_defaults(out, tier=tier_slug, role=role_slug)
+            status_slug = str((tier_row or {}).get("subscription_status") or "")
+            # Free/trial opt-in; paid active gets speech+TL+VI+Studio; admin full stack.
+            apply_upload_baseline_defaults(
+                out,
+                tier=tier_slug,
+                role=role_slug,
+                subscription_status=status_slug,
+            )
             ent = get_entitlements_for_tier(tier_slug)
             pref_explicit = (
                 d.get("tiktok_burn_styled_cover") is not None

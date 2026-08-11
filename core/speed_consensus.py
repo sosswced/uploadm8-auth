@@ -49,19 +49,54 @@ def _f(v: Any) -> float:
     return out if out > 0 else 0.0
 
 
+def _peak_matches_coord_integer(osd: Any, peak: float) -> bool:
+    """True when ``peak`` equals a lat/lon integer from OSD GPS fixes."""
+    if not isinstance(osd, dict) or peak < 5:
+        return False
+    target = int(round(peak))
+    coords: list = []
+    for key in ("first_seen", "last_seen"):
+        pt = osd.get(key) or {}
+        if isinstance(pt, dict):
+            coords.extend([pt.get("lat"), pt.get("lon")])
+    for row in (osd.get("gps_path") or [])[:24]:
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            coords.extend([row[0], row[1]])
+        elif isinstance(row, dict):
+            coords.extend([row.get("lat"), row.get("lon")])
+    for c in coords:
+        try:
+            if int(abs(float(c))) == target:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
-    """Fuse all speed readings on ``ctx`` into one canonical, confident artifact."""
+    """Fuse all speed readings on ``ctx`` into one canonical, confident artifact.
+
+    Contract: only ``.map`` telemetry elevates to publishable ``high`` by itself.
+    OSD-backfilled ``tel.max_speed_mph`` is HUD family — never treated as a true
+    map peak (that bypass used to mint lat/lon ghosts as publishable MPH).
+    """
     tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-    telemetry_max = _f(getattr(tel, "max_speed_mph", 0) if tel is not None else 0)
+    telemetry_raw = _f(getattr(tel, "max_speed_mph", 0) if tel is not None else 0)
 
     osd = getattr(ctx, "dashcam_osd_context", None) or {}
     osd_max = 0.0
     gps_implied = 0.0
+    backfilled = False
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         osd_max = _f(osd.get("max_speed_mph"))
+        backfilled = bool(osd.get("telemetry_backfilled"))
         sq = osd.get("speed_quality") or {}
         if isinstance(sq, dict):
             gps_implied = _f(sq.get("gps_implied_peak_mph"))
+    # Also honor an explicit flag on the telemetry object (tests / recovery).
+    if not backfilled and tel is not None:
+        backfilled = bool(getattr(tel, "osd_backfilled", False))
+
     series_peak = osd_series_peak_mph(osd if isinstance(osd, dict) else None)
 
     vision_peak = 0.0
@@ -77,17 +112,25 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
             except Exception:
                 vision_peak = 0.0
 
+    # Backfilled OSD must not win as telemetry — fold into HUD peak pool.
+    true_map_telemetry = telemetry_raw if (telemetry_raw >= 5 and not backfilled) else 0.0
+    if backfilled and telemetry_raw >= 5:
+        osd_max = max(osd_max, telemetry_raw)
+
     peak, source = trusted_peak_speed_mph(
-        telemetry_max=telemetry_max,
+        telemetry_max=true_map_telemetry,
         osd_max=osd_max,
         series_peak=series_peak,
         vision_peak=vision_peak,
     )
+    # Relabel for diagnostics when the winning number came from backfill fold-in.
+    if backfilled and source == "osd" and true_map_telemetry < 5:
+        source = "osd_backfill"
     tol = speed_tolerance_mph(peak)
 
     sources: Dict[str, float] = {}
     for name, val in (
-        ("telemetry", telemetry_max),
+        ("telemetry", true_map_telemetry),
         ("osd", osd_max),
         ("osd_series", series_peak),
         ("vision_ocr", vision_peak),
@@ -116,13 +159,31 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
     # Families that can elevate a non-telemetry peak to publishable high.
     elevating_families = [f for f in agreeing_families if f != "gps"]
 
+    # Lon/lat integer echoed as MPH — never publish. Fire when motion is
+    # crawling OR missing (gps_implied < 8 includes 0); true .map telemetry
+    # is exempt.
+    gps_vs_coord_ghost = bool(
+        true_map_telemetry < 5
+        and peak >= 5
+        and gps_implied < 8
+        and peak >= 25
+        and _peak_matches_coord_integer(osd, peak)
+    )
+
     if peak < 5:
         confidence = "none"
-    elif source == "telemetry":
+    elif source == "telemetry" and true_map_telemetry >= 5:
         confidence = "high"
     elif source == "gps_implied":
         # Defensive: gps_implied is never selected by trusted_peak_speed_mph.
         confidence = "low"
+    elif gps_vs_coord_ghost:
+        confidence = "low"
+        peak = 0.0
+        source = "coord_ghost"
+        agreeing = []
+        agreeing_families = []
+        outliers = [n for n in sources if n != "gps_implied"]
     elif len(elevating_families) >= 2:
         # Independent elevating families agree (e.g. HUD + vision, telemetry already high).
         confidence = "high"
@@ -150,6 +211,7 @@ def build_speed_consensus(ctx: Any) -> Dict[str, Any]:
         "agreeing": agreeing,
         "agreeing_families": agreeing_families,
         "outliers": outliers,
+        "telemetry_backfilled": backfilled,
     }
 
 
@@ -194,6 +256,14 @@ def prompt_peak_mph(ctx: Any) -> float:
     if str(cons.get("confidence") or "") not in ("high", "medium"):
         return 0.0
     return _f(cons.get("peak_mph"))
+
+
+def scrub_peak_mph(ctx: Any) -> float:
+    """Peak used to strip contradicting MPH claims (high or medium candidate).
+
+    Does **not** authorize title injects — that remains ``publishable_peak_mph``.
+    """
+    return consensus_peak_mph(ctx)
 
 
 def consensus_confidence(ctx: Any) -> str:
@@ -301,6 +371,8 @@ __all__ = [
     "get_speed_consensus",
     "consensus_peak_mph",
     "publishable_peak_mph",
+    "prompt_peak_mph",
+    "scrub_peak_mph",
     "consensus_confidence",
     "scrub_untrusted_speed_claims",
     "ensure_video_understanding_speed_scrubbed",

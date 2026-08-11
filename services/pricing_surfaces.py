@@ -163,16 +163,18 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
             f"separately (~{rec} AIC per image, ~2.5× provider cost).</em>"
         ),
         "guide_aic_desc": (
-            f"Used for the AI services you enable — captions, hashtags, Vision, optional "
-            f"Twelve Labs / Video Intelligence, audio helpers, and Thumbnail Studio / Pikzels. "
+            f"Used for the AI services you enable — captions, hashtags, Vision, Twelve Labs / "
+            f"Video Intelligence, audio helpers, and Thumbnail Studio / Pikzels. "
             f"Speech-to-text (Whisper) is included at no extra AIC when enabled. Each paid "
-            f"service has a weight; longer clips cost more for minute-metered tools. Defaults "
-            f"keep heavy analyzers off (~{lo}–{hi} AIC for a typical short); full-smart is "
-            f"~{flo}–{fhi} AIC. Studio recreate is priced separately (~{rec} AIC per image)."
+            f"service has a weight; longer clips cost more for minute-metered tools. "
+            f"Paid active plans default speech + captions + Vision + TL + VI + Studio on "
+            f"(~{flo}–{fhi} AIC typical); free/trial stay opt-in (~{lo}–{hi} AIC light). "
+            f"Studio recreate is priced separately (~{rec} AIC per image)."
         ),
         "whisper_note": (
-            "Speech-to-text (Whisper) is off by default and included at no extra AIC when "
-            "enabled — turn it on in Settings (How features work) for talking-head and voiceover clips."
+            "Speech-to-text (Whisper) is on by default for paid active plans (off on free/trial) "
+            "and included at no extra AIC. Manage it in Settings → How features work for "
+            "talking-head and voiceover clips."
         ),
     }
 

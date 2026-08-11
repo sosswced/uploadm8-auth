@@ -9,6 +9,12 @@ Used by:
   - ``stages.db.load_user_settings``
   - ``routers.preferences.get_user_prefs_for_upload`` / GET settings
   - ``worker._build_process_job_payload`` (sanitize before enqueue)
+
+Tier posture:
+  - free + trialing → opt-in (all AI masters off when unset)
+  - paid active → speech, captions, Vision, Twelve Labs, Video Intelligence,
+    and Thumbnail Studio / Pikzels engine on when unset
+  - admin / master_admin → full stack on
 """
 
 from __future__ import annotations
@@ -33,6 +39,19 @@ UPLOAD_PREF_STRIP_KEYS: FrozenSet[str] = frozenset(
 )
 
 ENTRY_TIER_SLUGS: FrozenSet[str] = frozenset({"free"})
+TRIAL_SUBSCRIPTION_STATUSES: FrozenSet[str] = frozenset({"trialing", "trial"})
+# Not paying — never inherit PAID_UPLOAD_BASELINE even if tier slug is still paid.
+INACTIVE_SUBSCRIPTION_STATUSES: FrozenSet[str] = frozenset(
+    {
+        "canceled",
+        "cancelled",
+        "unpaid",
+        "incomplete",
+        "incomplete_expired",
+        "inactive",
+        "paused",
+    }
+)
 
 # Universal floor: publish path succeeds without visiting Settings.
 UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
@@ -111,7 +130,7 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "trillAiEnhance": False,
     "trill_openai_model": "gpt-4o",
     "trillOpenaiModel": "gpt-4o",
-    # Per-service AI — all opt-in for free + paid; admin baseline turns these on.
+    # Per-service AI — filled by free/trial (off) or paid/admin (on) before this floor.
     "ai_service_telemetry": False,
     "aiServiceTelemetry": False,
     "ai_service_dashcam_osd": False,
@@ -138,7 +157,7 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "aiServiceVideoAnalyzer": False,
 }
 
-# Free / entry: same opt-in posture as universal (all AI/feature masters off when unset).
+# Free / entry + trialing: all AI/feature masters off when unset.
 FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "auto_captions": False,
     "autoCaptions": False,
@@ -156,6 +175,8 @@ FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "thumbnailStudioEngineEnabled": False,
     "thumbnail_render_pipeline": "none",
     "thumbnailRenderPipeline": "none",
+    "thumbnail_persona_enabled": False,
+    "thumbnailPersonaEnabled": False,
     "ai_service_telemetry": False,
     "aiServiceTelemetry": False,
     "ai_service_dashcam_osd": False,
@@ -186,6 +207,42 @@ FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "trillAiEnhance": False,
 }
 
+# Paid active (not free, not trialing): hear conversations + see/analyze + Studio.
+PAID_UPLOAD_BASELINE: Dict[str, Any] = {
+    "auto_captions": True,
+    "autoCaptions": True,
+    "auto_thumbnails": True,
+    "autoThumbnails": True,
+    "styled_thumbnails": True,
+    "styledThumbnails": True,
+    "use_audio_context": True,
+    "useAudioContext": True,
+    "audio_transcription": True,
+    "audioTranscription": True,
+    "thumbnail_studio_enabled": True,
+    "thumbnailStudioEnabled": True,
+    "thumbnail_studio_engine_enabled": True,
+    "thumbnailStudioEngineEnabled": True,
+    "thumbnail_persona_enabled": True,
+    "thumbnailPersonaEnabled": True,
+    "thumbnail_render_pipeline": "auto",
+    "thumbnailRenderPipeline": "auto",
+    "ai_service_audio_summary": True,
+    "aiServiceAudioSummary": True,
+    "ai_service_caption_writer": True,
+    "aiServiceCaptionWriter": True,
+    "ai_service_thumbnail_designer": True,
+    "aiServiceThumbnailDesigner": True,
+    "ai_service_speech_to_text": True,
+    "aiServiceSpeechToText": True,
+    "ai_service_scene_understanding": True,
+    "aiServiceSceneUnderstanding": True,
+    "ai_service_frame_inspector": True,
+    "aiServiceFrameInspector": True,
+    "ai_service_video_analyzer": True,
+    "aiServiceVideoAnalyzer": True,
+}
+
 # Admin / master_admin only — full stack on when prefs are sparse (ops / QA).
 ADMIN_UPLOAD_BASELINE: Dict[str, Any] = {
     "auto_captions": True,
@@ -204,6 +261,8 @@ ADMIN_UPLOAD_BASELINE: Dict[str, Any] = {
     "thumbnailStudioEngineEnabled": True,
     "thumbnail_render_pipeline": "auto",
     "thumbnailRenderPipeline": "auto",
+    "thumbnail_persona_enabled": True,
+    "thumbnailPersonaEnabled": True,
     "trill_enabled": True,
     "trillEnabled": True,
     "trill_ai_enhance": True,
@@ -242,6 +301,22 @@ def _is_admin_feature_defaults(role: Optional[str], tier: Optional[str]) -> bool
     return r in ADMIN_DEFAULT_ROLES or t in ADMIN_DEFAULT_TIERS
 
 
+def _is_entry_or_trial(
+    tier: Optional[str],
+    subscription_status: Optional[str] = None,
+) -> bool:
+    """Free tier, Stripe trialing, or inactive/canceled → conservative (opt-in) defaults."""
+    slug = str(tier or "").strip().lower()
+    if slug in ENTRY_TIER_SLUGS:
+        return True
+    status = str(subscription_status or "").strip().lower()
+    if status in TRIAL_SUBSCRIPTION_STATUSES:
+        return True
+    if status in INACTIVE_SUBSCRIPTION_STATUSES:
+        return True
+    return False
+
+
 def _fill_missing(settings: Dict[str, Any], defaults: Mapping[str, Any]) -> None:
     for key, val in defaults.items():
         if key not in settings or settings[key] is None:
@@ -253,10 +328,14 @@ def apply_upload_baseline_defaults(
     *,
     tier: Optional[str] = None,
     role: Optional[str] = None,
+    subscription_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Merge baseline defaults into *settings* in place.
 
-    Free + paid: opt-in (features off when unset). Admin / master_admin: full stack on.
+    Free + trialing: opt-in (features off when unset).
+    Paid active: speech/captions/Vision/TL/VI/Studio on when unset.
+    Admin / master_admin: full stack on.
+    Explicit user values are never overwritten (``_fill_missing`` only).
     """
     out: Dict[str, Any] = settings if settings is not None else {}
     slug = str(tier or "").strip().lower()
@@ -264,8 +343,10 @@ def apply_upload_baseline_defaults(
         _fill_missing(out, ADMIN_UPLOAD_BASELINE)
         _fill_missing(out, UNIVERSAL_UPLOAD_BASELINE)
         return out
-    if slug in ENTRY_TIER_SLUGS:
+    if _is_entry_or_trial(slug, subscription_status):
         _fill_missing(out, FREE_TIER_PROCESSING_DEFAULTS)
+    else:
+        _fill_missing(out, PAID_UPLOAD_BASELINE)
     _fill_missing(out, UNIVERSAL_UPLOAD_BASELINE)
     return out
 

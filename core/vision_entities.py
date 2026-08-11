@@ -77,6 +77,16 @@ _RESTAURANT_RE = re.compile(
     r")\b",
     re.I,
 )
+# Scene POIs that must survive automotive ambient filtering and reach hooks.
+_SCENE_POI_RE = re.compile(
+    r"\b("
+    r"gas\s*station|petrol\s*station|fuel\s*(?:station|pump|stop)|"
+    r"gasoline|petrol|fuel\s*pump|pump\s*island|"
+    r"car\s*wash|auto\s*wash|convenience\s*store|truck\s*stop|"
+    r"charging\s*station|ev\s*charger|rest\s*area|service\s*plaza"
+    r")\b",
+    re.I,
+)
 
 
 @dataclass
@@ -119,6 +129,10 @@ def _is_generic_object_label(raw: Any) -> bool:
 
 
 def _classify_scene_label(label: str, bundle: VisualEntityBundle) -> None:
+    # Scene POIs before generic filter — "Gas station" must never be dropped as furniture.
+    if _SCENE_POI_RE.search(label):
+        _append_unique(bundle.scene_labels, label)
+        return
     if _is_generic_object_label(label):
         return
     if _VEHICLE_RE.search(label):
@@ -299,6 +313,16 @@ def visual_entity_story_clauses(bundle: VisualEntityBundle) -> List[str]:
     return clauses
 
 
+def _primary_scene_poi(bundle: Optional[VisualEntityBundle]) -> str:
+    """Prefer gas-station / car-wash style POI over generic scene labels."""
+    if not bundle:
+        return ""
+    for label in bundle.scene_labels or []:
+        if _SCENE_POI_RE.search(str(label or "")):
+            return _clean_phrase(label, max_len=40)
+    return ""
+
+
 def build_scene_hook_line(
     *,
     place: str = "",
@@ -310,7 +334,10 @@ def build_scene_hook_line(
 ) -> str:
     """
     One-line creative hook from fused signals, e.g.
-    "racing near Dayton in a Honda Civic vibe to Chief Keef".
+    "at a gas station near Livermore vibing to A Boogie".
+
+    Lane order (no overwrite): motion → vehicle/brand → scene POI → place → music.
+    Visual POIs are peers of place/music so geo+ACR cannot erase pumps/car wash.
     """
     parts: List[str] = []
     if max_speed_mph >= 45:
@@ -319,13 +346,26 @@ def build_scene_hook_line(
         parts.append("cruise")
 
     veh = ""
+    brand = ""
     if bundle:
         if bundle.vehicles:
             veh = bundle.vehicles[0]
-        elif bundle.brands:
-            veh = bundle.brands[0]
+        if bundle.brands:
+            brand = bundle.brands[0]
     if veh:
         parts.append(f"in a {veh}")
+    elif brand and not _SCENE_POI_RE.search(brand):
+        # Brand-as-vehicle only when it isn't a fuel/retail logo used as POI cue.
+        parts.append(f"with {brand}")
+
+    poi = _primary_scene_poi(bundle)
+    if poi:
+        # "Gas station" → "at a gas station"; already-prefixed labels pass through.
+        low = poi.lower()
+        if low.startswith(("at ", "near ", "by ")):
+            parts.append(poi)
+        else:
+            parts.append(f"at a {poi}" if not low.startswith("a ") else f"at {poi}")
 
     place = _clean_phrase(place, max_len=48)
     if place:

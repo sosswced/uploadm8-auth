@@ -87,6 +87,45 @@ def is_placeholder_upload_caption(caption: str) -> bool:
     )
 
 
+def transcript_usable_for_story(
+    transcript: Any,
+    *,
+    music_detected: bool = False,
+    transcript_role: str = "",
+) -> bool:
+    """
+    True when Whisper text is usable as speech evidence in hydration/timeline.
+
+    Demotes music-bleed / syllable spam so ACR music and Vision/VI scene facts
+    are not overwritten by junk transcript cues (lane integrity).
+    """
+    text = re.sub(r"\s+", " ", str(transcript or "")).strip()
+    if len(text) < 4:
+        return False
+    role = str(transcript_role or "").strip().lower()
+    if role in ("third_party_lyrics", "third_party_music", "song", "music", "lyrics"):
+        return False
+    # Hangul / CJK-heavy ASR hallucinated over beats (e.g. 슥슥슥).
+    cjk = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", text))
+    if cjk >= 4 and cjk >= max(1, len(re.findall(r"[A-Za-z]{2,}", text))):
+        return False
+    # Repeated short tokens / onomatopoeia with no real words.
+    tokens = re.findall(r"[A-Za-z\uac00-\ud7af]{1,}", text)
+    if tokens:
+        uniq = {t.lower() for t in tokens}
+        avg_len = sum(len(t) for t in tokens) / max(1, len(tokens))
+        if len(tokens) >= 4 and len(uniq) <= 2 and avg_len <= 4:
+            return False
+        if music_detected and len(uniq) <= 3 and avg_len <= 5 and not re.search(
+            r"[A-Za-z]{5,}", text
+        ):
+            return False
+    # Music-identified clip with almost no Latin words → not dialogue.
+    if music_detected and not re.search(r"[A-Za-z]{4,}", text):
+        return False
+    return True
+
+
 @dataclass
 class TelemetryData:
     """Parsed telemetry data from .map file."""
@@ -528,14 +567,83 @@ class JobContext:
             if b:
                 blocked_set.add(b)
 
-        # ── Merge: always → user platform → base (upload) → M8 → generic AI ──
+        from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
+
+        # ── Merge with ledger reserve (FactLedger / evidence AI tags first) ─
+        # Always/platform can otherwise fill maxHashtags and starve music/geo/vehicle.
         base = coerce_hashtag_list(self.hashtags)
         ai = coerce_hashtag_list(self.ai_hashtags)
+
+        try:
+            raw_cap = us.get("maxHashtags")
+            if raw_cap is None:
+                raw_cap = us.get("max_hashtags")
+            cap = int(raw_cap) if raw_cap is not None and str(raw_cap).strip() != "" else 50
+        except (TypeError, ValueError):
+            cap = 50
+        cap = max(1, min(cap, 50))
+        reserve_n = min(8, cap)
+
+        reserved_bodies: List[str] = []
+        try:
+            from services.fact_ledger import fact_ledger_enabled
+
+            if fact_ledger_enabled():
+                arts = getattr(self, "output_artifacts", None) or {}
+                fl = arts.get("fact_ledger_v1") if isinstance(arts, dict) else None
+                if isinstance(fl, dict):
+                    for cls in (
+                        "music_artist",
+                        "music_title",
+                        "place_primary",
+                        "road_primary",
+                        "vehicle_make",
+                        "vehicle_model",
+                        "trill_bucket",
+                        "speed_peak",
+                    ):
+                        ent = (fl.get("facts") or {}).get(cls) or {}
+                        if not isinstance(ent, dict) or not ent.get("publishable", True):
+                            continue
+                        slug = str(ent.get("slug") or "").strip().lower()
+                        if cls == "speed_peak":
+                            try:
+                                import re as _re
+
+                                n = int(_re.search(r"(\d{2,3})", str(ent.get("value") or "")).group(1))
+                                slug = "tripledigits" if n >= 100 else ("highwayheat" if n >= 70 else slug)
+                            except Exception:
+                                slug = slug or ""
+                        if slug:
+                            reserved_bodies.append(slug)
+                # Hydration already padded ai/m8 ledger-first — keep those early.
+                for src in list(m8_tags)[:reserve_n] + list(ai)[:reserve_n]:
+                    b = sanitize_hashtag_body(str(src), max_len=HASHTAG_BODY_MAX_LEN)
+                    if b:
+                        reserved_bodies.append(b)
+        except Exception:
+            reserved_bodies = []
+
+        # Dedupe reserved, keep order, clamp to reserve_n
+        seen_res: set = set()
+        reserved_clean: List[str] = []
+        for b in reserved_bodies:
+            body = sanitize_hashtag_body(b, max_len=HASHTAG_BODY_MAX_LEN)
+            if not body or body in seen_res or body in blocked_set:
+                continue
+            if is_junk_hashtag_body(body):
+                continue
+            seen_res.add(body)
+            reserved_clean.append(body)
+            if len(reserved_clean) >= reserve_n:
+                break
 
         seen: set = set()
         merged: List[str] = []
 
-        from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
+        for body in reserved_clean:
+            seen.add(body)
+            merged.append(f"#{body}")
 
         for tag in always_tags + platform_tags + base + m8_tags + ai:
             body = sanitize_hashtag_body(tag, max_len=HASHTAG_BODY_MAX_LEN)
@@ -546,15 +654,6 @@ class JobContext:
             seen.add(body)
             merged.append(f"#{body}")
 
-        # "Max total hashtags" — cap final merged list (merge order preserved: always → platform → …).
-        try:
-            raw_cap = us.get("maxHashtags")
-            if raw_cap is None:
-                raw_cap = us.get("max_hashtags")
-            cap = int(raw_cap) if raw_cap is not None and str(raw_cap).strip() != "" else 50
-        except (TypeError, ValueError):
-            cap = 50
-        cap = max(1, min(cap, 50))
         if len(merged) > cap:
             merged = merged[:cap]
 
@@ -1029,8 +1128,26 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             "youtubeShortsCopyrightTrim",
             "use_audio_context",
             "useAudioContext",
+            "audio_transcription",
+            "audioTranscription",
+            "ai_service_speech_to_text",
+            "aiServiceSpeechToText",
+            "ai_service_audio_summary",
+            "aiServiceAudioSummary",
+            "ai_service_audio_signals",
+            "aiServiceAudioSignals",
             "ai_service_music_detection",
             "aiServiceMusicDetection",
+            "ai_service_caption_writer",
+            "aiServiceCaptionWriter",
+            "ai_service_scene_understanding",
+            "aiServiceSceneUnderstanding",
+            "ai_service_frame_inspector",
+            "aiServiceFrameInspector",
+            "ai_service_video_analyzer",
+            "aiServiceVideoAnalyzer",
+            "auto_captions",
+            "autoCaptions",
             "caption_style",
             "captionStyle",
             "caption_tone",
@@ -1575,7 +1692,11 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
         structured = ac.get("transcript_structured") or {}
         if isinstance(structured, dict) and structured.get("key_phrase"):
             transcript = str(structured.get("key_phrase") or "").strip()
-        if transcript:
+        music_on = bool(ac.get("music_detected") or artist or track)
+        role = str(ac.get("transcript_role") or "").strip()
+        if transcript and transcript_usable_for_story(
+            transcript, music_detected=music_on, transcript_role=role
+        ):
             audio_bits.append('speech/transcript cue: "' + transcript[:120].rstrip(".!?") + '"')
         top_sound = str(ac.get("top_sound_class") or "").strip()
         if top_sound:
@@ -1913,7 +2034,7 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
                         lon = float(pt[1])
                         spd = float(pt[2]) if len(pt) >= 3 else 0.0
                         t_s = float(pt[3]) if len(pt) >= 4 else 0.0
-                        if spd >= 5:
+                        if spd >= 5 and max_mph_osd >= 5 and spd <= max_mph_osd + 2:
                             _add(
                                 t_s,
                                 "osd_gps",
@@ -1979,12 +2100,7 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
             avg_mph_tel = float(getattr(tel, "avg_speed_mph", 0) or 0)
         except (TypeError, ValueError):
             avg_mph_tel = 0.0
-        tel_raw_max = 0.0
-        try:
-            tel_raw_max = float(getattr(tel, "max_speed_mph", 0) or 0)
-        except (TypeError, ValueError):
-            tel_raw_max = 0.0
-        if avg_mph_tel >= 5 and abs(avg_mph_tel - (tel_raw_max or max_mph_tel)) >= 8:
+        if avg_mph_tel >= 5 and max_mph_tel >= 5 and abs(avg_mph_tel - max_mph_tel) >= 8:
             t_avg = (clip_dur * 0.7) if clip_dur > 0 else 0.0
             _add(t_avg, "telemetry_avg", f"Telemetry avg ~{int(round(avg_mph_tel))} MPH")
         # End-of-run place beat when we know duration (gives the UI a second geo pin).
@@ -2003,12 +2119,23 @@ def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List
 
     # ── Audio: transcript segments (cap 10, ordered by time) ─────────────
     if isinstance(ac, dict):
+        music_on = bool(
+            ac.get("music_detected")
+            or ac.get("music_artist")
+            or ac.get("music_title")
+        )
+        tx_role = str(ac.get("transcript_role") or "").strip()
         ts_segs = ac.get("transcript_segments") or []
         if isinstance(ts_segs, list):
             for s in ts_segs[:10]:
                 if not isinstance(s, dict):
                     continue
-                _add(s.get("start"), "transcript", str(s.get("text") or "").strip())
+                seg_txt = str(s.get("text") or "").strip()
+                if not transcript_usable_for_story(
+                    seg_txt, music_detected=music_on, transcript_role=tx_role
+                ):
+                    continue
+                _add(s.get("start"), "transcript", seg_txt)
         artist = str(ac.get("music_artist") or "").strip()
         track = str(ac.get("music_title") or "").strip()
         if artist or track:
@@ -2457,8 +2584,10 @@ def build_fusion_caption_rules(ctx: JobContext) -> str:
         "FUSION RULES (obey all that apply):",
         "- Anchor the hook in the **newest, most specific** facts below (scene understanding > full-clip video intelligence + timeline > merged multi-frame Vision > transcript).",
         "- If transcript and visuals disagree, trust **visuals + scene understanding** for on-screen facts; use transcript for quoted speech only.",
+        "- When music is identified (ACR) and transcript looks like non-speech / lyrics bleed, ignore transcript for scene story; keep music as the audio lane only.",
         "- Do not recycle generic automotive / lifestyle templates unless telemetry or labels explicitly support them.",
-        "- When **landmarks**, **logos**, or **.map / GPS** fields are present, cite at least one of them explicitly (place name, brand, or route statistic) - do not ignore them.",
+        "- When **landmarks**, **logos**, **scene POIs** (gas station, car wash), or **.map / GPS** fields are present, cite at least one of them explicitly — do not let music alone own the hook.",
+        "- Prefer multi-lane consensus (Vision + VI + map + music); never let one modality overwrite another lane's facts.",
     ]
     ac = ctx.audio_context or {}
     if isinstance(ac, dict):
@@ -2514,16 +2643,30 @@ def build_fusion_caption_rules(ctx: JobContext) -> str:
 
     osd_ctx = ctx.dashcam_osd_context or {}
     if isinstance(osd_ctx, dict) and osd_ctx and not osd_ctx.get("skipped"):
-        if osd_ctx.get("max_speed_mph") or (osd_ctx.get("first_seen") or {}).get("lat") is not None:
+        has_hud_place = (osd_ctx.get("first_seen") or {}).get("lat") is not None
+        try:
+            from core.speed_consensus import prompt_peak_mph, publishable_peak_mph
+
+            _prompt_spd = prompt_peak_mph(ctx)
+            _pub_spd = publishable_peak_mph(ctx)
+        except Exception:
+            _prompt_spd = 0.0
+            _pub_spd = 0.0
+        if _pub_spd >= 5 or has_hud_place:
             lines.append(
                 "- Dashcam HUD (burned-in overlay) was decoded: prefer its date, time, GPS, "
-                "peak/avg speed and driver name as ground truth for time-and-place beats; "
-                "they were read directly off the video and beat any guess."
+                "and driver name as ground truth for time-and-place beats. "
+                "Only state a speed when speed consensus marks it publishable."
+            )
+        elif _prompt_spd >= 5:
+            lines.append(
+                "- Dashcam HUD was decoded with an unverified speed hint — omit MPH from titles; "
+                "prefer date, time, GPS, and driver name for place beats."
             )
         if osd_ctx.get("telemetry_backfilled"):
             lines.append(
-                "- HUD GPS was used to backfill telemetry (no .map file uploaded): treat "
-                "the route extent and peak speed as real, not estimated."
+                "- HUD GPS was used to backfill route geometry (no .map file): treat "
+                "the route extent as real; do not treat raw HUD digits as verified speed."
             )
 
     tel = ctx.telemetry or ctx.telemetry_data
@@ -2537,8 +2680,16 @@ def build_fusion_caption_rules(ctx: JobContext) -> str:
             "- Route bbox + sampled polyline may appear: use them for extent, direction, and shape; "
             "do not invent a different path or region than these GPS samples support."
         )
-    if tel and (getattr(tel, "max_speed_mph", 0) or 0) > 1:
-        lines.append("- Telemetry shows meaningful speed: reference mph, road, or place when writing automotive beats.")
+    try:
+        from core.speed_consensus import publishable_peak_mph as _pub_peak_rules
+
+        if _pub_peak_rules(ctx) >= 5:
+            lines.append(
+                "- Speed consensus has a publishable peak: reference that mph, road, or place "
+                "when writing automotive beats — never invent other speeds."
+            )
+    except Exception:
+        pass
     if tel and getattr(tel, "location_start_display", None) and getattr(tel, "location_display", None):
         if str(tel.location_start_display).strip() != str(tel.location_display).strip():
             lines.append(

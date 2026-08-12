@@ -43,6 +43,8 @@ UPLOADS_METADATA_PATCH_COLUMNS: frozenset[str] = frozenset(
         "updated_at",
         "vehicle_make_id",
         "vehicle_model_id",
+        "user_preferences",
+        "platforms",
     }
 )
 UPLOADS_COMPLETE_BODY_COLUMNS: frozenset[str] = frozenset(

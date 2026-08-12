@@ -2656,6 +2656,7 @@ async def admin_put_billing_catalog(
 async def get_admin_settings(user: dict = Depends(require_master_admin)):
     out = dict(admin_settings_cache)
     key = str(out.get("watermark_logo_r2_key") or "").strip()
+    out["watermark_logo_present"] = bool(key)
     if key:
         try:
             from core.r2 import generate_presigned_download_url
@@ -2665,6 +2666,8 @@ async def get_admin_settings(user: dict = Depends(require_master_admin)):
             out["watermark_logo_url"] = ""
     else:
         out["watermark_logo_url"] = ""
+    # Same-origin preview path (avoids R2 CORS breaking admin canvas drawImage).
+    out["watermark_logo_preview_path"] = "/api/admin/watermark-logo" if key else ""
     return out
 
 
@@ -2775,6 +2778,29 @@ async def update_admin_settings(settings: dict, user: dict = Depends(require_mas
     return {"status": "updated", "settings": core.state.admin_settings_cache}
 
 
+@router.get("/watermark-logo")
+async def get_admin_watermark_logo(user: dict = Depends(require_master_admin)):
+    """Stream the admin watermark logo for same-origin live preview (auth required)."""
+    from fastapi.responses import Response
+
+    from core.r2 import get_object_bytes
+
+    key = str(admin_settings_cache.get("watermark_logo_r2_key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=404, detail="No watermark logo uploaded")
+    try:
+        body, ct = get_object_bytes(key)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Watermark logo not found in storage")
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to load watermark logo")
+    return Response(
+        content=body,
+        media_type=ct or "image/png",
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
 @router.post("/watermark-logo")
 async def upload_admin_watermark_logo(
     file: UploadFile = File(...),
@@ -2834,6 +2860,8 @@ async def upload_admin_watermark_logo(
         "success": True,
         "r2_key": r2_key,
         "logo_url": logo_url,
+        "watermark_logo_present": True,
+        "watermark_logo_preview_path": "/api/admin/watermark-logo",
         "watermark_mode": core.state.admin_settings_cache.get("watermark_mode"),
         "settings": core.state.admin_settings_cache,
     }

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 
 def smart_schedule_explanation(
@@ -26,6 +26,23 @@ def smart_schedule_explanation(
     return out
 
 
+def occupancy_from_schedule(smart: Dict[str, datetime], *, now: Optional[datetime] = None) -> Dict[int, int]:
+    """Day-offset occupancy contributed by one per-platform schedule."""
+    ref = now or datetime.now(timezone.utc)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    else:
+        ref = ref.astimezone(timezone.utc)
+    today = ref.date()
+    occ: Dict[int, int] = {}
+    for dt in smart.values():
+        aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        offset = (aware.date() - today).days
+        if offset >= 1:
+            occ[offset] = occ.get(offset, 0) + 1
+    return occ
+
+
 def preview_response_payload(
     smart: Dict[str, datetime],
     sm: Dict[str, str],
@@ -33,11 +50,12 @@ def preview_response_payload(
     seed: str,
     smart_schedule_days: int,
     user_timezone: str = "UTC",
+    batch: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Canonical preview JSON for /api/scheduling/preview and legacy shim."""
     explanation = smart_schedule_explanation(smart, user_timezone=user_timezone)
     scheduled_min = min(sm.values()) if sm else None
-    return {
+    payload: Dict[str, Any] = {
         "smart_schedule": sm,
         "schedule": sm,
         "scheduled_time": scheduled_min,
@@ -45,3 +63,7 @@ def preview_response_payload(
         "smart_schedule_days": smart_schedule_days,
         "explanation": explanation,
     }
+    if batch is not None:
+        payload["batch"] = batch
+        payload["batch_count"] = len(batch)
+    return payload

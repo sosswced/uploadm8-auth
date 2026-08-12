@@ -8,9 +8,10 @@ Blends (when DB signals are supplied from ``services.smart_schedule_insights``):
   • Optional momentum multipliers (recent window vs older baseline)
   • Trained ``m8_publish_hour_priors`` when fresh (PCI ``published_at`` model)
 
-Day occupancy / blocked offsets hard-deconflict calendar days inside the
-scheduling window; when the window is full, slots spill into the expand
-horizon (``num_days * 2``) so later uploads still see those days.
+Day occupancy prefers free calendar days inside the scheduling window.
+When the window is full, later slots **pack** onto the least-occupied days
+inside ``1..num_days`` (same day, different hours) — they never extend past
+the user-chosen window.
 
 Pure helpers live here; SQL aggregation lives in ``services/smart_schedule_insights``.
 """
@@ -245,9 +246,10 @@ def clamp_smart_schedule_days(num_days: Any, *, default: int = 14) -> int:
 
 def smart_schedule_expand_horizon(num_days: int) -> int:
     """
-    Spill horizon when the primary window is full of occupied days.
+    Lookahead for occupancy queries (legacy spill slots past the window).
 
-    Same formula as dense-batch expansion: ``min(730, num_days * 2)``.
+    New slots never schedule past ``num_days``; this horizon only helps
+    ``get_existing_scheduled_days`` see older out-of-window rows.
     """
     n = clamp_smart_schedule_days(num_days)
     return max(n, min(730, n * 2))
@@ -287,9 +289,52 @@ def _normalize_day_occupancy(raw: Any) -> Dict[int, int]:
     return out
 
 
-def _blocked_day_set(raw: Any) -> set:
-    """Offsets that already have a publish slot (hard deconflict)."""
-    return set(_normalize_day_occupancy(raw).keys())
+def _day_offset_utc(dt: datetime, now: datetime) -> int:
+    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    return (aware.date() - now.date()).days
+
+
+def _clamp_slot_to_window(dt: datetime, now: datetime, num_days: int) -> datetime:
+    """Keep a UTC slot's calendar-day offset inside ``1..num_days``."""
+    num_days = clamp_smart_schedule_days(num_days)
+    offset = _day_offset_utc(dt, now)
+    if 1 <= offset <= num_days:
+        out = dt.replace(microsecond=0)
+        if out <= now and offset < num_days:
+            out = out + timedelta(days=1)
+            if _day_offset_utc(out, now) <= num_days:
+                return out
+        if out <= now:
+            # Last day of window but still in the past — push minutes forward today+num_days.
+            target = now + timedelta(days=num_days)
+            return target.replace(microsecond=0)
+        return out
+
+    target_offset = 1 if offset < 1 else num_days
+    target_date = now.date() + timedelta(days=target_offset)
+    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    clamped = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        aware.hour,
+        aware.minute,
+        aware.second,
+        tzinfo=timezone.utc,
+    ).replace(microsecond=0)
+    if clamped <= now:
+        clamped = (now + timedelta(minutes=15)).replace(microsecond=0)
+        if _day_offset_utc(clamped, now) > num_days:
+            clamped = datetime(
+                target_date.year,
+                target_date.month,
+                target_date.day,
+                23,
+                45,
+                0,
+                tzinfo=timezone.utc,
+            )
+    return clamped
 
 
 def _pick_day_offset(
@@ -301,17 +346,19 @@ def _pick_day_offset(
     rng: random.Random,
 ) -> int:
     """
-    Prefer free days inside ``1..num_days``; when the window is full, spill into
-    the expand horizon. Never reuses ``used_days`` or blocked occupancy offsets.
+    Prefer free days inside ``1..num_days``. When the window is full, pack onto
+    the least-occupied day still inside the window (never past ``num_days``).
     """
     num_days = clamp_smart_schedule_days(num_days)
-    expand_to = smart_schedule_expand_horizon(num_days)
     optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
-    blocked = _blocked_day_set(day_occupancy)
+    occupancy = _normalize_day_occupancy(day_occupancy)
 
+    # Prefer unused + empty days (soft prefer optimal weekdays).
     available_days: list = []
     for day_offset in range(1, num_days + 1):
-        if day_offset in blocked or day_offset in used_days:
+        if day_offset in used_days:
+            continue
+        if occupancy.get(day_offset, 0) > 0:
             continue
         target_date = now + timedelta(days=day_offset)
         weekday = target_date.weekday()
@@ -322,36 +369,19 @@ def _pick_day_offset(
         available_days.sort(key=lambda x: (-x[1], rng.random()))
         return available_days[0][0]
 
-    pool = [
-        d
-        for d in range(1, num_days + 1)
-        if d not in used_days and d not in blocked
-    ]
-    if pool:
-        return rng.choice(pool)
+    # Window full or partially occupied: pack onto least-occupied day.
+    # Prefer days not already used in this multi-platform call when possible.
+    unused_in_call = [d for d in range(1, num_days + 1) if d not in used_days]
+    pool = unused_in_call or list(range(1, num_days + 1))
 
-    # Window exhausted (dense batch / short window): expand past num_days
-    # rather than colliding with blocked/used offsets.
-    for day_offset in range(num_days + 1, expand_to + 1):
-        if day_offset in used_days or day_offset in blocked:
-            continue
-        return day_offset
+    def _score(day_offset: int) -> tuple:
+        target_date = now + timedelta(days=day_offset)
+        weekday = target_date.weekday()
+        optimal_boost = 0 if weekday in optimal_days else 1
+        return (occupancy.get(day_offset, 0), optimal_boost, rng.random())
 
-    # Last resort: unique offset that respects blocked + used (deterministic via rng).
-    for _ in range(64):
-        candidate = rng.randint(1, expand_to)
-        if candidate not in used_days and candidate not in blocked:
-            return candidate
-
-    # Walk past expand_to until unique — never collide with blocked days.
-    candidate = expand_to + 1
-    guard = 0
-    while candidate in used_days or candidate in blocked:
-        candidate += 1
-        guard += 1
-        if guard > 1024:
-            return expand_to + 1 + len(used_days) + len(blocked)
-    return candidate
+    pool.sort(key=_score)
+    return pool[0]
 
 
 def calculate_smart_schedule(
@@ -378,8 +408,8 @@ def calculate_smart_schedule(
     hardcoding a single clock time (0 disables).
 
     Day offsets prefer free days inside ``num_days``. When the window is full,
-    slots may spill into the expand horizon (``num_days * 2``, capped at 730)
-    so they never collide with ``blocked_day_offsets`` / occupancy.
+    slots pack onto the least-occupied days still inside the window — they
+    never schedule past ``num_days``.
 
     ``random_seed``: when set (e.g. upload_id), preview and presign produce identical slots.
     """
@@ -433,7 +463,8 @@ def calculate_smart_schedule(
             tzinfo=tz,
         )
         anchor_utc = local_dt.astimezone(timezone.utc)
-        schedule[platform] = _apply_subsecond_jitter(anchor_utc, now, rng=rng)
+        slot = _apply_subsecond_jitter(anchor_utc, now, rng=rng)
+        schedule[platform] = _clamp_slot_to_window(slot, now, num_days)
 
     return schedule
 
@@ -448,8 +479,8 @@ async def get_existing_scheduled_days(
     """
     Occupancy map of day offsets that already have a scheduled slot.
 
-    Tracks through the **expand horizon** (not just ``num_days``) so spill
-    slots past the primary window still deconflict later uploads.
+    Tracks through the expand horizon so legacy out-of-window rows still
+    count toward packing pressure (new slots stay inside ``num_days``).
     """
     now = _now_utc()
     num_days = clamp_smart_schedule_days(num_days)

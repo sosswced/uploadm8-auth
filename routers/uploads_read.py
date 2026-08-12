@@ -12,7 +12,7 @@ import core.state
 from core.audit import log_system_event
 from core.config import R2_BUCKET_NAME
 from core.deps import get_current_user, get_current_user_readonly, get_verified_user_id
-from core.models import UploadUpdate
+from core.models import UploadMassEditBody, UploadUpdate
 from core.r2 import (
     _normalize_r2_key,
     generate_presigned_upload_url,
@@ -20,7 +20,7 @@ from core.r2 import (
     r2_object_exists,
 )
 from core.wallet import refund_tokens
-from services.uploads_api import update_upload_metadata
+from services.uploads_api import mass_edit_uploads, update_upload_metadata
 from services.thumbnail_regenerate import regenerate_upload_thumbnail, should_skip_regenerate
 from services.uploads_handlers import (
     collect_thumbnail_repair_ids,
@@ -141,9 +141,27 @@ async def get_upload_thumbnail(
 async def generate_thumbnail_for_upload(
     upload_id: str,
     force: bool = Query(False, description="Regenerate even when a thumbnail already exists"),
+    use_studio_winner: bool = Query(
+        False,
+        description="Apply locked Thumbnail Studio winner (pinned cover) onto this upload",
+    ),
+    studio_variant_id: Optional[str] = Query(
+        None, description="Pin a specific Studio variant id for this regenerate"
+    ),
+    studio_job_id: Optional[str] = Query(
+        None, description="Studio job id for the variant (optional when variant is unique)"
+    ),
+    apply_mode: Optional[str] = Query(
+        None,
+        description="fresh_generate | strategy_only | pinned_cover (default pinned when use_studio_winner)",
+    ),
     user: dict = Depends(get_current_user),
 ):
-    """Backfill / regenerate the thumbnail for an existing upload."""
+    """Backfill / regenerate the thumbnail for an existing upload.
+
+    Pass ``use_studio_winner=1`` or ``studio_variant_id`` to swap covers from Studio
+    before publish (Instagram ``cover_url`` is create-time only — do this while scheduled).
+    """
     async with core.state.db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -163,7 +181,11 @@ async def generate_thumbnail_for_upload(
     if not row:
         raise HTTPException(404, "Upload not found")
 
-    if should_skip_regenerate(thumbnail_r2_key=row.get("thumbnail_r2_key"), force=force):
+    studio_pin = bool(use_studio_winner or (studio_variant_id and str(studio_variant_id).strip()))
+    # Studio pin always forces regenerate so covers refresh even when a thumb exists.
+    effective_force = bool(force or studio_pin)
+
+    if should_skip_regenerate(thumbnail_r2_key=row.get("thumbnail_r2_key"), force=effective_force):
         tk = row.get("thumbnail_r2_key")
         if tk and await asyncio.to_thread(r2_object_exists, str(tk)):
             try:
@@ -206,7 +228,11 @@ async def generate_thumbnail_for_upload(
             user_id=str(user["id"]),
             upload_row=upload_dict,
             user_row=user_dict,
-            force=force,
+            force=effective_force,
+            studio_variant_id=studio_variant_id,
+            studio_job_id=studio_job_id,
+            apply_mode=apply_mode,
+            use_studio_winner=bool(use_studio_winner or studio_pin),
         )
         return out
     except ValueError as e:
@@ -247,7 +273,18 @@ async def presign_thumbnail_upload(upload_id: str, user: dict = Depends(get_curr
 
 @router.get("/{upload_id}")
 async def get_upload_details(upload_id: str, user_id: str = Depends(get_verified_user_id)):
-    """Upload detail for current user."""
+    """Upload detail for current user.
+
+    Best-effort TikTok Step B on read so dashboard/queue Check and poll can
+    stamp ``platform_video_id`` / watch URLs without waiting for the worker tick.
+    """
+    if core.state.db_pool is not None:
+        try:
+            from stages.verify_stage import maybe_stamp_tiktok_confirmation
+
+            await maybe_stamp_tiktok_confirmation(core.state.db_pool, upload_id, user_id)
+        except Exception as e:
+            logger.debug("tiktok confirmation stamp on detail read: %s", e)
     return await fetch_upload_detail(core.state.db_pool, upload_id, user_id)
 
 
@@ -284,16 +321,26 @@ async def ask_upload(
     return result
 
 
+@router.post("/mass-edit")
+async def mass_edit_uploads_route(
+    body: UploadMassEditBody,
+    user: dict = Depends(get_current_user),
+):
+    """Bulk-update title/caption/schedule/platforms/writing mix on pending uploads."""
+    async with core.state.db_pool.acquire() as conn:
+        return await mass_edit_uploads(conn, user["id"], body)
+
+
 @router.patch("/{upload_id}")
 async def update_upload(
     upload_id: str,
     update_data: UploadUpdate,
     user: dict = Depends(get_current_user),
 ):
-    """Update an upload's metadata: title, caption, hashtags, scheduled_time, smart_schedule."""
+    """Update upload metadata: title, caption, schedule, platforms, writing mix."""
     async with core.state.db_pool.acquire() as conn:
-        await update_upload_metadata(conn, upload_id, user["id"], update_data)
-    return {"status": "updated", "id": upload_id}
+        applied = await update_upload_metadata(conn, upload_id, user["id"], update_data)
+    return {"status": "updated", "id": upload_id, "applied": applied}
 
 
 @router.delete("/{upload_id}")

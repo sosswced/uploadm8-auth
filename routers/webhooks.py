@@ -72,6 +72,92 @@ def _tiktok_webhook_pr_targets(pr_list, share_id: str) -> list:
     return awaiting[:1]
 
 
+def _tiktok_pr_missing_video_id(pr_raw) -> bool:
+    """True when platform_results has a TikTok row still missing a real video id."""
+    pr = _safe_json(pr_raw, [])
+    if isinstance(pr, dict):
+        legacy = pr.get("tiktok") if isinstance(pr.get("tiktok"), dict) else None
+        pr = [legacy] if legacy else []
+    if not isinstance(pr, list):
+        return False
+    for item in pr:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("platform") or "").strip().lower() != "tiktok":
+            continue
+        if str(item.get("platform_video_id") or item.get("video_id") or "").strip():
+            continue
+        # publish_id alone is Step A — still awaiting confirmation / link.
+        return True
+    return False
+
+
+async def _find_tiktok_upload_for_webhook(conn, user_openid: str, publish_id: str = ""):
+    """
+    Locate the upload this TikTok webhook should stamp.
+
+    Publish marks the row SUCCEEDED with only ``publish_id`` before TikTok
+    returns the public ``post_id``. Matching must include those succeeded
+    rows — excluding them left the UI stuck on Awaiting confirmation forever.
+    """
+    openid = str(user_openid or "").strip()
+    pub = str(publish_id or "").strip()
+    if not openid:
+        return None
+
+    if pub:
+        by_pub = await conn.fetchrow(
+            """
+            SELECT u.id, u.user_id, u.platform_results, u.status, u.put_reserved, u.aic_reserved
+            FROM publish_attempts pa
+            JOIN uploads u ON u.id = pa.upload_id
+            JOIN platform_tokens pt
+                ON u.user_id = pt.user_id
+               AND pt.platform = 'tiktok'
+               AND pt.account_id = $1
+               AND pt.revoked_at IS NULL
+            WHERE pa.platform = 'tiktok'
+              AND pa.publish_id = $2
+            ORDER BY pa.created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            openid,
+            pub,
+        )
+        if by_pub:
+            return by_pub
+
+    rows = await conn.fetch(
+        """
+        SELECT u.id, u.user_id, u.platform_results, u.status, u.put_reserved, u.aic_reserved
+        FROM uploads u
+        JOIN platform_tokens pt
+            ON u.user_id = pt.user_id
+           AND pt.platform = 'tiktok'
+           AND pt.account_id = $1
+           AND pt.revoked_at IS NULL
+        WHERE u.created_at > NOW() - INTERVAL '48 hours'
+          AND (
+                u.status NOT IN ('failed', 'cancelled')
+          )
+        ORDER BY u.created_at DESC
+        LIMIT 25
+        """,
+        openid,
+    )
+    # Prefer succeeded/partial still missing TikTok video_id, then in-flight.
+    awaiting = []
+    inflight = []
+    for row in rows:
+        st = str(row.get("status") or "").strip().lower()
+        missing = _tiktok_pr_missing_video_id(row.get("platform_results"))
+        if st in ("completed", "succeeded", "partial") and missing:
+            awaiting.append(row)
+        elif st not in ("completed", "succeeded", "failed", "cancelled", "partial"):
+            inflight.append(row)
+    return (awaiting or inflight or [None])[0]
+
+
 def _verify_tiktok_signature(raw_body: bytes, header: str, secret: str) -> tuple[bool, str]:
     """
     Parse and verify the Tiktok-Signature header.
@@ -129,44 +215,51 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
     Returns a short string describing what was done (stored in handling_notes).
     """
     notes = f"event={event_type}"
+    et = str(event_type or "").strip().lower()
 
     try:
         async with core.state.db_pool.acquire() as conn:
 
-            # -- video.publish.completed ----------------------------------------
-            if event_type == "video.publish.completed":
-                # content may contain share_id or video_id -- store it in
-                # platform_results and mark the upload completed if we can
-                # match it by TikTok open_id.
+            # -- publish complete / publicly available (stamp video_id + link) --
+            # Official: post.publish.complete / post.publish.publicly_available.
+            # Legacy alias still accepted: video.publish.completed.
+            if et in (
+                "video.publish.completed",
+                "post.publish.complete",
+                "post.publish.completed",
+                "post.publish.publicly_available",
+            ):
                 content = payload.get("content", {})
                 if isinstance(content, str):
                     try:
                         content = json.loads(content)
                     except Exception:
                         content = {"raw": content}
+                if not isinstance(content, dict):
+                    content = {}
 
-                share_id = content.get("share_id", "")
-                video_id = content.get("video_id", share_id)
-
-                # Find the most recent tiktok upload for this open_id that is
-                # still in a processing/queued state so we can mark it done.
-                upload = await conn.fetchrow(
-                    """
-                    SELECT u.id, u.user_id, u.platform_results
-                    FROM uploads u
-                    JOIN platform_tokens pt
-                        ON u.user_id = pt.user_id
-                       AND pt.platform = 'tiktok'
-                       AND pt.account_id = $1
-                       AND pt.revoked_at IS NULL
-                    WHERE u.status NOT IN ('completed', 'succeeded', 'failed', 'cancelled')
-                    ORDER BY u.created_at DESC
-                    LIMIT 1
-                    """,
-                    user_openid,
+                share_id = (
+                    content.get("publish_id")
+                    or content.get("share_id")
+                    or payload.get("publish_id")
+                    or ""
+                )
+                video_id = (
+                    content.get("post_id")
+                    or content.get("video_id")
+                    or payload.get("post_id")
+                    or ""
                 )
 
-                if upload:
+                share = str(share_id or "").strip()
+                vid = str(video_id or "").strip()
+                # Never stamp publish_id / share_id as the watchable video id.
+                if vid and share and vid == share and et != "post.publish.publicly_available":
+                    vid = ""
+
+                upload = await _find_tiktok_upload_for_webhook(conn, user_openid, share)
+
+                if upload and (vid or share):
                     # Pipeline stores platform_results as a list of per-platform objects.
                     # Patch matching TikTok rows in-place; never replace with a {"tiktok": ...} dict.
                     existing = _safe_json(upload["platform_results"], [])
@@ -177,18 +270,22 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                     if not isinstance(existing, list):
                         existing = []
 
-                    vid = str(video_id or "").strip()
-                    share = str(share_id or "").strip()
                     targets = _tiktok_webhook_pr_targets(existing, share)
                     for item in targets:
                         if vid:
                             item["platform_video_id"] = vid
                             item["video_id"] = vid
+                            uname = str(item.get("account_username") or "").strip().lstrip("@")
+                            if uname:
+                                tt_url = f"https://www.tiktok.com/@{uname}/video/{vid}"
+                                item["platform_url"] = tt_url
+                                item["url"] = tt_url
                         if share:
                             item["publish_id"] = item.get("publish_id") or share
                         item["status"] = "published"
                         item["success"] = True
-                        item["verify_status"] = "confirmed"
+                        if vid:
+                            item["verify_status"] = "confirmed"
                         item["published_at"] = _now_utc().isoformat()
                     if not targets and vid:
                         existing.append(
@@ -250,36 +347,30 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                             upload["id"],
                             share,
                         )
-                    notes += f" upload={upload['id']} patched=platform_results video_id={video_id}"
+                    notes += f" upload={upload['id']} patched=platform_results video_id={vid or 'none'}"
                 else:
                     notes += f" no-matching-upload-found openid={user_openid}"
 
-            # -- video.upload.failed --------------------------------------------
-            elif event_type == "video.upload.failed":
+            # -- video.upload.failed / post.publish.failed ----------------------
+            elif et in ("video.upload.failed", "post.publish.failed"):
                 content = payload.get("content", {})
                 if isinstance(content, str):
                     try:
                         content = json.loads(content)
                     except Exception:
                         content = {"raw": content}
+                if not isinstance(content, dict):
+                    content = {}
 
-                share_id = content.get("share_id", "")
+                share_id = (
+                    content.get("publish_id")
+                    or content.get("share_id")
+                    or payload.get("publish_id")
+                    or ""
+                )
 
-                upload = await conn.fetchrow(
-                    """
-                    SELECT u.id, u.user_id, u.platform_results,
-                           u.put_reserved, u.aic_reserved
-                    FROM uploads u
-                    JOIN platform_tokens pt
-                        ON u.user_id = pt.user_id
-                       AND pt.platform = 'tiktok'
-                       AND pt.account_id = $1
-                       AND pt.revoked_at IS NULL
-                    WHERE u.status NOT IN ('completed', 'succeeded', 'failed', 'cancelled')
-                    ORDER BY u.created_at DESC
-                    LIMIT 1
-                    """,
-                    user_openid,
+                upload = await _find_tiktok_upload_for_webhook(
+                    conn, user_openid, str(share_id or "")
                 )
 
                 if upload:
@@ -336,7 +427,7 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                     notes += f" no-matching-upload-found openid={user_openid}"
 
             # -- authorization.removed ------------------------------------------
-            elif event_type == "authorization.removed":
+            elif et == "authorization.removed":
                 # TikTok has already revoked the token on their side; we just
                 # need to purge the platform_tokens row and log the disconnect.
                 rows = await conn.fetch(

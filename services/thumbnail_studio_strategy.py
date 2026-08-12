@@ -65,6 +65,7 @@ def thumbnail_strategy_from_variant(
             "youtube": {"apply_mode": "cover_direct" if preview_r2 else "strategy_only"},
             "tiktok": {"apply_mode": "letterbox" if preview_r2 else "fresh_generate"},
             "instagram": {"apply_mode": "letterbox" if preview_r2 else "fresh_generate"},
+            "facebook": {"apply_mode": "letterbox" if preview_r2 else "fresh_generate"},
         },
     }
     return {k: val for k, val in strategy.items() if val not in ("", None)}
@@ -128,7 +129,7 @@ def strategy_summary_line(prefs: Optional[Mapping[str, Any]]) -> Optional[str]:
     preview = str(strat.get("preview_r2_key") or strat.get("previewR2Key") or "").strip()
     mode = str(strat.get("apply_mode") or strat.get("applyMode") or "").strip().lower()
     if preview and mode == "cover_direct":
-        parts.append("Studio winner image → YT/FB covers")
+        parts.append("Studio winner → YT 16:9 + letterbox IG/FB/TT")
     elif preview:
         parts.append("Studio winner as Pikzels support image")
     if not parts:

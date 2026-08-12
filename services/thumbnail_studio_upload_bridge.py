@@ -3,12 +3,16 @@
 When a user clicks “Use for my next upload”, we persist ``preview_r2_key`` and
 ``apply_mode`` on ``thumbnailStudioDefaultStrategy``. Upload jobs can then:
 
-* ``cover_direct`` / ``pinned_cover`` — use the Studio JPEG for YouTube/Facebook
-  covers and letterbox 9:16 for Instagram/TikTok so Meta ``cover_url`` exists at
-  container create (Instagram cannot set cover after publish).
+* ``cover_direct`` / ``pinned_cover`` — use the Studio JPEG for YouTube 16:9;
+  letterbox 9:16 for Instagram/Facebook/TikTok so Meta covers exist at create
+  (Instagram ``cover_url`` cannot change after publish; Facebook Reels prefer 9:16).
 * ``support_image`` / ``fresh_generate`` — regenerate from the video frame but
   steer Pikzels with the Studio still + high ``image_weight``.
 * ``strategy_only`` — strategy fields only; no Studio JPEG / YT support image.
+
+Batch-only pin (``?studio_variant=``) may set source ids without rewriting the
+locked default strategy — call ``hydrate_bridge_strategy`` so the variant's
+``preview_r2_key`` is loaded before apply.
 """
 
 from __future__ import annotations
@@ -20,8 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("uploadm8-api")
 
-COVER_DIRECT_PLATFORMS = frozenset({"youtube", "facebook"})
-VERTICAL_PLATFORMS = frozenset({"instagram", "tiktok"})
+# YouTube custom thumbs are 16:9. Vertical Meta/TikTok covers use letterbox.
+COVER_DIRECT_PLATFORMS = frozenset({"youtube"})
+VERTICAL_PLATFORMS = frozenset({"instagram", "facebook", "tiktok"})
 
 
 def strategy_preview_r2_key(strategy: Optional[Dict[str, Any]]) -> str:
@@ -57,6 +62,178 @@ def strategy_apply_mode(strategy: Optional[Dict[str, Any]], us: Optional[Dict[st
     return "strategy_only"
 
 
+def _source_ids_from_prefs_and_strategy(
+    strategy: Optional[Dict[str, Any]],
+    us: Optional[Dict[str, Any]],
+) -> Tuple[str, str]:
+    """Resolve Studio job/variant ids — upload pin prefs win over locked strategy."""
+    prefs = us if isinstance(us, dict) else {}
+    strat = strategy if isinstance(strategy, dict) else {}
+    job_id = str(
+        prefs.get("thumbnail_source_job_id")
+        or prefs.get("thumbnailSourceJobId")
+        or ""
+    ).strip()
+    var_id = str(
+        prefs.get("thumbnail_source_variant_id")
+        or prefs.get("thumbnailSourceVariantId")
+        or ""
+    ).strip()
+    if not job_id:
+        job_id = str(strat.get("job_id") or strat.get("source_job_id") or "").strip()
+    if not var_id:
+        var_id = str(strat.get("variant_id") or strat.get("source_variant_id") or "").strip()
+    return job_id, var_id
+
+
+async def fetch_studio_variant_preview_r2(
+    *,
+    user_id: str,
+    variant_id: str,
+    job_id: str = "",
+    db_pool: Any = None,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Load ``preview_r2_key`` (+ light variant meta) for a user's Studio variant.
+
+    Returns ``(preview_r2_key, meta)``. Empty key when missing / unauthorized.
+    """
+    uid = str(user_id or "").strip()
+    vid = str(variant_id or "").strip()
+    jid = str(job_id or "").strip()
+    if not uid or not vid or db_pool is None:
+        return "", {}
+    try:
+        import uuid as _uuid
+
+        from core.helpers import coerce_jsonb_dict
+
+        v_uuid = _uuid.UUID(vid)
+        u_uuid = _uuid.UUID(uid)
+    except (ValueError, TypeError, AttributeError):
+        return "", {}
+    try:
+        async with db_pool.acquire() as conn:
+            if jid:
+                try:
+                    j_uuid = _uuid.UUID(jid)
+                except (ValueError, TypeError, AttributeError):
+                    j_uuid = None
+                if j_uuid is not None:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT v.id, v.job_id, v.variant_json
+                        FROM thumbnail_recreate_variants v
+                        JOIN thumbnail_recreate_jobs j ON j.id = v.job_id
+                        WHERE v.id = $1 AND v.user_id = $2 AND v.job_id = $3
+                          AND j.user_id = $2
+                        """,
+                        v_uuid,
+                        u_uuid,
+                        j_uuid,
+                    )
+                else:
+                    row = None
+            else:
+                row = None
+            if row is None:
+                row = await conn.fetchrow(
+                    """
+                    SELECT v.id, v.job_id, v.variant_json
+                    FROM thumbnail_recreate_variants v
+                    JOIN thumbnail_recreate_jobs j ON j.id = v.job_id
+                    WHERE v.id = $1 AND v.user_id = $2 AND j.user_id = $2
+                    """,
+                    v_uuid,
+                    u_uuid,
+                )
+        if not row:
+            return "", {}
+        vj = coerce_jsonb_dict(row.get("variant_json"), default={})
+        if not isinstance(vj, dict):
+            vj = {}
+        key = str(vj.get("preview_r2_key") or vj.get("previewR2Key") or "").strip()
+        meta = {
+            "variant_id": str(row["id"]),
+            "job_id": str(row["job_id"]),
+            "layout_name": str(vj.get("name") or "")[:120],
+            "layout_pattern": str(vj.get("layout_pattern") or "")[:240],
+            "format_key": str(vj.get("format_key") or "")[:80],
+            "headline": str(vj.get("headline") or "")[:120],
+        }
+        return key, meta
+    except Exception:
+        logger.warning(
+            "studio variant preview hydrate failed user=%s variant=%s",
+            uid[:36],
+            vid[:36],
+            exc_info=True,
+        )
+        return "", {}
+
+
+async def hydrate_bridge_strategy(
+    strategy: Optional[Dict[str, Any]],
+    us: Optional[Dict[str, Any]] = None,
+    *,
+    user_id: Optional[str] = None,
+    db_pool: Any = None,
+    report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Ensure pin-this-upload source ids resolve to a ``preview_r2_key``.
+
+    When Upload is opened with ``?studio_variant=&studio_job=`` the prefs carry
+    source ids but the locked default strategy may still point at another
+    (or empty) preview. Reload the pinned variant's R2 key from DB.
+    """
+    strat = dict(strategy or {})
+    prefs = us if isinstance(us, dict) else {}
+    job_id, var_id = _source_ids_from_prefs_and_strategy(strat, prefs)
+    existing = strategy_preview_r2_key(strat)
+    strat_var = str(strat.get("variant_id") or strat.get("source_variant_id") or "").strip()
+    needs = bool(var_id) and (not existing or strat_var != var_id)
+    if report is not None:
+        report["studio_winner_hydrate_needed"] = needs
+        report["studio_winner_hydrate_variant_id"] = var_id or None
+        report["studio_winner_hydrate_job_id"] = job_id or None
+    if not needs:
+        return strat
+    if not user_id or db_pool is None:
+        if report is not None:
+            report["studio_winner_hydrate_error"] = "no_db_or_user"
+        return strat
+    r2_key, meta = await fetch_studio_variant_preview_r2(
+        user_id=str(user_id),
+        variant_id=var_id,
+        job_id=job_id,
+        db_pool=db_pool,
+    )
+    if not r2_key:
+        if report is not None:
+            report["studio_winner_hydrate_error"] = "variant_preview_missing"
+        return strat
+    out = dict(strat)
+    out["preview_r2_key"] = r2_key
+    out["variant_id"] = str(meta.get("variant_id") or var_id)
+    out["source_variant_id"] = out["variant_id"]
+    if meta.get("job_id") or job_id:
+        out["job_id"] = str(meta.get("job_id") or job_id)
+        out["source_job_id"] = out["job_id"]
+    for k in ("layout_name", "layout_pattern", "format_key"):
+        if meta.get(k) and not out.get(k):
+            out[k] = meta[k]
+    if meta.get("headline") and not out.get("selected_headline_style"):
+        out["selected_headline_style"] = meta["headline"]
+    # Pin path without an apply_mode still means cover_direct when we have bytes.
+    if not str(out.get("apply_mode") or out.get("applyMode") or "").strip():
+        out["apply_mode"] = "cover_direct"
+    if report is not None:
+        report["studio_winner_hydrate_ok"] = True
+        report["studio_winner_preview_r2_key"] = r2_key[:200]
+    return out
+
+
 async def download_studio_preview_to_path(r2_key: str, dest: Path) -> bool:
     """Download a Studio variant preview from R2 into ``dest``."""
     key = str(r2_key or "").strip()
@@ -90,7 +267,7 @@ def public_or_presigned_url_for_r2_key(r2_key: str, *, expires: int = 3600) -> s
 
 
 def letterbox_to_vertical(src: Path, dest: Path, *, width: int = 1080, height: int = 1920) -> bool:
-    """Fit a 16:9 (or other) Studio still into 9:16 with letterbox for IG/TikTok covers."""
+    """Fit a 16:9 (or other) Studio still into 9:16 with letterbox for IG/FB/TikTok covers."""
     try:
         from PIL import Image
     except ImportError:
@@ -159,7 +336,7 @@ async def apply_studio_winner_to_upload_thumbs(
     Apply Studio winner assets into the upload render plan.
 
     Returns ``(platform_map, brief, skip_studio_platforms, opts_overlay)``.
-    Platforms in ``skip_studio_platforms`` already have covers (incl. IG/TikTok
+    Platforms in ``skip_studio_platforms`` already have covers (incl. IG/FB/TikTok
     letterbox) and must not call Pikzels recreate — covers are ready for Meta
     container create.
     """
@@ -207,7 +384,7 @@ async def apply_studio_winner_to_upload_thumbs(
                     platform_map[plat] = str(out)
                     skip_studio.append(plat)
                 elif plat in VERTICAL_PLATFORMS:
-                    # Instagram cover_url must exist at container create — letterbox now.
+                    # IG cover_url + FB Reels + TikTok previews — letterbox 9:16 now.
                     if letterbox_to_vertical(dest, out):
                         platform_map[plat] = str(out)
                         skip_studio.append(plat)

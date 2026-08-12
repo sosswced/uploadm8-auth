@@ -120,15 +120,65 @@ def _tiktok_items_to_update(pr_list: Any, publish_id: Optional[str]) -> list:
     return awaiting or tiktoks[:1]
 
 
+def _tiktok_video_id_from_status_data(data: Any) -> Optional[str]:
+    """
+    Extract the public post/video id from TikTok status/fetch ``data``.
+
+    Official Content Posting API returns ``publicaly_available_post_id`` (list)
+    once the post is public and moderation completes — not ``published_element``.
+    Older/unofficial shapes may still use ``video_id`` / ``published_element``.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # Official field (TikTok's documented spelling includes the typo).
+    for key in ("publicaly_available_post_id", "publicly_available_post_id"):
+        raw = data.get(key)
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                vid = str(item or "").strip()
+                if vid:
+                    return vid
+        elif raw is not None and str(raw).strip():
+            return str(raw).strip()
+
+    for key in ("video_id", "post_id"):
+        vid = str(data.get(key) or "").strip()
+        if vid:
+            return vid
+
+    pe = data.get("published_element")
+    if isinstance(pe, dict):
+        for key in ("video_id", "post_id", "id"):
+            vid = str(pe.get(key) or "").strip()
+            if vid:
+                return vid
+
+    # Some responses include a watch URL instead of a bare id.
+    for key in ("share_url", "platform_url", "url"):
+        url = str(data.get(key) or "").strip()
+        if "/video/" not in url:
+            continue
+        try:
+            tail = url.split("/video/", 1)[1]
+            vid = "".join(ch for ch in tail.split("?", 1)[0] if ch.isdigit())
+            if len(vid) >= 10:
+                return vid
+        except Exception:
+            continue
+    return None
+
+
 async def verify_tiktok(publish_id: str, token_data: dict):
     """
     Check TikTok publish status.
     Returns: (status_str, video_id_or_None)
       status: 'confirmed', 'rejected', 'pending', or 'unknown'
-      video_id: the real TikTok video_id when PUBLISH_COMPLETE (None otherwise)
+      video_id: the real TikTok video_id when publicly available (None otherwise)
 
-    TikTok's status response includes published_element.video_id once live.
-    We capture it so sync-analytics can query per-video metrics later.
+    Official status/fetch returns ``publicaly_available_post_id`` after
+    PUBLISH_COMPLETE + public moderation. Without that id the UI stays on
+    "Awaiting confirmation" and cannot build the watch link.
     """
     access_token = token_data.get("access_token")
     if not access_token or not publish_id:
@@ -149,21 +199,21 @@ async def verify_tiktok(publish_id: str, token_data: dict):
                 return "unknown", None
 
             data = resp.json().get("data", {})
-            status = data.get("status", "").upper()
-            # TikTok includes the real video_id once publishing is complete
-            video_id = (
-                data.get("published_element", {}).get("video_id")
-                or data.get("video_id")
-                or None
-            )
-            if video_id:
-                video_id = str(video_id)
+            if not isinstance(data, dict):
+                data = {}
+            status = str(data.get("status") or "").upper()
+            video_id = _tiktok_video_id_from_status_data(data)
 
             if status == "PUBLISH_COMPLETE":
                 return "confirmed", video_id
             elif status in ("FAILED", "UPLOAD_ERROR"):
                 return "rejected", None
-            elif status in ("PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD", "SENDING_TO_USER_INBOX"):
+            elif status in (
+                "PROCESSING_UPLOAD",
+                "PROCESSING_DOWNLOAD",
+                "SENDING_TO_USER_INBOX",
+                "SEND_TO_USER_INBOX",
+            ):
                 return "pending", None
             else:
                 return "unknown", None
@@ -480,6 +530,68 @@ async def verify_single_attempt(
                 )
             except Exception as e:
                 logger.warning("publish_verify_failed notify failed upload=%s: %s", uid_upload, e)
+
+
+async def maybe_stamp_tiktok_confirmation(
+    db_pool: asyncpg.Pool,
+    upload_id: str,
+    user_id: str,
+    *,
+    limit: int = 4,
+) -> int:
+    """
+    On-demand Step B for dashboard/queue Check + poll.
+
+    Runs status/fetch for this upload's pending TikTok publish_attempts so
+    ``platform_results`` get a real video_id / watch URL without waiting for
+    the worker verification tick.
+    """
+    uid = str(upload_id or "").strip()
+    owner = str(user_id or "").strip()
+    if not db_pool or not uid or not owner:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pa.*
+                FROM publish_attempts pa
+                JOIN uploads u ON u.id = pa.upload_id
+                WHERE pa.upload_id = $1
+                  AND u.user_id = $2
+                  AND pa.platform = 'tiktok'
+                  AND pa.status = 'accepted'
+                  AND (
+                        pa.verify_status IS NULL
+                     OR pa.verify_status IN ('pending', 'unknown')
+                  )
+                  AND pa.publish_id IS NOT NULL
+                  AND TRIM(pa.publish_id) <> ''
+                ORDER BY pa.created_at ASC
+                LIMIT $3
+                """,
+                uid,
+                owner,
+                max(1, int(limit)),
+            )
+    except Exception as e:
+        logger.debug("maybe_stamp_tiktok_confirmation load failed: %s", e)
+        return 0
+    if not rows:
+        return 0
+    init_enc_keys()
+    stamped = 0
+    for row in rows:
+        try:
+            await verify_single_attempt(db_pool, dict(row))
+            stamped += 1
+        except Exception as e:
+            logger.debug(
+                "maybe_stamp_tiktok_confirmation attempt=%s: %s",
+                row.get("id"),
+                e,
+            )
+    return stamped
 
 
 async def run_verification_loop(

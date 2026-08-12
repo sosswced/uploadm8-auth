@@ -303,7 +303,7 @@ class SmartScheduleOnlyUpdate(BaseModel):
     smart_schedule: Dict[str, str] = Field(..., description="Platform -> ISO datetime string")
 
 class UploadUpdate(BaseModel):
-    """PATCH /api/uploads/{id} - title, caption, hashtags, scheduled_time, smart_schedule."""
+    """PATCH /api/uploads/{id} — metadata, schedule, writing mix, platforms."""
     title: Optional[str] = None
     caption: Optional[str] = None
     hashtags: Optional[List[str]] = None
@@ -311,6 +311,42 @@ class UploadUpdate(BaseModel):
     smart_schedule: Optional[Dict[str, str]] = Field(None, description="Platform -> ISO datetime string")
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
     vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
+    platforms: Optional[List[str]] = None
+    caption_style: Optional[str] = Field(None, alias="captionStyle")
+    caption_tone: Optional[str] = Field(None, alias="captionTone")
+    caption_voice: Optional[str] = Field(None, alias="captionVoice")
+    randomize_writing_mix: Optional[bool] = Field(
+        None,
+        alias="randomizeWritingMix",
+        description="Assign a random style×tone×voice into this upload's preference snapshot",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class UploadMassEditBody(BaseModel):
+    """POST /api/uploads/mass-edit — apply the same (or per-id random) edits to many pending uploads."""
+
+    upload_ids: List[str] = Field(..., min_length=1, max_length=50, alias="uploadIds")
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+    scheduled_time: Optional[datetime] = Field(None, alias="scheduledTime")
+    smart_schedule: Optional[Dict[str, str]] = Field(None, alias="smartSchedule")
+    shift_minutes: Optional[int] = Field(
+        None,
+        alias="shiftMinutes",
+        description="Add N minutes to each upload's scheduled_time (and smart times when present)",
+    )
+    platforms: Optional[List[str]] = None
+    caption_style: Optional[str] = Field(None, alias="captionStyle")
+    caption_tone: Optional[str] = Field(None, alias="captionTone")
+    caption_voice: Optional[str] = Field(None, alias="captionVoice")
+    randomize_writing_mix: Optional[bool] = Field(
+        None,
+        alias="randomizeWritingMix",
+        description="Each selected upload gets its own random style×tone×voice",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 

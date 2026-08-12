@@ -17,7 +17,7 @@ from core.config import R2_BUCKET_NAME
 import core.state
 from core.deps import get_current_user, get_current_user_readonly
 from core.wallet import refund_tokens
-from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col
+from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col, coerce_jsonb_dict
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
@@ -311,6 +311,7 @@ _SCHEDULED_DETAIL_COLS = [
     "platform_results",
     "error_code",
     "error_detail",
+    "user_preferences",
 ]
 
 
@@ -710,6 +711,7 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         "schedule_metadata": sm,
         "smart_schedule": sm,  # alias for scheduled.html saveScheduledUpload()
         "platform_results": platform_results,
+        "user_preferences": coerce_jsonb_dict(upload.get("user_preferences")),
         "is_editable": upload.get("status") in SCHEDULED_PIPELINE_STATUSES,
         "is_cancellable": _is_cancellable(upload.get("status") or ""),
         "is_requeueable": is_requeueable_upload(

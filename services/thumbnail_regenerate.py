@@ -131,10 +131,18 @@ async def regenerate_upload_thumbnail(
     upload_row: Dict[str, Any],
     user_row: Dict[str, Any],
     force: bool = False,
+    studio_variant_id: Optional[str] = None,
+    studio_job_id: Optional[str] = None,
+    apply_mode: Optional[str] = None,
+    use_studio_winner: bool = False,
 ) -> Dict[str, Any]:
     """
     Download source video, extract a frame, optionally run Pikzels + template styled stack,
     upload to R2, update ``thumbnail_r2_key`` and ``thumb_*`` processed_assets keys.
+
+    When ``studio_variant_id`` / ``use_studio_winner`` / pinned ``apply_mode`` is set,
+    applies the Studio winner bridge (same as the upload thumbnail stage) so scheduled
+    / mid-flight repairs can swap covers before publish (IG cover is create-time only).
 
     Returns a dict suitable for JSON: thumbnail_url, r2_key, generated, method, offset_seconds.
     """
@@ -151,6 +159,29 @@ async def regenerate_upload_thumbnail(
     settings = await db_stage.load_user_settings(db_pool, str(user_id))
     _overlay_upload_user_preferences(settings, upload_row.get("user_preferences"))
     await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, str(user_id), settings)
+
+    # Mid-flight Studio pin / re-apply locked winner onto this upload's prefs snapshot.
+    from services.thumbnail_apply_mode import bind_source_ids_into_prefs, normalize_apply_mode
+    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+    pin_var = str(studio_variant_id or "").strip()
+    pin_job = str(studio_job_id or "").strip()
+    pin_mode = str(apply_mode or "").strip()
+    if use_studio_winner and not pin_var:
+        strat0 = read_thumbnail_studio_default_strategy(settings)
+        pin_var = str(strat0.get("variant_id") or strat0.get("source_variant_id") or "").strip()
+        pin_job = pin_job or str(strat0.get("job_id") or strat0.get("source_job_id") or "").strip()
+        if not pin_mode:
+            pin_mode = "pinned_cover"
+    if pin_var or pin_job:
+        bind_source_ids_into_prefs(settings, job_id=pin_job or None, variant_id=pin_var or None)
+    if pin_mode:
+        nm = normalize_apply_mode(pin_mode)
+        settings["thumbnail_apply_mode"] = nm
+        settings["thumbnailApplyMode"] = nm
+    elif use_studio_winner:
+        settings["thumbnail_apply_mode"] = "pinned_cover"
+        settings["thumbnailApplyMode"] = "pinned_cover"
 
     overrides = await db_stage.load_user_entitlement_overrides(db_pool, str(user_id))
     ent = get_entitlements_from_user(user_row, overrides)
@@ -293,12 +324,63 @@ async def regenerate_upload_thumbnail(
         if run_styled and not platforms_to_render:
             platforms_to_render = ["youtube"]
 
+        skip_studio_platforms: List[str] = []
+        studio_render_report: Dict[str, Any] = {}
+        if run_styled and platforms_to_render:
+            from services.thumbnail_studio_upload_bridge import (
+                apply_studio_winner_to_upload_thumbs,
+                hydrate_bridge_strategy,
+            )
+            from stages.thumbnail_stage import _thumbnail_default_strategy
+
+            strategy_for_bridge = _thumbnail_default_strategy(settings)
+            strategy_for_bridge = await hydrate_bridge_strategy(
+                strategy_for_bridge,
+                settings,
+                user_id=str(user_id),
+                db_pool=db_pool,
+                report=studio_render_report,
+            )
+            try:
+                platform_map_seed: Dict[str, str] = {}
+                platform_map_seed, brief, skip_studio_platforms, opts_overlay = (
+                    await apply_studio_winner_to_upload_thumbs(
+                        strategy=strategy_for_bridge,
+                        platforms=list(platforms_to_render),
+                        temp_dir=tmp_path,
+                        upload_id=str(upload_id),
+                        brief=brief if isinstance(brief, dict) else {},
+                        studio_opts={},
+                        platform_map=platform_map_seed,
+                        report=studio_render_report,
+                        user_settings=settings,
+                    )
+                )
+                for plat, path_s in (platform_map_seed or {}).items():
+                    pth = Path(str(path_s))
+                    if pth.exists():
+                        platform_files[plat] = pth
+                        if primary is None or plat == "youtube":
+                            primary = pth
+                if skip_studio_platforms:
+                    render_method = "studio_winner_cover_direct"
+                if isinstance(opts_overlay, dict) and opts_overlay.get("image_weight"):
+                    # Fresh-generate support path: keep Pikzels below with high weight.
+                    pass
+            except Exception:
+                logger.warning("regenerate studio winner bridge failed", exc_info=True)
+                skip_studio_platforms = []
+
         if run_styled and platforms_to_render:
             persona_api, studio_opts = _studio_persona_for_request(settings)
+            skip_set = {str(x).strip().lower() for x in skip_studio_platforms}
+            remaining = [
+                p for p in platforms_to_render if str(p).strip().lower() not in skip_set
+            ]
             # One Pikzels call per aspect — copy to each platform (same as upload pipeline).
             pikzels_aspect_cache: Dict[str, Path] = {}
-            if studio_ok and "studio" in render_steps:
-                leaders = unique_pikzels_aspect_leaders(list(platforms_to_render))
+            if studio_ok and "studio" in render_steps and remaining:
+                leaders = unique_pikzels_aspect_leaders(list(remaining))
                 for aspect_fmt, lead_plat in leaders.items():
                     cache_path = tmp_path / f"thumb_pikzels_aspect_{aspect_fmt.replace(':', 'x')}.jpg"
                     lead_ok = await render_thumbnail_with_studio_renderer(
@@ -327,7 +409,7 @@ async def regenerate_upload_thumbnail(
                             except Exception as _pe:
                                 logger.debug("regenerate pikzels edit skipped: %s", _pe)
 
-            for platform in platforms_to_render:
+            for platform in remaining:
                 out_path = tmp_path / f"thumb_styled_{platform}.jpg"
                 step_ok = False
                 last_method = render_method
@@ -419,6 +501,13 @@ async def regenerate_upload_thumbnail(
         oa_merge: Dict[str, Any] = {}
         if platform_r2_keys:
             oa_merge["platform_thumbnail_r2_keys"] = json.dumps(platform_r2_keys, default=str)
+        if studio_render_report:
+            try:
+                oa_merge["studio_render_report"] = json.dumps(studio_render_report, default=str)[:24000]
+            except Exception:
+                pass
+            if render_method == "studio_winner_cover_direct" or skip_studio_platforms:
+                oa_merge["thumbnail_render_method"] = "studio_winner_cover_direct"
         try:
             oa_merge["thumbnail_brief_json"] = json.dumps(copy_brief_for_persistence(brief), default=str)[:48000]
         except Exception:

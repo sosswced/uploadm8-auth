@@ -6,17 +6,114 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
-from typing import Any, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from core.helpers import _now_utc, _safe_col
+from core.helpers import _now_utc, _safe_col, coerce_jsonb_dict
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
-from core.models import UploadUpdate
+from core.models import UploadMassEditBody, UploadUpdate
 from core.r2 import resolve_stored_account_avatar_url
 
 logger = logging.getLogger("uploadm8-api")
+
+_KNOWN_PLATFORMS = frozenset({"tiktok", "youtube", "instagram", "facebook"})
+_EDITABLE_STATUSES = frozenset(
+    {"pending", "scheduled", "queued", "staged", "ready_to_publish"}
+)
+
+
+def normalize_platforms_list(raw: Any) -> List[str]:
+    """Dedupe + validate platform names; raise HTTP 400 if empty/invalid."""
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise HTTPException(400, "platforms must be a list")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        p = str(item or "").strip().lower()
+        if not p:
+            continue
+        if p not in _KNOWN_PLATFORMS:
+            raise HTTPException(400, f"Unsupported platform: {p}")
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    if not out:
+        raise HTTPException(400, "platforms must include at least one platform")
+    return out
+
+
+def merge_caption_creative_prefs(
+    prefs: Optional[Dict[str, Any]],
+    *,
+    caption_style: Optional[str] = None,
+    caption_tone: Optional[str] = None,
+    caption_voice: Optional[str] = None,
+    randomize_writing_mix: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Merge style/tone/voice into an upload user_preferences snapshot."""
+    from core.caption_creative import (
+        normalize_caption_style,
+        normalize_caption_tone,
+        normalize_caption_voice,
+        pick_random_combination,
+    )
+
+    out: Dict[str, Any] = dict(prefs) if isinstance(prefs, dict) else {}
+    style = caption_style
+    tone = caption_tone
+    voice = caption_voice
+    if randomize_writing_mix:
+        style, tone, voice = pick_random_combination()
+        out["randomizeCaptionCreative"] = True
+        out["randomize_caption_creative"] = True
+        out["captionCreativePickMode"] = "random"
+        out["caption_creative_pick_mode"] = "random"
+    elif style is not None or tone is not None or voice is not None:
+        out["randomizeCaptionCreative"] = False
+        out["randomize_caption_creative"] = False
+        out["captionCreativePickMode"] = "off"
+        out["caption_creative_pick_mode"] = "off"
+
+    if style is not None:
+        s = normalize_caption_style(style)
+        out["captionStyle"] = s
+        out["caption_style"] = s
+    if tone is not None:
+        t = normalize_caption_tone(tone)
+        out["captionTone"] = t
+        out["caption_tone"] = t
+    if voice is not None:
+        v = normalize_caption_voice(voice)
+        out["captionVoice"] = v
+        out["caption_voice"] = v
+
+    applied = {
+        "captionStyle": str(out.get("captionStyle") or out.get("caption_style") or ""),
+        "captionTone": str(out.get("captionTone") or out.get("caption_tone") or ""),
+        "captionVoice": str(out.get("captionVoice") or out.get("caption_voice") or ""),
+    }
+    return out, applied
+
+
+def _shift_iso_map(sm: Dict[str, Any], delta: timedelta) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for k, v in (sm or {}).items():
+        if not v:
+            continue
+        s = str(v).replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        out[str(k)] = (dt + delta).isoformat()
+    return out
 
 
 def _parse_platform_results_items(upload_row: dict) -> list:
@@ -291,46 +388,63 @@ def parse_smart_schedule(sm: dict, upload_platforms: list) -> tuple:
     return metadata, scheduled_dt
 
 
-async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data: UploadUpdate) -> None:
-    """PATCH fields: title, caption, hashtags, scheduled_time, smart_schedule."""
+async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data: UploadUpdate) -> Dict[str, Any]:
+    """PATCH fields: title, caption, hashtags, schedule, platforms, writing mix."""
     upload = await conn.fetchrow(
-        "SELECT id, status, platforms FROM uploads WHERE id = $1 AND user_id = $2",
+        """
+        SELECT id, status, platforms, schedule_metadata, scheduled_time, user_preferences
+        FROM uploads WHERE id = $1 AND user_id = $2
+        """,
         upload_id,
         user_id,
     )
     if not upload:
         raise HTTPException(404, "Upload not found")
-    editable = ("pending", "scheduled", "queued", "staged", "ready_to_publish")
-    if upload["status"] not in editable:
+    if upload["status"] not in _EDITABLE_STATUSES:
         raise HTTPException(400, "Cannot edit upload that is already processing or published")
 
     cols = UPLOADS_METADATA_PATCH_COLUMNS
     updates: List[str] = []
     params: List[Any] = [upload_id, user_id]
     param_count = 2
+    applied: Dict[str, Any] = {}
 
     if update_data.title is not None:
         param_count += 1
         updates.append(f"{_safe_col('title', cols)} = ${param_count}")
         params.append(update_data.title)
+        applied["title"] = update_data.title
 
     if update_data.caption is not None:
         param_count += 1
         updates.append(f"{_safe_col('caption', cols)} = ${param_count}")
         params.append(update_data.caption)
+        applied["caption"] = update_data.caption
 
     if update_data.hashtags is not None:
         param_count += 1
         updates.append(f"{_safe_col('hashtags', cols)} = ${param_count}")
         params.append(update_data.hashtags)
+        applied["hashtags"] = update_data.hashtags
 
     if update_data.scheduled_time is not None:
         param_count += 1
         updates.append(f"{_safe_col('scheduled_time', cols)} = ${param_count}")
         params.append(update_data.scheduled_time)
+        applied["scheduled_time"] = update_data.scheduled_time.isoformat()
+
+    platforms_for_smart = list(upload["platforms"] or [])
+    if update_data.platforms is not None:
+        platforms_for_smart = normalize_platforms_list(update_data.platforms)
+        param_count += 1
+        updates.append(f"{_safe_col('platforms', cols)} = ${param_count}")
+        params.append(platforms_for_smart)
+        applied["platforms"] = platforms_for_smart
 
     if update_data.smart_schedule is not None:
-        metadata, scheduled_dt = parse_smart_schedule(update_data.smart_schedule, upload["platforms"])
+        metadata, scheduled_dt = parse_smart_schedule(
+            update_data.smart_schedule, platforms_for_smart
+        )
         param_count += 1
         updates.append(f"{_safe_col('schedule_metadata', cols)} = ${param_count}::jsonb")
         params.append(json.dumps(metadata))
@@ -341,6 +455,7 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
         param_count += 1
         updates.append(f"{_safe_col('schedule_mode', cols)} = ${param_count}")
         params.append("smart")
+        applied["smart_schedule"] = metadata
 
     if update_data.vehicle_make_id is not None or update_data.vehicle_model_id is not None:
         vm_id = update_data.vehicle_make_id
@@ -362,6 +477,26 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
         updates.append(f"{_safe_col('vehicle_model_id', cols)} = ${param_count}")
         params.append(vmd_id)
 
+    want_mix = bool(
+        update_data.randomize_writing_mix
+        or update_data.caption_style is not None
+        or update_data.caption_tone is not None
+        or update_data.caption_voice is not None
+    )
+    if want_mix:
+        prefs = coerce_jsonb_dict(upload["user_preferences"])
+        merged, mix = merge_caption_creative_prefs(
+            prefs,
+            caption_style=update_data.caption_style,
+            caption_tone=update_data.caption_tone,
+            caption_voice=update_data.caption_voice,
+            randomize_writing_mix=bool(update_data.randomize_writing_mix),
+        )
+        param_count += 1
+        updates.append(f"{_safe_col('user_preferences', cols)} = ${param_count}::jsonb")
+        params.append(json.dumps(merged))
+        applied["writing_mix"] = mix
+
     if not updates:
         raise HTTPException(400, "No updates provided")
 
@@ -371,4 +506,94 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
 
     assert_set_fragments_columns(updates, UPLOADS_METADATA_PATCH_COLUMNS)
 
-    await conn.execute(f"UPDATE uploads SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+    await conn.execute(
+        f"UPDATE uploads SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params
+    )
+    return applied
+
+
+async def mass_edit_uploads(conn, user_id: str, body: UploadMassEditBody) -> Dict[str, Any]:
+    """Apply mass edits to editable uploads owned by user_id."""
+    ids = [str(x).strip() for x in (body.upload_ids or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(400, "upload_ids required")
+    if len(ids) > 50:
+        raise HTTPException(400, "At most 50 uploads per mass-edit")
+
+    has_any = any(
+        [
+            body.title is not None,
+            body.caption is not None,
+            body.hashtags is not None,
+            body.scheduled_time is not None,
+            body.smart_schedule is not None,
+            body.shift_minutes is not None,
+            body.platforms is not None,
+            body.caption_style is not None,
+            body.caption_tone is not None,
+            body.caption_voice is not None,
+            body.randomize_writing_mix,
+        ]
+    )
+    if not has_any:
+        raise HTTPException(400, "No mass-edit fields provided")
+
+    results: List[Dict[str, Any]] = []
+    ok_n = 0
+    fail_n = 0
+    for uid in ids:
+        try:
+            patch = UploadUpdate(
+                title=body.title,
+                caption=body.caption,
+                hashtags=body.hashtags,
+                scheduled_time=body.scheduled_time,
+                smart_schedule=body.smart_schedule,
+                platforms=body.platforms,
+                caption_style=body.caption_style,
+                caption_tone=body.caption_tone,
+                caption_voice=body.caption_voice,
+                randomize_writing_mix=body.randomize_writing_mix,
+            )
+            if body.shift_minutes is not None and int(body.shift_minutes) != 0:
+                row = await conn.fetchrow(
+                    """
+                    SELECT scheduled_time, schedule_metadata, schedule_mode
+                    FROM uploads WHERE id = $1::uuid AND user_id = $2
+                    """,
+                    uid,
+                    user_id,
+                )
+                if not row:
+                    raise HTTPException(404, "Upload not found")
+                delta = timedelta(minutes=int(body.shift_minutes))
+                sm_raw = coerce_jsonb_dict(row["schedule_metadata"])
+                if str(row["schedule_mode"] or "").lower() == "smart" and sm_raw:
+                    shifted = _shift_iso_map(sm_raw, delta)
+                    if shifted:
+                        patch.smart_schedule = shifted
+                elif row["scheduled_time"] is not None:
+                    st = row["scheduled_time"]
+                    if getattr(st, "tzinfo", None) is None:
+                        st = st.replace(tzinfo=timezone.utc)
+                    patch.scheduled_time = st + delta
+                elif body.scheduled_time is None:
+                    raise HTTPException(400, "No scheduled_time to shift")
+
+            applied = await update_upload_metadata(conn, uid, user_id, patch)
+            results.append({"id": uid, "ok": True, "applied": applied})
+            ok_n += 1
+        except HTTPException as he:
+            results.append({"id": uid, "ok": False, "error": he.detail})
+            fail_n += 1
+        except Exception as e:
+            logger.warning("mass_edit failed for %s: %s", uid, e)
+            results.append({"id": uid, "ok": False, "error": str(e)[:200]})
+            fail_n += 1
+
+    return {
+        "ok": fail_n == 0,
+        "updated": ok_n,
+        "failed": fail_n,
+        "results": results,
+    }

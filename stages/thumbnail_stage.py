@@ -1765,10 +1765,22 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
 
         # Studio winner → upload covers / support image (before per-platform Pikzels).
         # Pinned/letterboxed covers satisfy Instagram cover_url-at-container-create.
+        # Hydrate pin-this-upload variant R2 when source ids ≠ locked strategy preview.
         skip_studio_platforms: List[str] = []
         try:
-            from services.thumbnail_studio_upload_bridge import apply_studio_winner_to_upload_thumbs
+            from services.thumbnail_studio_upload_bridge import (
+                apply_studio_winner_to_upload_thumbs,
+                hydrate_bridge_strategy,
+            )
 
+            _pool = getattr(ctx, "_db_pool", None)
+            strategy_for_bridge = await hydrate_bridge_strategy(
+                strategy_for_bridge,
+                us,
+                user_id=str(getattr(ctx, "user_id", "") or ""),
+                db_pool=_pool,
+                report=studio_render_report,
+            )
             if strategy_for_bridge and ctx.temp_dir:
                 platform_map, brief, skip_studio_platforms, opts_overlay = await apply_studio_winner_to_upload_thumbs(
                     strategy=strategy_for_bridge,

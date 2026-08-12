@@ -764,7 +764,14 @@ async def _maybe_burn_tiktok_styled_cover(ctx: JobContext, upload_id: str) -> No
         return
 
     render_method = str((ctx.output_artifacts or {}).get("thumbnail_render_method") or "").strip()
-    if render_method not in ("studio_renderer", "template", "ai_edit"):
+    # Include studio_winner_cover_direct so locked/pinned Studio JPEGs burn into the MP4
+    # (TikTok has no custom-image cover API — only frame timestamp + optional burn).
+    if render_method not in (
+        "studio_renderer",
+        "template",
+        "ai_edit",
+        "studio_winner_cover_direct",
+    ):
         logger.info(
             "[%s] TikTok cover burn skipped — no styled tiktok thumb (render_method=%r)",
             upload_id,

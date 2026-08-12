@@ -3,7 +3,7 @@
 Apply modes (upload-time):
   - fresh_generate: frame + strategy; YT support + persona subject to ref_persona_mode
   - strategy_only: frame + strategy; never attach YouTube support image
-  - pinned_cover: use Studio variant R2 image for YouTube 16:9; adapt 9:16 covers
+  - pinned_cover: use Studio variant R2 image for YouTube 16:9; letterbox 9:16 for IG/FB/TikTok
 
 Ref/persona modes (product copy enforcement):
   - recreate_style: support image, no persona

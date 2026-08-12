@@ -40,6 +40,7 @@ from services.upload.schedule_guard import (
     ERROR_SCHEDULE_INCOMPLETE,
     ERROR_STUCK_PENDING,
     ERROR_STUCK_READY_TO_PUBLISH,
+    ERROR_TARGET_ACCOUNTS_DEAD,
     UPLOAD_ERROR_MESSAGES,
     loud_upload_schedule_failure,
     mark_schedule_incomplete_failed,
@@ -106,10 +107,10 @@ async def _resolve_ready_publish_targets(
         )
     except Exception as e:
         logger.warning(
-            "ready_to_publish: target_accounts resolve failed (%s) — platform fallback",
+            "ready_to_publish: target_accounts resolve failed (%s) — fail-closed (no platform fallback)",
             e,
         )
-        return [(p, None) for p in platforms]
+        return []
 
     by_id = {str(r["id"]): str(r["platform"] or "").strip().lower() for r in rows}
     pairs: list[tuple[str, str]] = []
@@ -119,7 +120,11 @@ async def _resolve_ready_publish_targets(
             pairs.append((plat, tid))
     if pairs:
         return expected_publish_targets_resolved(platforms, pairs)
-    return [(p, None) for p in platforms]
+    # Explicit targets were set but none are live — do not widen to all platforms.
+    logger.warning(
+        "ready_to_publish: all target_accounts disconnected/revoked — empty targets"
+    )
+    return []
 
 
 async def recover_staged_without_schedule(
@@ -593,6 +598,31 @@ async def recover_stuck_ready_to_publish(
             logger.debug("[%s] ready_to_publish pending check: %s", upload_id, _pend_e)
 
         publish_targets = await _resolve_ready_publish_targets(conn, upload)
+        if not publish_targets:
+            detail = UPLOAD_ERROR_MESSAGES.get(
+                ERROR_TARGET_ACCOUNTS_DEAD,
+                "All target accounts are disconnected.",
+            )
+            await mark_schedule_incomplete_failed(
+                conn,
+                upload_id,
+                detail=detail,
+                error_code=ERROR_TARGET_ACCOUNTS_DEAD,
+            )
+            await loud_upload_schedule_failure(
+                upload_id,
+                user_id,
+                reason=detail,
+                schedule_mode=mode,
+                db_pool=db_pool,
+            )
+            stats["failed"] += 1
+            logger.warning(
+                "[%s] ready_to_publish → failed %s (no live targets)",
+                upload_id,
+                ERROR_TARGET_ACCOUNTS_DEAD,
+            )
+            continue
 
         # --- Missing scheduled_time ---
         if upload.get("scheduled_time") is None:

@@ -10,12 +10,41 @@ from fastapi import HTTPException
 
 
 async def fetch_user_platform_token_ids(conn, user_id: str) -> Set[str]:
-    """Return set of platform_tokens.id strings owned by user."""
+    """Return set of live platform_tokens.id strings owned by user."""
     rows = await conn.fetch(
-        "SELECT id::text FROM platform_tokens WHERE user_id = $1",
+        """
+        SELECT id::text FROM platform_tokens
+         WHERE user_id = $1 AND revoked_at IS NULL
+        """,
         user_id,
     )
     return {str(r["id"]) for r in rows}
+
+
+async def prune_account_id_from_groups(conn, user_id: str, account_id: str) -> int:
+    """
+    Remove a disconnected platform_tokens.id from every group owned by user.
+
+    Returns the number of groups updated.
+    """
+    aid = str(account_id or "").strip()
+    if not aid or not user_id:
+        return 0
+    status = await conn.execute(
+        """
+        UPDATE account_groups
+           SET account_ids = array_remove(account_ids, $2::text),
+               updated_at = NOW()
+         WHERE user_id = $1
+           AND $2::text = ANY(account_ids)
+        """,
+        user_id,
+        aid,
+    )
+    try:
+        return int(str(status).split()[-1])
+    except (TypeError, ValueError, IndexError):
+        return 0
 
 
 async def validate_account_ids_for_user(

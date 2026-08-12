@@ -32,6 +32,42 @@ class _FakeConn:
         return "OK"
 
 
+def test_resolve_ready_publish_targets_dead_accounts_fail_closed():
+    """Explicit target_accounts that are all gone must not widen to platforms."""
+
+    class _Conn:
+        async def fetch(self, sql, *args):
+            return []  # no live tokens
+
+    upload = {
+        "platforms": ["tiktok", "youtube"],
+        "target_accounts": ["dead-a", "dead-b"],
+    }
+
+    async def _run():
+        return await sr._resolve_ready_publish_targets(_Conn(), upload)
+
+    assert asyncio.run(_run()) == []
+
+
+def test_resolve_ready_publish_targets_keeps_live_pairs():
+    class _Conn:
+        async def fetch(self, sql, *args):
+            return [
+                {"id": "live-tt", "platform": "tiktok"},
+            ]
+
+    upload = {
+        "platforms": ["tiktok", "youtube"],
+        "target_accounts": ["live-tt", "dead-yt"],
+    }
+
+    async def _run():
+        return await sr._resolve_ready_publish_targets(_Conn(), upload)
+
+    assert asyncio.run(_run()) == [("tiktok", "live-tt")]
+
+
 def test_fail_deferred_batch_without_slot_when_no_next(monkeypatch):
     conn = _FakeConn([])
     mark = AsyncMock()

@@ -2442,7 +2442,12 @@ async def publish_to_facebook(
 # =====================================================================
 
 async def resolve_publish_targets(ctx: JobContext, db_pool) -> list[tuple[str, str | None]]:
-    """Build (platform, token_id) publish targets for an upload."""
+    """Build (platform, token_id) publish targets for an upload.
+
+    When ``target_accounts`` is set, only those live tokens are used. If every
+    listed token is missing/revoked, fail closed — never widen to one-per-platform
+    (that could publish to the wrong accounts after disconnect).
+    """
     publish_targets: list[tuple[str, str | None]] = []
     if ctx.target_accounts:
         for token_id in ctx.target_accounts:
@@ -2454,11 +2459,16 @@ async def resolve_publish_targets(ctx: JobContext, db_pool) -> list[tuple[str, s
                     continue
             logger.warning(f"target_account {token_id}: token not found or revoked — skipping")
         if not publish_targets:
-            logger.warning(
-                f"All target_accounts invalid for upload {ctx.upload_id}, falling back to one per platform"
+            logger.error(
+                f"All target_accounts invalid for upload {ctx.upload_id} — fail-closed (no platform fallback)"
             )
-    if not publish_targets:
-        publish_targets = [(p, None) for p in ctx.platforms]
+            raise PublishError(
+                "All target accounts are disconnected or revoked — cannot publish",
+                code=ErrorCode.PUBLISH,
+                retryable=False,
+            )
+        return publish_targets
+    publish_targets = [(p, None) for p in ctx.platforms]
     return publish_targets
 
 

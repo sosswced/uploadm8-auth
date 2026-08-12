@@ -246,6 +246,24 @@ async def disconnect_account(
         )
         await conn.execute("DELETE FROM platform_tokens WHERE id = $1", row["id"])
 
+        try:
+            from services.account_groups import prune_account_id_from_groups
+
+            pruned = await prune_account_id_from_groups(conn, token_owner, str(row["id"]))
+            if pruned:
+                logger.info(
+                    "Pruned disconnected account %s from %s group(s) for user %s",
+                    row["id"],
+                    pruned,
+                    token_owner,
+                )
+        except Exception as prune_err:
+            logger.warning(
+                "Group membership prune failed for account %s: %s",
+                row["id"],
+                prune_err,
+            )
+
         await conn.execute(
             """
             INSERT INTO platform_disconnect_log

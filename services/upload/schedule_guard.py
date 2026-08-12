@@ -21,6 +21,7 @@ ERROR_PUBLISH_SLOT_MISSING = "PUBLISH_SLOT_MISSING"
 ERROR_STUCK_READY_TO_PUBLISH = "STUCK_READY_TO_PUBLISH"
 ERROR_STUCK_PENDING = "STUCK_PENDING"
 ERROR_ABANDONED_PENDING = "ABANDONED_PENDING"
+ERROR_TARGET_ACCOUNTS_DEAD = "TARGET_ACCOUNTS_DEAD"
 
 UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
     ERROR_SCHEDULE_INCOMPLETE: (
@@ -42,6 +43,10 @@ UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
     ERROR_ABANDONED_PENDING: (
         "Upload was left incomplete (file never finished registering). Marked failed — "
         "upload again, or Retry if the file is still in storage."
+    ),
+    ERROR_TARGET_ACCOUNTS_DEAD: (
+        "All selected publish accounts are disconnected or revoked. "
+        "Reconnect accounts or edit the upload targets, then retry."
     ),
     ERROR_SOURCE_NOT_IN_R2: SOURCE_NOT_IN_R2_MESSAGE,
     "ENQUEUE_FAILED": (
@@ -167,8 +172,13 @@ async def build_smart_schedule_for_upload(
     exclude_upload_id: Optional[str] = None,
     random_seed: Optional[str] = None,
     user_timezone: Optional[str] = None,
+    extra_day_occupancy: Optional[Dict[int, int]] = None,
 ) -> Dict[str, datetime]:
-    """Return per-platform UTC slots (lowercase keys) for every requested platform."""
+    """Return per-platform UTC slots (lowercase keys) for every requested platform.
+
+    ``extra_day_occupancy`` merges with DB occupancy (used by batch preview so
+    sibling videos deconflict before rows exist).
+    """
     plats = normalize_platform_list(platforms)
     if not plats:
         return {}
@@ -180,6 +190,15 @@ async def build_smart_schedule_for_upload(
     occupancy = await get_existing_scheduled_days(
         conn, user_id, num_days, exclude_upload_id=exclude_upload_id
     )
+    if extra_day_occupancy:
+        for k, v in extra_day_occupancy.items():
+            try:
+                offset = int(k)
+                count = int(v)
+            except (TypeError, ValueError):
+                continue
+            if offset >= 1 and count > 0:
+                occupancy[offset] = occupancy.get(offset, 0) + count
     schedule = await calculate_smart_schedule_data_driven(
         conn,
         user_id,

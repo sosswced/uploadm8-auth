@@ -37,6 +37,64 @@ _BOOTSTRAP_GLOBAL: List[str] = [
     "sound",
 ]
 
+# Genre clusters without enough learned rows. Speed last. Do not rewrite
+# data/ml/hero_fact_priors_v1.json automotive overlays.
+_TAG_ALIASES: Dict[str, str] = {
+    "wearable": "travel",
+    "concert": "music",
+    "art": "museum",
+}
+_BOOTSTRAP_CLUSTERS: Dict[str, List[str]] = {
+    "travel": [
+        "landmark",
+        "place",
+        "on_screen_text",
+        "logo",
+        "entity",
+        "transcript",
+        "music",
+        "count",
+        "sound",
+        "speed",
+    ],
+    "music": [
+        "music",
+        "logo",
+        "on_screen_text",
+        "transcript",
+        "landmark",
+        "place",
+        "entity",
+        "count",
+        "sound",
+        "speed",
+    ],
+    "museum": [
+        "landmark",
+        "on_screen_text",
+        "place",
+        "logo",
+        "entity",
+        "transcript",
+        "music",
+        "count",
+        "sound",
+        "speed",
+    ],
+    "food": [
+        "entity",
+        "on_screen_text",
+        "logo",
+        "place",
+        "landmark",
+        "count",
+        "transcript",
+        "music",
+        "sound",
+        "speed",
+    ],
+}
+
 
 def _load_priors(path: Optional[Path] = None) -> Dict[str, Any]:
     p = path or DEFAULT_PRIORS_PATH
@@ -64,9 +122,12 @@ def class_rank_for_cluster(
     """Ordered hero-fact class preference for a content cluster."""
     data = priors if isinstance(priors, dict) else _load_priors()
     tag = str(domain_tag or "").strip().lower()
+    tag = _TAG_ALIASES.get(tag, tag)
     clusters = data.get("clusters") if isinstance(data.get("clusters"), dict) else {}
     if tag and isinstance(clusters.get(tag), list) and clusters[tag]:
         return [str(c) for c in clusters[tag] if c]
+    if tag in _BOOTSTRAP_CLUSTERS:
+        return list(_BOOTSTRAP_CLUSTERS[tag])
     # Automotive-only learning must not skew gardening/food/travel globals.
     auto_tags = {"automotive", "driving", "dashcam", "vehicle"}
     cluster_keys = {str(k).strip().lower() for k in clusters.keys() if k}

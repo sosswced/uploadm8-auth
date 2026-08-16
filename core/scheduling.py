@@ -233,6 +233,23 @@ def _apply_subsecond_jitter(
     return out
 
 
+# Preview compute cap (DoS / timeout). Upload N is unbounded except plan queue/wallet.
+SMART_SCHEDULE_MAX_BATCH = 5000
+SMART_SCHEDULE_PREVIEW_RETURN_CAP = 24
+SMART_SCHEDULE_PREVIEW_REQUEST_MAX = 1_000_000
+
+
+def clamp_smart_schedule_batch(n: Any, *, default: int = 1) -> int:
+    """Accept any batch size ≥ 1; cap only the preview *compute* loop."""
+    try:
+        v = int(n)
+    except (TypeError, ValueError):
+        v = int(default)
+    if v < 1:
+        v = 1
+    return min(v, SMART_SCHEDULE_MAX_BATCH)
+
+
 def clamp_smart_schedule_days(num_days: Any, *, default: int = 14) -> int:
     """Normalize Smart Schedule window to 1–730 days (never 0 / NaN)."""
     try:
@@ -409,7 +426,9 @@ def calculate_smart_schedule(
 
     Day offsets prefer free days inside ``num_days``. When the window is full,
     slots pack onto the least-occupied days still inside the window — they
-    never schedule past ``num_days``.
+    never schedule past ``num_days``. Dense batches (N videos over a short W)
+    are supported by design: multiple posts may share a calendar day at
+    different times.
 
     ``random_seed``: when set (e.g. upload_id), preview and presign produce identical slots.
     """

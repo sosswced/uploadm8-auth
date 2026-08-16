@@ -35,7 +35,7 @@ _KIND_PRIORITY: Dict[str, float] = {
 
 _NICHE_KIND_ORDER: Dict[str, List[str]] = {
     "automotive": ["vehicle", "signage", "music", "geo", "trill", "landmark", "restaurant", "object"],
-    "travel": ["landmark", "geo", "vehicle", "restaurant", "music", "signage", "object"],
+    "travel": ["landmark", "geo", "restaurant", "music", "signage", "object", "vehicle"],
     "food": ["restaurant", "food", "landmark", "music", "geo", "object"],
     "camping": ["landmark", "geo", "outdoors", "music", "object"],
     "fishing": ["object", "geo", "landmark", "music"],

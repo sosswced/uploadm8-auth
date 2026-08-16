@@ -43,7 +43,12 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from core.helpers import coerce_hashtag_list, sanitize_hashtag_body, strip_stray_hashtag_json_blob
+from core.helpers import (
+    coerce_hashtag_list,
+    normalize_hashtag_bodies,
+    sanitize_hashtag_body,
+    strip_stray_hashtag_json_blob,
+)
 
 import httpx
 
@@ -761,7 +766,9 @@ def _build_narrative_prompt(
         }.get(hashtag_style, "mix viral and niche tags")
         tasks.append(
             f"{ti}. hashtags_by_platform: JSON object mapping each target platform to an array of "
-            f"up to {hashtag_count} hashtag words WITHOUT the # symbol ({style_hint}). "
+            f"up to {hashtag_count} SHORT search terms WITHOUT the # symbol ({style_hint}). "
+            f"Each array item is 1–2 words (dashcam, lasvegas, makeuptutorial) — NEVER a sentence "
+            f"or prepositional phrase. City and state are separate tags. "
             f"NEVER return single letters or word fragments.\n"
             f"   Target platforms: {sel_label}\n"
             '   Also set top-level "hashtags" to the same array as hashtags_by_platform["tiktok"] '
@@ -1118,7 +1125,10 @@ Rules:
 - ACCURACY OVER ENGAGEMENT: Do NOT use clickbait patterns ("Nobody expected", "You need to see this", "The secret nobody tells you"). Describe what is actually shown. Hooks must reflect visible content — never overpromise or mislead.
 - Hook in the first 3 words for short-form platforms
 - Do not use emojis, emoticons, or decorative Unicode symbols in the title or caption
-- HASHTAGS: each must be a complete word (e.g. "makeuptutorial", "gardenlife", "dashcam")
+- HASHTAGS: each array item is ONE short search term (1–2 words, no spaces), e.g. "dashcam", "lasvegas", "makeuptutorial".
+  NEVER write a clause, sentence, or prepositional phrase as a hashtag
+  (not "latenightdrivethroughlasvegas", not "Driving through Las Vegas").
+  City and state are SEPARATE tags. Put each term in its own array slot.
   NEVER return single characters or word fragments
 - NEVER put hashtags, JSON arrays, escaped quotes, or "#word" tokens inside "caption" —
   all tags go ONLY in the "hashtags" array as plain words (no # prefix)
@@ -1362,13 +1372,13 @@ def _finalise_hashtags(
     from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
 
     for tag in list(base_tags or []) + list(ai_tags or []):
-        body = sanitize_hashtag_body(tag, max_len=HASHTAG_BODY_MAX_LEN)
-        if not body or body in seen or body in blocked_set:
-            continue
-        if is_junk_hashtag_body(body):
-            continue
-        seen.add(body)
-        merged.append(f"#{body}")
+        for body in normalize_hashtag_bodies([str(tag)], max_len=HASHTAG_BODY_MAX_LEN):
+            if not body or body in seen or body in blocked_set:
+                continue
+            if is_junk_hashtag_body(body):
+                continue
+            seen.add(body)
+            merged.append(f"#{body}")
 
     return merged[:max_total]
 

@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import asyncpg
 import httpx
 
+from services.tiktok_api import tiktok_watch_url
 from services.worker_leader_lock import acquire_leader_lock, release_leader_lock
 
 from . import db as db_stage
@@ -26,17 +27,6 @@ from .notify_stage import notify_user_publish_confirmed, notify_user_publish_rej
 from .publish_stage import decrypt_token, init_enc_keys
 
 logger = logging.getLogger("uploadm8-worker")
-
-
-def _tiktok_web_video_url(video_id: str, username: Optional[str]) -> str:
-    """TikTok often 404s for www.tiktok.com/video/{id} without the creator handle."""
-    v = str(video_id or "").strip()
-    if not v:
-        return ""
-    u = (username or "").strip().lstrip("@")
-    if u:
-        return f"https://www.tiktok.com/@{u}/video/{v}"
-    return f"https://www.tiktok.com/video/{v}"
 
 
 VERIFY_INTERVAL_SECONDS = int(os.environ.get("VERIFY_INTERVAL_SECONDS", "60"))
@@ -349,7 +339,7 @@ async def verify_single_attempt(
             uname_hint = (
                 str(token_data.get("_account_username") or "").strip().lstrip("@")
             )
-        tiktok_post_url = _tiktok_web_video_url(tiktok_video_id, uname_hint or None)
+        tiktok_post_url = tiktok_watch_url(tiktok_video_id, uname_hint or None)
 
     # Persist status (pending stays pending so the loop keeps polling).
     # TikTok: stamp ledger platform_post_id when status/fetch returns video_id so
@@ -419,7 +409,7 @@ async def verify_single_attempt(
                                         .strip()
                                         .lstrip("@")
                                     )
-                                tt_url = _tiktok_web_video_url(tiktok_video_id, uname) or tiktok_post_url
+                                tt_url = tiktok_watch_url(tiktok_video_id, uname) or tiktok_post_url
                                 item["platform_url"] = tt_url
                                 item["url"] = tt_url
                                 if tt_url:
@@ -453,7 +443,7 @@ async def verify_single_attempt(
                 if vid:
                     post_url = f"https://www.youtube.com/shorts/{vid}"
             elif platform == "tiktok" and tiktok_video_id:
-                post_url = (tiktok_post_url or "").strip() or _tiktok_web_video_url(
+                post_url = (tiktok_post_url or "").strip() or tiktok_watch_url(
                     tiktok_video_id,
                     (
                         str((token_data or {}).get("_account_username") or "").strip().lstrip("@")

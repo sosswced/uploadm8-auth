@@ -46,6 +46,7 @@ from core.vision_labels import (
     is_generic_vision_label,
     penalize_generic_vision_hashtags,
     vision_labels_for_m8_scene_graph,
+    prose_scene_beats_from_vi,
 )
 
 from .context import (
@@ -426,6 +427,28 @@ def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
             fact_bits.append(f"music={artist or title}")
     if fact_bits:
         lines.append("HYDRATION FACTS: " + " | ".join(fact_bits[:12]))
+
+    beats = scene_graph.get("scene_beats") or []
+    if isinstance(beats, list) and beats:
+        beat_bits: List[str] = []
+        for b in beats[:10]:
+            if not isinstance(b, dict):
+                continue
+            noun = str(b.get("noun") or "").strip()
+            if not noun:
+                continue
+            try:
+                t_s = float(b.get("t") if b.get("t") is not None else 0)
+                dur = float(b.get("duration_s") or 0)
+            except (TypeError, ValueError):
+                t_s, dur = 0.0, 0.0
+            beat_bits.append(f"{noun}@{t_s:.0f}s ({dur:.0f}s)")
+        if beat_bits:
+            lines.append(
+                "SCENE BEATS (timed nouns — weave in time order; do not upgrade "
+                "a noun to a proper place unless landmark/OCR in this graph names it): "
+                + "; ".join(beat_bits)
+            )
 
     timeline = scene_graph.get("timeline") or []
     if isinstance(timeline, list) and timeline:
@@ -907,6 +930,13 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    try:
+        scene_beats = prose_scene_beats_from_vi(ctx)
+    except Exception:
+        scene_beats = []
+    if scene_beats:
+        out_graph["scene_beats"] = scene_beats
+
     return out_graph
 
 
@@ -1095,6 +1125,9 @@ def _build_m8_prompt(
         hashtag_rule = (
             f"Include exactly {hashtag_count} hashtags per variant as JSON array of words "
             f"WITHOUT '#'. Style: {hashtag_style} — {style_hint}. "
+            "Each tag must be ONE short search term (1–2 words), never a clause or run-on sentence "
+            "(not 'latenightdrivethroughlasvegas', not 'Driving through Las Vegas'). "
+            "City and state are SEPARATE tags. "
             "Each tag must be a concrete niche/topic/search term (artist fragment, hobby, vehicle, place type). "
             "When scene_graph.geo.gazetteer_place, geo.protected_area_name, or geo.near_protected_land are set, "
             "include at least one discovery tag tied to that real place or protected-land context (no false claims). "
@@ -1200,6 +1233,28 @@ TITLE BUILD CONTRACT (VOICE + EVIDENCE — REJECTION RULES APPLY):
             "(respect copyright_risk / third-party lyrics). "
             "When audio_environment is populated, mention 1–2 concrete sounds where it strengthens the hook."
         )
+        beats = scene_graph.get("scene_beats") or []
+        if isinstance(beats, list) and beats and not has_speed_peak:
+            beat_bits = []
+            for b in beats[:10]:
+                if not isinstance(b, dict):
+                    continue
+                noun = str(b.get("noun") or "").strip()
+                if not noun:
+                    continue
+                try:
+                    t_s = float(b.get("t") if b.get("t") is not None else 0)
+                except (TypeError, ValueError):
+                    t_s = 0.0
+                beat_bits.append(f"t={t_s:.0f}s {noun}")
+            if beat_bits:
+                caption_rule += (
+                    " SCENE BEATS (Video Intelligence timed nouns — weave in time order; "
+                    "do not upgrade a noun: water is water, not the Mediterranean, unless "
+                    "a landmark or OCR string in the scene graph names that place): "
+                    + "; ".join(beat_bits)
+                    + "."
+                )
         if freestyle:
             caption_rule += (
                 " FREESTYLE: invent a fresh caption shape; length and arc are optional; "

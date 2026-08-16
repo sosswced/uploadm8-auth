@@ -716,6 +716,7 @@ def _adaptive_vision_frame_count(
     duration_seconds: float,
     *,
     user_override: Optional[int] = None,
+    wearable_floor: bool = False,
 ) -> int:
     """Pick how many frames to send to GCV based on clip length.
 
@@ -734,19 +735,22 @@ def _adaptive_vision_frame_count(
         per-upload spend predictable.
     """
     raw_env = (os.environ.get("VISION_MULTI_FRAME") or "").strip()
+    n = 0
     if user_override is not None:
         try:
             n = int(user_override)
         except (TypeError, ValueError):
             n = 0
         if n > 0:
-            return max(1, min(n, _vision_frame_ceiling()))
+            n = max(1, min(n, _vision_frame_ceiling()))
+            return max(n, 4) if wearable_floor else n
     # Legacy hard pin — only honor when explicitly set non-empty.
     if raw_env:
         try:
             n = int(raw_env)
             if n > 0:
-                return max(1, min(n, _vision_frame_ceiling()))
+                n = max(1, min(n, _vision_frame_ceiling()))
+                return max(n, 4) if wearable_floor else n
         except ValueError:
             pass
     d = max(0.0, float(duration_seconds or 0.0))
@@ -760,6 +764,8 @@ def _adaptive_vision_frame_count(
         n = 8
     else:
         n = 10
+    if wearable_floor:
+        n = max(n, 4)
     return max(1, min(n, _vision_frame_ceiling()))
 
 
@@ -825,37 +831,110 @@ def _vi_shot_offset_fractions(
     return chosen[:target_count]
 
 
+async def _probe_video_duration_seconds(video_path: Path) -> float:
+    """ffprobe duration; 0.0 when unknown."""
+    FFPROBE_PATH = resolve_ffmpeg_executable("ffprobe") or "ffprobe"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            FFPROBE_PATH,
+            "-v",
+            "quiet",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(video_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        from stages.ffmpeg_progress import communicate_or_kill
+
+        stdout, _ = await communicate_or_kill(proc)
+        if proc.returncode == 0 and stdout:
+            data = json.loads(stdout.decode("utf-8", errors="replace"))
+            d = data.get("format", {}).get("duration", 0)
+            return max(0.0, float(d) if d else 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+async def _maybe_h264_watch_proxy(ctx: JobContext, video_path: Path) -> Path:
+    """HEVC/Meta MOV → small H.264 so Vision/VI can decode real frames."""
+    try:
+        from core.wearable_source import source_needs_h264_proxy
+
+        if not source_needs_h264_proxy(ctx, video_path):
+            return video_path
+    except Exception:
+        return video_path
+    try:
+        from stages.video_intelligence_stage import _build_vi_inline_proxy
+
+        proxy = await _build_vi_inline_proxy(
+            video_path,
+            max_bytes=40 * 1024 * 1024,
+            temp_dir=Path(ctx.temp_dir) if getattr(ctx, "temp_dir", None) else video_path.parent,
+        )
+        if proxy and Path(proxy).exists() and Path(proxy).stat().st_size > 1000:
+            logger.info("[vision] using H.264 watch proxy %s", Path(proxy).name)
+            return Path(proxy)
+    except Exception as e:
+        logger.debug("[vision] H.264 watch proxy skipped: %s", e)
+    return video_path
+
+
+async def _ffmpeg_extract_jpeg(
+    video_path: Path,
+    out_path: Path,
+    offset_s: float,
+    *,
+    decode_accurate: bool = True,
+) -> bool:
+    """Extract one JPEG. Decode-seek (``-ss`` after ``-i``) for HEVC keyframe misses."""
+    from core.frame_quality import jpeg_is_unusable
+    from stages.ffmpeg_progress import communicate_or_kill
+
+    FFMPEG_PATH = resolve_ffmpeg_executable() or "ffmpeg"
+    t = max(0.15, float(offset_s))
+    if decode_accurate:
+        cmd = [
+            FFMPEG_PATH, "-y", "-i", str(video_path),
+            "-ss", f"{t:.3f}", "-vframes", "1", "-q:v", "2",
+            "-vf", "scale=1280:-1", str(out_path),
+        ]
+    else:
+        cmd = [
+            FFMPEG_PATH, "-y", "-ss", f"{t:.3f}", "-i", str(video_path),
+            "-vframes", "1", "-q:v", "2",
+            "-vf", "scale=1280:-1", str(out_path),
+        ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await communicate_or_kill(proc)
+    except Exception as e:
+        logger.debug("[vision] extract @%.2fs failed: %s", t, e)
+        return False
+    if jpeg_is_unusable(out_path):
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
 async def _extract_frames_at_offsets(
     video_path: Path,
     temp_dir: Path,
     offsets: List[float],
+    *,
+    decode_accurate: bool = True,
 ) -> List[Tuple[float, Path]]:
     """Extract one JPEG per fractional offset; returns (fraction_used, path) per success."""
-    FFMPEG_PATH = resolve_ffmpeg_executable() or "ffmpeg"
-    FFPROBE_PATH = resolve_ffmpeg_executable("ffprobe") or "ffprobe"
-    duration = 1.0
-    proc = await asyncio.create_subprocess_exec(
-        FFPROBE_PATH,
-        "-v",
-        "quiet",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        str(video_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    from stages.ffmpeg_progress import communicate_or_kill
-
-    stdout, _ = await communicate_or_kill(proc)
-    if proc.returncode == 0 and stdout:
-        try:
-            data = json.loads(stdout.decode("utf-8", errors="replace"))
-            d = data.get("format", {}).get("duration", 1)
-            duration = float(d) if d else 1.0
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
+    duration = await _probe_video_duration_seconds(video_path)
     duration = max(duration, 0.25)
 
     out_pairs: List[Tuple[float, Path]] = []
@@ -867,26 +946,15 @@ async def _extract_frames_at_offsets(
         f = max(0.02, min(f, 0.98))
         offset_s = max(0.15, duration * f)
         out_path = temp_dir / f"vision_mf_{i:02d}.jpg"
-        cmd = [
-            FFMPEG_PATH,
-            "-y",
-            "-ss",
-            f"{offset_s:.3f}",
-            "-i",
-            str(video_path),
-            "-vframes",
-            "1",
-            "-q:v",
-            "2",
-            "-vf",
-            "scale=1280:-1",
-            str(out_path),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        ok = await _ffmpeg_extract_jpeg(
+            video_path, out_path, offset_s, decode_accurate=decode_accurate
         )
-        await communicate_or_kill(proc)
-        if out_path.exists() and out_path.stat().st_size > 1000:
+        if not ok and decode_accurate:
+            # Nudge off a possible IDR gap, then one fast-seek retry.
+            ok = await _ffmpeg_extract_jpeg(
+                video_path, out_path, offset_s + 0.4, decode_accurate=True
+            )
+        if ok:
             out_pairs.append((f, out_path))
     return out_pairs
 
@@ -934,26 +1002,47 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
         # Duration-aware adaptive sampling. Falls back to legacy 3-frame cap
         # only when VISION_MULTI_FRAME env or user setting forces it.
         duration = float((getattr(ctx, "video_info", None) or {}).get("duration") or 0.0)
+        if duration <= 0 and video_path:
+            duration = await _probe_video_duration_seconds(video_path)
+            if duration > 0:
+                info = dict(getattr(ctx, "video_info", None) or {})
+                info["duration"] = duration
+                ctx.video_info = info
+                if not getattr(ctx, "duration_seconds", None):
+                    ctx.duration_seconds = duration
+        wearable_floor = False
+        try:
+            from core.wearable_source import is_meta_glasses_filename
+
+            wearable_floor = is_meta_glasses_filename(str(getattr(ctx, "filename", "") or ""))
+        except Exception:
+            wearable_floor = False
         us = ctx.user_settings or {}
         user_override = us.get("thumbnail_vision_multi_frame") or us.get(
             "thumbnailVisionMultiFrame"
         )
-        multi = _adaptive_vision_frame_count(duration, user_override=user_override)
+        multi = _adaptive_vision_frame_count(
+            duration, user_override=user_override, wearable_floor=wearable_floor
+        )
         logger.info(
-            "[vision] adaptive sampling: duration=%.1fs frames=%d ceiling=%d",
+            "[vision] adaptive sampling: duration=%.1fs frames=%d ceiling=%d wearable_floor=%s",
             duration,
             multi,
             _vision_frame_ceiling(),
+            wearable_floor,
         )
 
         loop = asyncio.get_running_loop()
         result: Dict[str, Any] = {}
 
         if multi > 1 and video_path and ctx.temp_dir:
+            watch_path = await _maybe_h264_watch_proxy(ctx, video_path)
             # Prefer VI shot midpoints when available (skips transitions);
             # falls back to evenly distributed offsets otherwise.
             offsets = _vi_shot_offset_fractions(ctx, duration, multi) or _parse_frame_offset_fractions(multi)
-            frame_pairs = await _extract_frames_at_offsets(video_path, Path(ctx.temp_dir), offsets)
+            frame_pairs = await _extract_frames_at_offsets(
+                watch_path, Path(ctx.temp_dir), offsets, decode_accurate=True
+            )
             frames_m = [p for _, p in frame_pairs]
             fracs_used = [f for f, _ in frame_pairs]
             if len(frames_m) >= 2:
@@ -1082,5 +1171,144 @@ async def _extract_frame_for_vision(ctx: JobContext) -> Optional[Path]:
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError, ValueError) as e:
         logger.warning("[vision] Frame extraction failed: %s", e)
         return None
+
+
+_SECOND_PASS_TIMEOUT_S = 60.0
+
+
+def _second_pass_should_run(ctx: JobContext) -> Tuple[bool, str]:
+    try:
+        from core.config import VISION_SECOND_PASS_ENABLED
+
+        if not VISION_SECOND_PASS_ENABLED:
+            return False, "flag_off"
+    except Exception:
+        pass
+    try:
+        from core.driving_evidence import has_driving_evidence
+
+        if has_driving_evidence(ctx):
+            return False, "driving_evidence"
+    except Exception:
+        pass
+    vc = getattr(ctx, "vision_context", None) or {}
+    if isinstance(vc, dict):
+        names = [str(x).strip() for x in (vc.get("landmark_names") or []) if str(x).strip()]
+        if names:
+            return False, "landmark_already_present"
+    try:
+        from core.visual_marks import has_pixel_visual_marks
+
+        if has_pixel_visual_marks(ctx):
+            return False, "visual_marks_present"
+    except Exception:
+        pass
+    return True, "ok"
+
+
+async def _extract_frames_at_seconds(
+    video_path: Path,
+    temp_dir: Path,
+    timestamps_sec: List[float],
+) -> List[Tuple[float, Path]]:
+    """Extract JPEGs at absolute timestamps (seconds)."""
+    out_pairs: List[Tuple[float, Path]] = []
+    for i, raw in enumerate(list(timestamps_sec)[:4]):
+        try:
+            t = max(0.15, float(raw))
+        except (TypeError, ValueError):
+            continue
+        out_path = temp_dir / f"vision_sp_{i:02d}.jpg"
+        ok = await _ffmpeg_extract_jpeg(video_path, out_path, t, decode_accurate=True)
+        if ok:
+            out_pairs.append((t, out_path))
+    return out_pairs
+
+
+async def _vision_second_pass_impl(ctx: JobContext) -> Dict[str, Any]:
+    from core.hero_window import pick_second_pass_timestamps
+    from core.vision_labels import prose_scene_beats_from_vi
+
+    video_path: Optional[Path] = None
+    for c in (ctx.processed_video_path, ctx.local_video_path):
+        if c and Path(c).exists():
+            video_path = Path(c)
+            break
+    if not video_path or not ctx.temp_dir:
+        return {"ok": False, "skipped": True, "reason": "no_video"}
+
+    arts = getattr(ctx, "output_artifacts", None) or {}
+    beats = list(arts.get("scene_beats_v1") or []) if isinstance(arts, dict) else []
+    if not beats:
+        beats = prose_scene_beats_from_vi(ctx)
+    duration = float(
+        (getattr(ctx, "video_info", None) or {}).get("duration")
+        or getattr(ctx, "duration_seconds", None)
+        or 0
+    )
+    timestamps = pick_second_pass_timestamps(beats, max_n=4, duration_s=duration)
+    if not timestamps:
+        from core.hero_window import pick_speech_second_pass_timestamps
+
+        timestamps = pick_speech_second_pass_timestamps(ctx, max_n=4, duration_s=duration)
+    if not timestamps:
+        return {"ok": True, "skipped": True, "reason": "no_timestamps"}
+
+    watch_path = await _maybe_h264_watch_proxy(ctx, video_path)
+    pairs = await _extract_frames_at_seconds(watch_path, Path(ctx.temp_dir), timestamps)
+    if not pairs:
+        return {"ok": False, "skipped": True, "reason": "extract_failed"}
+
+    blobs = [p.read_bytes() for _, p in pairs]
+    loop = asyncio.get_running_loop()
+    extra = await loop.run_in_executor(_gcv_executor, partial(_analyze_batch_sync, blobs))
+    if not isinstance(extra, dict) or not extra:
+        return {"ok": False, "skipped": True, "reason": "annotate_empty"}
+
+    vc = getattr(ctx, "vision_context", None) or {}
+    if not isinstance(vc, dict):
+        vc = {}
+    merged = _merge_vision_dicts([vc, extra]) if vc else dict(extra)
+    for k, v in vc.items():
+        if k not in merged or merged.get(k) in (None, "", [], {}):
+            merged[k] = v
+    sample_times = dict(merged.get("landmark_sample_times") or {})
+    extra_names = [str(x).strip() for x in (extra.get("landmark_names") or []) if str(x).strip()]
+    if extra_names and pairs:
+        sample_times.setdefault(extra_names[0], float(pairs[0][0]))
+    merged["landmark_sample_times"] = sample_times
+    merged["vision_second_pass"] = True
+    ctx.vision_context = merged
+    return {
+        "ok": True,
+        "skipped": False,
+        "frames": len(pairs),
+        "timestamps": [round(t, 3) for t, _ in pairs],
+        "landmarks": extra.get("landmark_names") or [],
+    }
+
+
+async def maybe_run_vision_second_pass(ctx: JobContext) -> Dict[str, Any]:
+    """Best-effort landmark hunt at beat peaks. Never fails the job."""
+    report: Dict[str, Any] = {"ok": False, "skipped": True}
+    try:
+        should, reason = _second_pass_should_run(ctx)
+        if not should:
+            report = {"ok": True, "skipped": True, "reason": reason}
+        else:
+            report = await asyncio.wait_for(
+                _vision_second_pass_impl(ctx),
+                timeout=_SECOND_PASS_TIMEOUT_S,
+            )
+            if not isinstance(report, dict):
+                report = {"ok": True, "skipped": False}
+    except Exception as e:
+        logger.info("[vision] second pass skipped (non-fatal): %s", e)
+        report = {"ok": False, "skipped": False, "error": str(e)[:240]}
+    if not isinstance(getattr(ctx, "output_artifacts", None), dict):
+        ctx.output_artifacts = {}
+    ctx.output_artifacts["vision_second_pass_v1"] = report
+    return report
+
 
 

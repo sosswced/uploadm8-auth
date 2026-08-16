@@ -13,7 +13,56 @@ resolved dynamically from category + filename + label hints — not dashcam-only
 from __future__ import annotations
 
 import re
-from typing import Any, FrozenSet, Iterable, List, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set
+
+# Timed nouns allowed on the M8 worksheet / identity packet. Hashtag bans
+# in GENERIC_VISION_LABEL_SLUGS stay frozen — this door is prose-only.
+PROSE_SCENE_NOUN_SLUGS: frozenset[str] = frozenset(
+    {
+        "water",
+        "sea",
+        "harbor",
+        "harbour",
+        "fountain",
+        "river",
+        "lake",
+        "boat",
+        "ship",
+        "church",
+        "cathedral",
+        "tower",
+        "bridge",
+        "plaza",
+        "building",
+    }
+)
+_PROSE_NEVER_SLUGS: frozenset[str] = frozenset(
+    {
+        "sky",
+        "outdoor",
+        "outdoors",
+        "person",
+        "people",
+        "windshield",
+        "windscreen",
+        "architecture",
+        "indoor",
+        "indoors",
+    }
+)
+_PROSE_BETTER_THAN_BUILDING: frozenset[str] = frozenset(
+    {
+        "church",
+        "cathedral",
+        "tower",
+        "bridge",
+        "plaza",
+        "harbor",
+        "harbour",
+    }
+)
+_PROSE_MIN_DURATION_S = 2.0
+_PROSE_BUILDING_MIN_DURATION_S = 8.0
 
 # Slugs (alphanumeric, lower) for labels we never want as hashtag evidence.
 GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
@@ -272,6 +321,9 @@ _JUNK_HASHTAG_RE = re.compile(
     # Ambient logos: exact slug only (never substring — ups must not kill meetups)
     r"|^(?:maersk|kohinoor|kohinoorhardtmuth|hardtmuth|quiksilver|fedex|ups|dhl)$"
     r"|^(?:matson|matsoninc|cosco|evergreen|walmart|costco|circlek|chevron|exxon)$"
+    # Caption-clause mashups the model stuffed into one tag
+    r"|through.{4,}|withthe|andthe|forthe|fromthe|intothe|overthe"
+    r"|watchingthe|lookingat|headingto|drivingthrough"
     r")"
 )
 
@@ -356,6 +408,16 @@ AMBIENT_REDUNDANT_SLUGS_BY_PROFILE: dict[str, frozenset[str]] = {
             "dashcam",
             "actioncamera",
             "gopro",
+        }
+    ),
+    "travel": frozenset(
+        {
+            "tourist",
+            "vacation",
+            "sightseeing",
+            "destination",
+            "holiday",
+            "tourism",
         }
     ),
     "gardening": frozenset(
@@ -699,9 +761,17 @@ def is_junk_hashtag_body(raw: Any) -> bool:
     slug = vision_label_slug(text)
     if not slug:
         return True
-    # Overrun mashups are never useful discovery tags.
-    if len(slug) > HASHTAG_BODY_MAX_LEN:
+    # Overrun mashups are never useful discovery tags. Sanitize truncates TO
+    # HASHTAG_BODY_MAX_LEN, so exact-length leftovers are the truncated clause.
+    if len(slug) >= HASHTAG_BODY_MAX_LEN:
         return True
+    try:
+        from core.helpers import is_hashtag_sentence_stopword, is_mashed_sentence_hashtag
+
+        if is_hashtag_sentence_stopword(slug) or is_mashed_sentence_hashtag(slug):
+            return True
+    except Exception:
+        pass
     try:
         from services.generic_hard_ban import is_hard_banned_slug
 
@@ -907,7 +977,7 @@ def resolve_ambient_profiles(
 
     _CATEGORY_PROFILES: dict[str, frozenset[str]] = {
         "automotive": frozenset({"automotive"}),
-        "travel": frozenset({"automotive"}),
+        "travel": frozenset({"travel"}),
         "dashcam": frozenset({"automotive", "dashcam"}),
         "food": frozenset({"cooking"}),
         "camping": frozenset({"camping"}),
@@ -1071,6 +1141,115 @@ def vision_labels_for_m8_scene_graph(
         category=category,
         filename=filename,
     )[: max(0, int(limit or 24))]
+
+
+def _prose_noun_from_description(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    slug = vision_label_slug(text)
+    if slug in _PROSE_NEVER_SLUGS:
+        return ""
+    if slug in PROSE_SCENE_NOUN_SLUGS:
+        # Prefer the readable noun (harbour stays harbour).
+        return text.split(",")[0].split("(")[0].strip() or slug
+    # Multi-word labels: "church building" → church
+    for token in text.replace("/", " ").replace("-", " ").split():
+        tok_slug = vision_label_slug(token)
+        if tok_slug in _PROSE_NEVER_SLUGS:
+            continue
+        if tok_slug in PROSE_SCENE_NOUN_SLUGS and tok_slug != "building":
+            return tok_slug
+    return ""
+
+
+def _vi_payload_from_ctx(ctx: Any) -> Dict[str, Any]:
+    vi = getattr(ctx, "video_intelligence", None) or {}
+    if not isinstance(vi, dict) or vi.get("error"):
+        vi = {}
+    if not vi:
+        vic = getattr(ctx, "video_intelligence_context", None) or {}
+        if isinstance(vic, dict) and not vic.get("error"):
+            vi = vic
+    return vi if isinstance(vi, dict) else {}
+
+
+def _collect_vi_timed_rows(ctx: Any) -> List[Dict[str, Any]]:
+    vi = _vi_payload_from_ctx(ctx)
+    rows: List[Dict[str, Any]] = []
+    for key, source in (
+        ("object_tracks", "vi_object"),
+        ("segment_labels", "vi_segment"),
+        ("shot_labels", "vi_shot"),
+    ):
+        for item in vi.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = float(item.get("start_s") or 0)
+                end = float(item.get("end_s") or 0)
+            except (TypeError, ValueError):
+                continue
+            if end < start:
+                start, end = end, start
+            rows.append({
+                "description": item.get("description") or item.get("label") or "",
+                "start_s": start,
+                "end_s": end,
+                "source": source,
+                "confidence": item.get("confidence"),
+            })
+    return rows
+
+
+def prose_scene_beats_from_vi(ctx: Any) -> List[Dict[str, Any]]:
+    """Timed scene nouns for M8 / identity. Does not loosen hashtag bans."""
+    raw_rows = _collect_vi_timed_rows(ctx)
+    prelim: List[Dict[str, Any]] = []
+    for row in raw_rows:
+        noun = _prose_noun_from_description(row.get("description"))
+        if not noun:
+            continue
+        slug = vision_label_slug(noun)
+        if slug in _PROSE_NEVER_SLUGS:
+            continue
+        dur = float(row["end_s"]) - float(row["start_s"])
+        if dur < _PROSE_MIN_DURATION_S:
+            continue
+        prelim.append({
+            "t": round(float(row["start_s"]), 3),
+            "duration_s": round(dur, 3),
+            "noun": noun,
+            "source": str(row.get("source") or "vi"),
+            "slug": slug,
+        })
+
+    def _overlaps(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        a0, a1 = a["t"], a["t"] + a["duration_s"]
+        b0, b1 = b["t"], b["t"] + b["duration_s"]
+        return a0 < b1 and b0 < a1
+
+    better = [b for b in prelim if b["slug"] in _PROSE_BETTER_THAN_BUILDING]
+    beats: List[Dict[str, Any]] = []
+    for b in prelim:
+        if b["slug"] == "building":
+            if b["duration_s"] < _PROSE_BUILDING_MIN_DURATION_S:
+                continue
+            if any(_overlaps(b, other) for other in better):
+                continue
+        beats.append({k: v for k, v in b.items() if k != "slug"})
+
+    beats.sort(key=lambda x: (float(x["t"]), -float(x["duration_s"])))
+    # Drop duplicate noun+start
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for b in beats:
+        key = f"{b['noun']}|{b['t']:.1f}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(b)
+    return out[:24]
 
 
 def evidence_pool_has_strong_hashtag_signals(pool: Any) -> bool:

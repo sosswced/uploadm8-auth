@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.helpers import coerce_hashtag_list, coerce_jsonb_dict, sanitize_hashtag_body, strip_stray_hashtag_json_blob
+from core.helpers import (
+    coerce_hashtag_list,
+    coerce_jsonb_dict,
+    normalize_hashtag_bodies,
+    sanitize_hashtag_body,
+    strip_stray_hashtag_json_blob,
+)
 
 from .entitlements import Entitlements
 
@@ -618,9 +624,11 @@ class JobContext:
                             reserved_bodies.append(slug)
                 # Hydration already padded ai/m8 ledger-first — keep those early.
                 for src in list(m8_tags)[:reserve_n] + list(ai)[:reserve_n]:
-                    b = sanitize_hashtag_body(str(src), max_len=HASHTAG_BODY_MAX_LEN)
-                    if b:
-                        reserved_bodies.append(b)
+                    reserved_bodies.extend(
+                        normalize_hashtag_bodies(
+                            [str(src)], max_len=HASHTAG_BODY_MAX_LEN
+                        )
+                    )
         except Exception:
             reserved_bodies = []
 
@@ -646,13 +654,13 @@ class JobContext:
             merged.append(f"#{body}")
 
         for tag in always_tags + platform_tags + base + m8_tags + ai:
-            body = sanitize_hashtag_body(tag, max_len=HASHTAG_BODY_MAX_LEN)
-            if not body or body in seen or body in blocked_set:
-                continue
-            if is_junk_hashtag_body(body):
-                continue
-            seen.add(body)
-            merged.append(f"#{body}")
+            for body in normalize_hashtag_bodies([str(tag)], max_len=HASHTAG_BODY_MAX_LEN):
+                if not body or body in seen or body in blocked_set:
+                    continue
+                if is_junk_hashtag_body(body):
+                    continue
+                seen.add(body)
+                merged.append(f"#{body}")
 
         if len(merged) > cap:
             merged = merged[:cap]

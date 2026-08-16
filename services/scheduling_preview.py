@@ -43,6 +43,19 @@ def occupancy_from_schedule(smart: Dict[str, datetime], *, now: Optional[datetim
     return occ
 
 
+def compact_preview_batch(
+    batch: List[Dict[str, Any]],
+    *,
+    cap: int = 24,
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Keep preview JSON small: first/last slices when N is huge (500–5000)."""
+    if not batch or cap < 2 or len(batch) <= cap:
+        return list(batch or []), False
+    head = cap // 2
+    tail = cap - head
+    return list(batch[:head]) + list(batch[-tail:]), True
+
+
 def preview_response_payload(
     smart: Dict[str, datetime],
     sm: Dict[str, str],
@@ -51,6 +64,9 @@ def preview_response_payload(
     smart_schedule_days: int,
     user_timezone: str = "UTC",
     batch: Optional[List[Dict[str, Any]]] = None,
+    batch_count: Optional[int] = None,
+    occupancy: Optional[Dict[int, int]] = None,
+    batch_truncated: bool = False,
 ) -> Dict[str, Any]:
     """Canonical preview JSON for /api/scheduling/preview and legacy shim."""
     explanation = smart_schedule_explanation(smart, user_timezone=user_timezone)
@@ -65,5 +81,9 @@ def preview_response_payload(
     }
     if batch is not None:
         payload["batch"] = batch
-        payload["batch_count"] = len(batch)
+        payload["batch_count"] = int(batch_count) if batch_count is not None else len(batch)
+        if batch_truncated:
+            payload["batch_truncated"] = True
+    if occupancy:
+        payload["occupancy"] = {str(int(k)): int(v) for k, v in occupancy.items() if int(v) > 0}
     return payload

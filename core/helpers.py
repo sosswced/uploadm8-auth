@@ -264,6 +264,44 @@ _HASHTAG_ENTITY_SPLIT_RE = re.compile(
 _HASHTAG_CITY_STATE_RE = re.compile(
     r"^\s*(?P<city>.+?)\s*,\s*(?P<state>[A-Za-z]{2}|[A-Za-z][A-Za-z\s]{2,})\s*$"
 )
+# CamelCase / TitleCase: DashcamRide, LosAngelesCA, LateNightDriveThroughVegas
+_CAMEL_HASHTAG_SPLIT_RE = re.compile(
+    r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
+# Function words that turn a tag into a clause when concatenated.
+_HASHTAG_SENTENCE_STOPWORDS = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "through",
+    "while", "as", "and", "but", "or", "that", "this", "from", "into", "over",
+    "past", "watching", "looking", "heading", "during", "across", "around",
+    "about", "after", "before", "under", "near", "via",
+})
+# Leftover verbs/adverbs from a smashed caption — not searchable on their own.
+_HASHTAG_SENTENCE_CRUMBS = frozenset({
+    "late", "night", "drive", "ride", "run", "clip", "video", "moment", "time",
+    "going", "just", "really", "another", "today", "tonight", "still", "even",
+    "back", "down", "up", "out", "off", "got", "get", "see", "saw", "hit",
+})
+_CITY_PREFIX_TOKENS = frozenset({
+    "las", "los", "san", "new", "fort", "st", "saint", "el", "la", "des",
+})
+# Two-letter US abbrs that collide with English word endings (*ride → de).
+_GEO_ABBR_ENGLISH_COLLISION_RE = re.compile(
+    r"(?:ride|side|made|code|mode|fade|grade|trade|shade|blade|pride|slide|"
+    r"wide|tide|hide|guide|inside|outside|arcade|decade|tutorial|digital|"
+    r"original|festival|official|animal|crystal|hospital|capital|national)$"
+)
+# Abbrs that are also common English suffixes — never infer geo from them.
+# Full state-name suffixes (california, oregon) still split. City+NV/TX/WA/etc. still split.
+_HIGH_COLLISION_STATE_ABBR = frozenset({
+    "al", "ar", "de", "hi", "id", "in", "la", "ma", "me", "ok", "or", "pa",
+})
+# Already-lowercased clause mashups the LLM emitted as one token.
+_MASHED_SENTENCE_GLUE_RE = re.compile(
+    r"(?ix)"
+    r"(?:through.{4,}"
+    r"|withthe|andthe|forthe|fromthe|intothe|overthe"
+    r"|watchingthe|lookingat|headingto|drivingthrough)"
+)
 
 
 def split_hashtag_source_phrases(raw: str | None) -> list[str]:
@@ -299,6 +337,102 @@ def split_hashtag_source_phrases(raw: str | None) -> list[str]:
     return parts if parts else [text]
 
 
+def is_mashed_sentence_hashtag(slug: str | None) -> bool:
+    """True when a slug is a smashed caption clause, not a search term."""
+    body = re.sub(r"[^\w]", "", str(slug or ""), flags=re.UNICODE).lower()
+    if not body:
+        return False
+    return bool(_MASHED_SENTENCE_GLUE_RE.search(body))
+
+
+def is_hashtag_sentence_stopword(slug: str | None) -> bool:
+    """True for lone function-word tags leftover from splitting a clause."""
+    body = re.sub(r"[^\w]", "", str(slug or ""), flags=re.UNICODE).lower()
+    return bool(body) and body in _HASHTAG_SENTENCE_STOPWORDS
+
+
+def _hashtag_lexical_tokens(raw: str) -> list[str]:
+    """Split a raw hashtag on whitespace/punctuation and CamelCase, keep order."""
+    text = str(raw or "").strip().lstrip("#")
+    if not text:
+        return []
+    chunks: list[str] = []
+    for piece in re.split(r"[\s,._/\-]+", text):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if (
+            piece.isupper()
+            or piece.islower()
+            or not any(c.isupper() for c in piece[1:])
+        ):
+            chunks.append(piece)
+            continue
+        parts = _CAMEL_HASHTAG_SPLIT_RE.split(piece)
+        chunks.extend(p for p in parts if p)
+    return chunks or [text]
+
+
+def expand_sentence_runon_hashtag(raw: str | None, *, max_len: int = 50) -> list[str]:
+    """Never let a caption clause become one discovery tag.
+
+    Space/CamelCase sentences split into content tokens. Two-word compounds
+    without glue (``makeup tutorial``, ``DashcamRide``) stay one phrase so
+    geo expansion can still see ``losangelesca``. Already-mashed lowercase
+    clauses with preposition glue are dropped (evidence tags refill place).
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    tokens = _hashtag_lexical_tokens(text)
+    stop_hit = any(t.lower() in _HASHTAG_SENTENCE_STOPWORDS for t in tokens)
+    sentence_like = stop_hit or len(tokens) >= 4
+    if sentence_like and len(tokens) >= 2:
+        out: list[str] = []
+        seen: set[str] = set()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            low = tok.lower()
+            if low in _HASHTAG_SENTENCE_STOPWORDS:
+                i += 1
+                continue
+            nxt = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
+            if (
+                low in _CITY_PREFIX_TOKENS
+                and nxt
+                and nxt not in _HASHTAG_SENTENCE_STOPWORDS
+            ):
+                joined = sanitize_hashtag_body(tok + tokens[i + 1], max_len=max_len)
+                if joined and joined not in seen and len(joined) >= 6:
+                    seen.add(joined)
+                    out.append(joined)
+                    i += 2
+                    continue
+            body = sanitize_hashtag_body(tok, max_len=max_len)
+            keep = (
+                bool(body)
+                and body not in seen
+                and body not in _HASHTAG_SENTENCE_CRUMBS
+                and body not in _HASHTAG_SENTENCE_STOPWORDS
+                and (
+                    any(c.isupper() for c in tok)
+                    or len(body) >= 6
+                )
+            )
+            if keep:
+                seen.add(body)
+                out.append(body)
+            i += 1
+        return out
+    mashed = sanitize_hashtag_body(text, max_len=max_len)
+    if not mashed:
+        return []
+    if is_mashed_sentence_hashtag(mashed):
+        return []
+    return [text]
+
+
 def expand_geo_runon_hashtag(body: str | None, *, max_len: int = 50) -> list[str]:
     """Split city+state run-ons into separate discovery tags.
 
@@ -321,7 +455,12 @@ def expand_geo_runon_hashtag(body: str | None, *, max_len: int = 50) -> list[str
                 return [city[:max_len], state_slug]
     # city + 2-letter abbr (lasvegasnv). Require a long stem so short brands and
     # given names ending in state letters (angelica→ca, veronica→ca) stay intact.
-    if len(slug) >= 10:
+    # Skip English compounds that merely end in a state abbr (*ride → delaware).
+    if (
+        len(slug) >= 10
+        and not _GEO_ABBR_ENGLISH_COLLISION_RE.search(slug)
+        and slug[-2:] not in _HIGH_COLLISION_STATE_ABBR
+    ):
         abbr = slug[-2:]
         state_slug = _US_ABBR_TO_STATE_SLUG.get(abbr)
         if state_slug:
@@ -332,17 +471,20 @@ def expand_geo_runon_hashtag(body: str | None, *, max_len: int = 50) -> list[str
 
 
 def normalize_hashtag_bodies(raw_tags: list[str] | None, *, max_len: int = 50) -> list[str]:
-    """Sanitize + expand geo run-ons + split multi-entity sources; dedupe keep order."""
+    """Sanitize + split sentence/geo/entity run-ons; dedupe keep order."""
     out: list[str] = []
     seen: set[str] = set()
     for raw in raw_tags or []:
         for phrase in split_hashtag_source_phrases(str(raw)):
-            for piece in expand_geo_runon_hashtag(phrase, max_len=max_len):
-                body = sanitize_hashtag_body(piece, max_len=max_len)
-                if not body or body in seen:
-                    continue
-                seen.add(body)
-                out.append(body)
+            for clause in expand_sentence_runon_hashtag(phrase, max_len=max_len):
+                for piece in expand_geo_runon_hashtag(clause, max_len=max_len):
+                    body = sanitize_hashtag_body(piece, max_len=max_len)
+                    if not body or body in seen:
+                        continue
+                    if is_mashed_sentence_hashtag(body):
+                        continue
+                    seen.add(body)
+                    out.append(body)
     return out
 
 

@@ -1968,9 +1968,23 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except asyncio.TimeoutError:
                 logger.warning(f"[{upload_id}] Video intelligence timed out after {STAGE_TIMEOUT_VI}s")
                 _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": "timeout"})
+                try:
+                    from stages.video_intelligence_stage import record_video_intelligence_status
+
+                    record_video_intelligence_status(ctx, status="timeout", reason="timeout")
+                    await _persist_diag_artifacts_now("video_intelligence_status")
+                except Exception:
+                    pass
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
                 _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
+                try:
+                    from stages.video_intelligence_stage import record_video_intelligence_status
+
+                    record_video_intelligence_status(ctx, status="skipped", reason=str(e.reason or e))
+                    await _persist_diag_artifacts_now("video_intelligence_status")
+                except Exception:
+                    pass
                 if (
                     _google_multimodal_strict_enabled()
                     and VIDEO_INTELLIGENCE_STAGE_ENABLED
@@ -2161,6 +2175,17 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.debug(f"[{upload_id}] multimodal depth router skipped: {_depth_e}")
 
         try:
+            from core.vision_labels import prose_scene_beats_from_vi
+
+            _beats = prose_scene_beats_from_vi(ctx)
+            if isinstance(ctx.output_artifacts, dict):
+                ctx.output_artifacts["scene_beats_v1"] = _beats
+            if _beats:
+                await _persist_diag_artifacts_now("scene_beats_v1")
+        except Exception as _beats_e:
+            logger.debug(f"[{upload_id}] scene_beats skipped: {_beats_e}")
+
+        try:
             await db_stage.save_pipeline_manifest(
                 db_pool,
                 str(upload_id),
@@ -2220,6 +2245,32 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             })
         except Exception as _pe_e:
             logger.debug(f"[{upload_id}] place_evidence skipped: {_pe_e}")
+
+        try:
+            from stages.vision_stage import maybe_run_vision_second_pass
+
+            _sp = await maybe_run_vision_second_pass(ctx)
+            _ai_trace(ctx, upload_id, "vision_second_pass", {
+                "ok": (_sp or {}).get("ok"),
+                "skipped": (_sp or {}).get("skipped"),
+                "reason": (_sp or {}).get("reason"),
+                "frames": (_sp or {}).get("frames"),
+            })
+            if isinstance(ctx.output_artifacts, dict) and ctx.output_artifacts.get("vision_second_pass_v1"):
+                await _persist_diag_artifacts_now("vision_second_pass_v1")
+        except Exception as _sp_e:
+            logger.debug(f"[{upload_id}] vision second pass skipped: {_sp_e}")
+
+        try:
+            from core.visual_marks import collect_visual_marks
+
+            _marks = collect_visual_marks(ctx)
+            if isinstance(ctx.output_artifacts, dict):
+                ctx.output_artifacts["visual_marks_v1"] = _marks
+            if _marks:
+                await _persist_diag_artifacts_now("visual_marks_v1")
+        except Exception as _vm_e:
+            logger.debug(f"[{upload_id}] visual_marks skipped: {_vm_e}")
 
         if _multimodal_strict_gaps and isinstance(getattr(ctx, "output_artifacts", None), dict):
             ctx.output_artifacts["google_multimodal_gaps"] = json.dumps(
@@ -2372,6 +2423,20 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             )
         except Exception as _scts_e:
             logger.debug(f"[{upload_id}] scene_story/timeline build skipped: {_scts_e}")
+
+        try:
+            from core.config import HERO_WINDOW_ENABLED
+            from core.driving_evidence import has_driving_evidence
+            from core.hero_window import build_hero_window_v1
+
+            if HERO_WINDOW_ENABLED and not has_driving_evidence(ctx):
+                _hw = build_hero_window_v1(ctx)
+                if _hw and isinstance(ctx.output_artifacts, dict):
+                    ctx.output_artifacts["hero_window_v1"] = _hw
+                    await _persist_diag_artifacts_now("hero_window_v1")
+                    _ai_trace(ctx, upload_id, "hero_window", _hw)
+        except Exception as _hw_e:
+            logger.debug(f"[{upload_id}] hero_window skipped: {_hw_e}")
 
         # 24/7 scene understanding floor: when Twelve Labs skipped/failed, fuse
         # VI + Vision OCR + OSD + ACR + Whisper into video_understanding.

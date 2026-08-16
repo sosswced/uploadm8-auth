@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import httpx
 
 from core.helpers import sanitize_hashtag_body
+from services.tiktok_api import rewrite_tiktok_watch_url, tiktok_watch_url
 
 from .context import JobContext, PlatformResult
 from . import db as db_stage
@@ -785,8 +786,15 @@ def _tiktok_status_lines(ctx: JobContext, result: PlatformResult) -> List[str]:
 
 def _normalize_post_url(result: PlatformResult) -> Optional[str]:
     u = (result.platform_url or "").strip()
+    plat = (result.platform or "").lower()
+    if plat == "tiktok":
+        rewritten = rewrite_tiktok_watch_url(
+            u,
+            video_id=getattr(result, "platform_video_id", None),
+            username=getattr(result, "account_username", None),
+        )
+        return rewritten or None
     if u.startswith("http"):
-        plat = (result.platform or "").lower()
         if plat == "facebook" and "facebook.com/video/" in u and "/watch/" not in u:
             vid = getattr(result, "platform_video_id", None)
             if vid:
@@ -802,10 +810,7 @@ def _fallback_post_url(result: PlatformResult) -> Optional[str]:
     plat = (result.platform or "").lower()
     if plat == "tiktok":
         handle = getattr(result, "account_username", None) or ""
-        h = str(handle).strip().lstrip("@")
-        if h:
-            return f"https://www.tiktok.com/@{h}/video/{vid}"
-        return f"https://www.tiktok.com/video/{vid}"
+        return tiktok_watch_url(vid, handle) or None
     if plat == "youtube":
         payload = getattr(result, "response_payload", None) or {}
         if isinstance(payload, dict) and payload.get("youtube_long_form_rights_guard"):

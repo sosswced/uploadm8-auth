@@ -172,6 +172,9 @@ CONTENT_FEATURES: List[Feature] = [
     Feature("transcript_chars", "ai_transcript / audio_context length", "int", "num",
             status="experimental",
             notes="Speech coverage proxy; correlates with STT pref + auto-Whisper."),
+    Feature("clip_kind", "output_artifacts.clip_kind / multimodal_depth_route_v1", "categorical", "cat",
+            status="experimental",
+            notes="Routing enum (dashcam/concert/museum/wearable/vlog/…); not a product taxonomy. Do not train on yet."),
 
     # Engagement label inputs (kept as meta, used to build the label)
     Feature("views", "platform_results engagement", "int", "meta"),

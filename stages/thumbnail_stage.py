@@ -352,11 +352,18 @@ def _hero_fact_headlines(ctx: JobContext, category: str) -> List[str]:
     speed_conf = str(consensus.get("confidence") or "none")
     cat = (category or "general").strip().lower()
     domain_tag = top_domain_tag(identity)
+    driving_ev = False
+    try:
+        from core.driving_evidence import has_driving_evidence
+
+        driving_ev = bool(has_driving_evidence(ctx))
+    except Exception:
+        driving_ev = False
     if cat in {"automotive", "sports"}:
-        driving_domain = True
+        driving_domain = driving_ev or cat == "automotive"
     elif cat in {"", "general", "travel"}:
-        # Undetermined/travel content: trust the identity domain tags.
-        driving_domain = domain_tag in ("automotive", "driving", "motorsport")
+        # Walks/glasses: peak MPH or an automotive identity stamp is not enough.
+        driving_domain = driving_ev
     else:
         # An explicit non-driving category (gardening, food, …) blocks speed
         # even when a GPS logger recorded motion — no MPH on a garden cover.
@@ -391,6 +398,24 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
     title) back them up; CATEGORY_HEADLINE_FALLBACKS is the demoted last
     resort for uploads with no usable evidence at all.
     """
+    driving_ev = False
+    try:
+        from core.driving_evidence import has_driving_evidence
+
+        driving_ev = bool(has_driving_evidence(ctx))
+    except Exception:
+        driving_ev = False
+    if not driving_ev:
+        try:
+            from core.visual_marks import collect_visual_marks
+
+            for mark in collect_visual_marks(ctx)[:6]:
+                cleaned = clean_thumbnail_headline(str(mark.get("text") or ""), max_words=4)
+                if cleaned and not is_generic_thumbnail_headline(cleaned):
+                    return cleaned
+        except Exception:
+            pass
+
     hero = _hero_fact_headlines(ctx, category)
     if hero:
         return hero[0]
@@ -1038,12 +1063,19 @@ def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict
     return None, opts
 
 
-def effective_thumbnail_category(us: Dict[str, Any], detected_category: str) -> str:
+def effective_thumbnail_category(
+    us: Dict[str, Any],
+    detected_category: str,
+    filename: str = "",
+) -> str:
     """Prefer saved Studio default audience/niche over auto-detected category.
 
     "general" in the Studio dropdown means Auto — identity-driven detection
     wins. Any specific niche is a hard user override of the layout bucket
     (never of the identity descriptor itself, which prompts always receive).
+
+    Meta Glasses exports ignore a leftover automotive Studio niche so a
+    forgotten dashcam default cannot stomp a downtown/sports walk.
     """
     strategy = _thumbnail_default_strategy(us)
     niche = str(strategy.get("audience_niche") or "").strip()
@@ -1052,6 +1084,13 @@ def effective_thumbnail_category(us: Dict[str, Any], detected_category: str) -> 
 
         normalized = normalize_niche(niche, default=detected_category or "general")
         if normalized != "general":
+            try:
+                from core.wearable_source import is_meta_glasses_filename
+
+                if normalized == "automotive" and is_meta_glasses_filename(filename):
+                    return (detected_category or "general").strip().lower() or "general"
+            except Exception:
+                pass
             return normalized
     return (detected_category or "general").strip().lower() or "general"
 
@@ -1383,7 +1422,9 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         category = _detect_category(ctx)
         category_source = "thumbnail_detector"
 
-    category = effective_thumbnail_category(us, category)
+    category = effective_thumbnail_category(
+        us, category, filename=str(getattr(ctx, "filename", "") or "")
+    )
     if category_source == "thumbnail_detector" and _thumbnail_default_strategy(us).get(
         "audience_niche"
     ):
@@ -1471,6 +1512,30 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 "Thumbnail: prepending VI keyframe at %.2fs (object/logo/person peak)",
                 vi_keyframe_offset,
             )
+
+    try:
+        from core.config import HERO_WINDOW_ENABLED
+        from core.driving_evidence import has_driving_evidence
+
+        if HERO_WINDOW_ENABLED and not has_driving_evidence(ctx):
+            arts = getattr(ctx, "output_artifacts", None) or {}
+            hw = arts.get("hero_window_v1") if isinstance(arts, dict) else None
+            if isinstance(hw, dict):
+                try:
+                    hero_t = float(hw.get("t_seconds") or 0)
+                except (TypeError, ValueError):
+                    hero_t = 0.0
+                if hero_t > 0:
+                    existing = [round(o, 2) for o in offsets]
+                    if round(hero_t, 2) not in existing:
+                        offsets = [hero_t] + offsets
+                        logger.info(
+                            "Thumbnail: prepending hero_window_v1 at %.2fs (%s)",
+                            hero_t,
+                            hw.get("label") or hw.get("kind"),
+                        )
+    except Exception as hw_e:
+        logger.debug("Thumbnail: hero window offset skipped (non-fatal): %s", hw_e)
 
     logger.debug(f"Thumbnail offsets: {[f'{o:.1f}s' for o in offsets]}")
 

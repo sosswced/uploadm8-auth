@@ -666,13 +666,21 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             pool.music_title = title
             pool.music_genre = genre
 
-    # ── Garage / Trill vehicle ───────────────────────────────────────────
-    make = getattr(ctx, "vehicle_make_name", None)
-    model = getattr(ctx, "vehicle_model_name", None)
-    if isinstance(make, str) and make.strip():
-        pool.vehicle_make = make.strip()
-    if isinstance(model, str) and model.strip():
-        pool.vehicle_model = model.strip()
+    # ── Garage / Trill vehicle — only on real driving evidence ───────────
+    driving_ev = False
+    try:
+        from core.driving_evidence import has_driving_evidence
+
+        driving_ev = bool(has_driving_evidence(ctx))
+    except Exception:
+        driving_ev = False
+    if driving_ev:
+        make = getattr(ctx, "vehicle_make_name", None)
+        model = getattr(ctx, "vehicle_model_name", None)
+        if isinstance(make, str) and make.strip():
+            pool.vehicle_make = make.strip()
+        if isinstance(model, str) and model.strip():
+            pool.vehicle_model = model.strip()
 
     # ── Whisper / transcript ────────────────────────────────────────────
     transcript = (getattr(ctx, "ai_transcript", "") or "").strip()

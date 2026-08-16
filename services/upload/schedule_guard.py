@@ -173,11 +173,16 @@ async def build_smart_schedule_for_upload(
     random_seed: Optional[str] = None,
     user_timezone: Optional[str] = None,
     extra_day_occupancy: Optional[Dict[int, int]] = None,
+    base_day_occupancy: Optional[Dict[int, int]] = None,
+    hour_weights_by_platform: Optional[Dict[str, List[float]]] = None,
 ) -> Dict[str, datetime]:
     """Return per-platform UTC slots (lowercase keys) for every requested platform.
 
     ``extra_day_occupancy`` merges with DB occupancy (used by batch preview so
     sibling videos deconflict before rows exist).
+
+    ``base_day_occupancy`` / ``hour_weights_by_platform`` skip repeated DB reads
+    when the caller already loaded them once (batch preview).
     """
     plats = normalize_platform_list(platforms)
     if not plats:
@@ -187,9 +192,20 @@ async def build_smart_schedule_for_upload(
 
     num_days = clamp_smart_schedule_days(num_days)
     tz = user_timezone or await _user_timezone(conn, user_id)
-    occupancy = await get_existing_scheduled_days(
-        conn, user_id, num_days, exclude_upload_id=exclude_upload_id
-    )
+    if base_day_occupancy is not None:
+        occupancy: Dict[int, int] = {}
+        for k, v in dict(base_day_occupancy).items():
+            try:
+                offset = int(k)
+                count = int(v)
+            except (TypeError, ValueError):
+                continue
+            if offset >= 1 and count > 0:
+                occupancy[offset] = count
+    else:
+        occupancy = await get_existing_scheduled_days(
+            conn, user_id, num_days, exclude_upload_id=exclude_upload_id
+        )
     if extra_day_occupancy:
         for k, v in extra_day_occupancy.items():
             try:
@@ -199,15 +215,32 @@ async def build_smart_schedule_for_upload(
                 continue
             if offset >= 1 and count > 0:
                 occupancy[offset] = occupancy.get(offset, 0) + count
-    schedule = await calculate_smart_schedule_data_driven(
-        conn,
-        user_id,
-        plats,
-        num_days=num_days,
-        day_occupancy=occupancy or None,
-        user_timezone=tz,
-        random_seed=random_seed,
-    )
+
+    if hour_weights_by_platform:
+        weights = {
+            str(p).strip().lower(): list(w)
+            for p, w in hour_weights_by_platform.items()
+            if p and w is not None
+        }
+        schedule = calculate_smart_schedule(
+            plats,
+            num_days=num_days,
+            user_timezone=tz,
+            hour_weights_by_platform=weights or None,
+            hour_weights_are_local=True,
+            day_occupancy=occupancy or None,
+            random_seed=random_seed,
+        )
+    else:
+        schedule = await calculate_smart_schedule_data_driven(
+            conn,
+            user_id,
+            plats,
+            num_days=num_days,
+            day_occupancy=occupancy or None,
+            user_timezone=tz,
+            random_seed=random_seed,
+        )
     if not schedule:
         logger.warning(
             "smart_schedule data-driven empty for user=%s platforms=%s — using static priors",

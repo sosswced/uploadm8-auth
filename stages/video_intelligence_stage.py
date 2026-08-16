@@ -167,17 +167,69 @@ VI_PERSON_CONF_MIN = float(os.environ.get("VIDEO_INTELLIGENCE_PERSON_CONF_MIN", 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gvi")
 
 
+def record_video_intelligence_status(
+    ctx: JobContext,
+    *,
+    status: str,
+    reason: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist VI skip/ok/error so admin is not silent when the stage never lands."""
+    import json
+
+    payload: Dict[str, Any] = {"status": str(status or "unknown")}
+    if reason:
+        payload["reason"] = str(reason)[:2000]
+    if extra:
+        payload.update(extra)
+    if not isinstance(getattr(ctx, "output_artifacts", None), dict):
+        ctx.output_artifacts = {}
+    try:
+        ctx.output_artifacts["video_intelligence_status"] = json.dumps(payload, default=str)[:4000]
+    except Exception:
+        ctx.output_artifacts["video_intelligence_status"] = str(payload)[:4000]
+    setattr(ctx, "video_intelligence_status", payload)
+
+
+def watchable_proxy_failure_reason(
+    *,
+    needs_hevc_proxy: bool,
+    size: int,
+    max_bytes: int,
+    proxy_ok: bool,
+) -> Optional[str]:
+    """Why inline VI must skip when the H.264 watch proxy did not land."""
+    if proxy_ok:
+        return None
+    if size > max_bytes:
+        return (
+            f"Video too large for inline Video Intelligence ({size} bytes > {max_bytes}); "
+            "set VIDEO_INTELLIGENCE_INPUT_URI to gs://... or raise VIDEO_INTELLIGENCE_MAX_BYTES"
+        )
+    if needs_hevc_proxy:
+        return (
+            "HEVC/MOV H.264 proxy failed; skipping inline Video Intelligence "
+            "(do not send original HEVC bytes)"
+        )
+    return None
+
+
 def _ctx_duration_sec(ctx: JobContext) -> Optional[float]:
     vi = getattr(ctx, "video_info", None)
-    if not isinstance(vi, dict):
-        return None
-    d = vi.get("duration")
-    if d is None:
-        return None
-    try:
-        return float(d)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(vi, dict):
+        d = vi.get("duration")
+        if d is not None:
+            try:
+                return float(d)
+            except (TypeError, ValueError):
+                pass
+    raw = getattr(ctx, "duration_seconds", None)
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _resolve_gcp_credentials_path() -> Optional[Path]:
@@ -627,15 +679,20 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
         default=False,
         allowed_services=tier_allowed_set,
     ):
+        record_video_intelligence_status(
+            ctx, status="skipped", reason="Video Intelligence disabled in upload preferences"
+        )
         raise SkipStage("Video Intelligence disabled in upload preferences (aiServiceVideoAnalyzer)")
 
     dur = _ctx_duration_sec(ctx)
     if VIDEO_INTELLIGENCE_MAX_DURATION_SEC > 0:
         if dur is not None and dur > VIDEO_INTELLIGENCE_MAX_DURATION_SEC:
-            raise SkipStage(
+            reason = (
                 f"Video Intelligence skipped (duration {dur:.0f}s > "
                 f"{VIDEO_INTELLIGENCE_MAX_DURATION_SEC:.0f}s VIDEO_INTELLIGENCE_MAX_DURATION_SEC)"
             )
+            record_video_intelligence_status(ctx, status="skipped", reason=reason)
+            raise SkipStage(reason)
     if dur is not None and dur > _GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC:
         logger.warning(
             "[video_intelligence] duration=%.0fs exceeds Google annotate ~%ds limit; "
@@ -647,10 +704,12 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     creds_obj = _gcp_creds_for_vi()
     creds_path = _resolve_gcp_credentials_path()
     if not creds_obj and not creds_path:
-        raise SkipStage(
+        reason = (
             "GCP credentials not configured for Video Intelligence (same as Vision: "
             "GOOGLE_APPLICATION_CREDENTIALS or social-media-up-*.json in repo root)"
         )
+        record_video_intelligence_status(ctx, status="skipped", reason=reason)
+        raise SkipStage(reason)
 
     if creds_path and not (os.environ.get("GCP_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_CREDENTIALS_JSON")):
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
@@ -697,11 +756,19 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
             video_path = Path(candidate)
             break
     if not video_path:
+        record_video_intelligence_status(ctx, status="skipped", reason="No local video file")
         raise SkipStage("No local video file for Video Intelligence")
 
     size = video_path.stat().st_size
     vi_input_path = video_path
-    if size > VIDEO_INTELLIGENCE_MAX_BYTES:
+    needs_hevc_proxy = False
+    try:
+        from core.wearable_source import source_needs_h264_proxy
+
+        needs_hevc_proxy = bool(source_needs_h264_proxy(ctx, video_path))
+    except Exception:
+        needs_hevc_proxy = False
+    if size > VIDEO_INTELLIGENCE_MAX_BYTES or needs_hevc_proxy:
         proxy = await _build_vi_inline_proxy(
             video_path,
             max_bytes=VIDEO_INTELLIGENCE_MAX_BYTES,
@@ -710,28 +777,37 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
         if proxy and proxy.exists():
             vi_input_path = proxy
             logger.info(
-                "[video_intelligence] inline proxy %s (%.1f MB -> %.1f MB)",
+                "[video_intelligence] inline proxy %s (%.1f MB -> %.1f MB hevc=%s)",
                 proxy.name,
                 size / (1024 * 1024),
                 proxy.stat().st_size / (1024 * 1024),
+                needs_hevc_proxy,
             )
         else:
-            raise SkipStage(
-                f"Video too large for inline Video Intelligence ({size} bytes > {VIDEO_INTELLIGENCE_MAX_BYTES}); "
-                "set VIDEO_INTELLIGENCE_INPUT_URI to gs://... or raise VIDEO_INTELLIGENCE_MAX_BYTES"
+            reason = watchable_proxy_failure_reason(
+                needs_hevc_proxy=needs_hevc_proxy,
+                size=size,
+                max_bytes=VIDEO_INTELLIGENCE_MAX_BYTES,
+                proxy_ok=False,
             )
+            if reason:
+                record_video_intelligence_status(ctx, status="skipped", reason=reason)
+                raise SkipStage(reason)
 
     try:
         video_bytes = vi_input_path.read_bytes()
     except (OSError, PermissionError) as e:
+        record_video_intelligence_status(ctx, status="skipped", reason=f"Cannot read video file: {e}")
         raise SkipStage(f"Cannot read video file: {e}") from e
 
     if len(video_bytes) > VIDEO_INTELLIGENCE_MAX_BYTES:
-        raise SkipStage(
+        reason = (
             f"Video too large for inline Video Intelligence ({len(video_bytes)} bytes > "
             f"{VIDEO_INTELLIGENCE_MAX_BYTES}); set VIDEO_INTELLIGENCE_INPUT_URI to gs://... "
             "or raise VIDEO_INTELLIGENCE_MAX_BYTES"
         )
+        record_video_intelligence_status(ctx, status="skipped", reason=reason)
+        raise SkipStage(reason)
 
     try:
         data = await loop.run_in_executor(
@@ -740,6 +816,15 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
         )
         ctx.video_intelligence_context = data
         _publish_recognition_to_ctx(ctx, data)
+        record_video_intelligence_status(
+            ctx,
+            status="ok",
+            extra={
+                "objects": len(data.get("object_tracks") or []),
+                "logos": len(data.get("logos") or []),
+                "text": len(data.get("on_screen_text") or []),
+            },
+        )
         logger.info(
             "[video_intelligence] inline labels=%d shots=%d objects=%d text=%d persons=%d logos=%d",
             len(data.get("segment_labels") or []),
@@ -752,6 +837,7 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     except asyncio.CancelledError:
         raise
     except Exception as e:
+        record_video_intelligence_status(ctx, status="failed", reason=str(e)[:2000])
         logger.warning("[video_intelligence] Non-fatal error: %s", e)
         append_provider_error(
             ctx,

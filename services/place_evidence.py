@@ -38,6 +38,16 @@ _STADIUM_RE = re.compile(
     r"(Stadium|Arena|Ballpark|Coliseum|Fieldhouse|Speedway)\b",
     re.I,
 )
+_HARBOR_RE = re.compile(
+    r"\b([A-Z][A-Za-z'&.\-]+(?:\s+[A-Z][A-Za-z'&.\-]+){0,3}\s+)?"
+    r"(Harbor|Harbour|Port|Marina)\b",
+    re.I,
+)
+_PLAZA_RE = re.compile(
+    r"\b([A-Z][A-Za-z'&.\-]+(?:\s+[A-Z][A-Za-z'&.\-]+){0,3}\s+)?"
+    r"(Plaza|Plaça|Placa|Fountain|Font)\b",
+    re.I,
+)
 
 # Common pro / college team tokens (OCR / logos / transcript). Extend carefully.
 _TEAM_TOKENS = frozenset(
@@ -242,6 +252,7 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
 
     transcript_places: List[str] = []
     transcript_orgs: List[str] = []
+    transcript_topics: List[str] = []
     ac = getattr(ctx, "audio_context", None) or {}
     if isinstance(ac, dict):
         structured = ac.get("transcript_structured") or {}
@@ -250,12 +261,24 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
             if isinstance(ne, dict):
                 transcript_places = [str(x).strip() for x in (ne.get("places") or []) if str(x).strip()]
                 transcript_orgs = [str(x).strip() for x in (ne.get("organizations") or []) if str(x).strip()]
+            transcript_topics = [str(x).strip() for x in (structured.get("topics") or []) if str(x).strip()]
+
+    speech_blob = " ".join(
+        [
+            str(getattr(ctx, "ai_transcript", None) or ""),
+            str(ac.get("transcript") or "") if isinstance(ac, dict) else "",
+            " ".join(transcript_orgs),
+            " ".join(transcript_topics),
+        ]
+    )
 
     beaches = _extract_regex_places(ocr, _BEACH_RE)
     monuments = _extract_regex_places(ocr, _MONUMENT_RE)
     stadiums = _extract_regex_places(ocr, _STADIUM_RE)
+    harbors = _extract_regex_places(ocr, _HARBOR_RE)
+    plazas = _extract_regex_places(ocr, _PLAZA_RE)
     plates = _extract_license_plates(ocr)
-    teams = _extract_teams(ocr + " " + " ".join(transcript_orgs), logos)
+    teams = _extract_teams(ocr + " " + speech_blob, logos)
 
     # Landmark names that look like beaches/monuments
     for lm in landmarks:
@@ -267,20 +290,26 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
             monuments.append(name)
         if any(tok in low for tok in ("stadium", "arena", "ballpark")):
             stadiums.append(name)
+        if any(tok in low for tok in ("harbor", "harbour", "port", "marina")):
+            harbors.append(name)
+        if any(tok in low for tok in ("plaza", "plaça", "fountain")):
+            plazas.append(name)
 
     places = _uniq(
         [str(lm.get("name") or "") for lm in landmarks]
         + transcript_places
         + beaches
         + monuments
-        + stadiums,
+        + stadiums
+        + harbors
+        + plazas,
         limit=16,
     )
 
     sources: List[str] = []
     if landmarks:
         sources.append("vision_landmark")
-    if beaches or monuments or stadiums or plates:
+    if beaches or monuments or stadiums or plates or harbors or plazas:
         sources.append("ocr")
     if transcript_places:
         sources.append("transcript")
@@ -297,6 +326,8 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
         "beaches": _uniq(beaches, limit=8),
         "monuments": _uniq(monuments, limit=8),
         "stadiums": _uniq(stadiums, limit=8),
+        "harbors": _uniq(harbors, limit=8),
+        "plazas": _uniq(plazas, limit=8),
         "license_plates": plates,
         "sports_teams": teams,
         "logos": logos[:8],

@@ -168,6 +168,37 @@ def build_identity_evidence(ctx: Any) -> Dict[str, Any]:
         vi_ocr = vi.get("ocr_text")
         if isinstance(vi_ocr, str) and vi_ocr.strip():
             _add_token(tokens, "video_intelligence", "on_screen_text", _first_sentence(vi_ocr, max_len=100))
+        try:
+            from core.vision_labels import prose_scene_beats_from_vi
+
+            for beat in prose_scene_beats_from_vi(ctx)[:12]:
+                noun = str(beat.get("noun") or "").strip()
+                if noun:
+                    _add_token(tokens, "video_intelligence", "object", noun, max_len=80)
+        except Exception:
+            pass
+
+    try:
+        from core.visual_marks import collect_visual_marks
+
+        for mark in collect_visual_marks(ctx)[:10]:
+            text = str(mark.get("text") or "").strip()
+            if not text:
+                continue
+            src = str(mark.get("source") or "mark")
+            if src in ("vision_logo", "vi_logo"):
+                kind = "logo"
+            elif src == "landmark":
+                kind = "landmark"
+            elif src in ("ocr",):
+                kind = "on_screen_text"
+            elif src in ("speech", "transcript"):
+                kind = "place" if src == "speech" else "transcript"
+            else:
+                kind = "entity"
+            _add_token(tokens, src, kind, text, max_len=80)
+    except Exception:
+        pass
 
     # ── Audio: music ID, YAMNet, keywords ────────────────────────────────
     ac = getattr(ctx, "audio_context", None) or {}
@@ -315,8 +346,16 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
             "score": round(_group_score(g), 2),
         })
 
-    # Verified speed is a peer hero fact — only on high consensus confidence.
-    if peak_mph >= 10 and speed_conf == "high":
+    driving = False
+    try:
+        from core.driving_evidence import has_driving_evidence
+
+        driving = bool(has_driving_evidence(ctx))
+    except Exception:
+        driving = False
+
+    # Verified speed is a peer hero fact — only on high consensus + driving evidence.
+    if peak_mph >= 10 and speed_conf == "high" and driving:
         hero_facts.append({
             "text": f"{peak_mph:.0f} MPH peak (verified)",
             "class": "speed",
@@ -343,12 +382,14 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
         confidence = "low"
 
     do_not_invent: List[str] = []
-    if peak_mph >= 10 and speed_conf == "high":
+    if peak_mph >= 10 and speed_conf == "high" and driving:
         do_not_invent.append(f"the only publishable speed is {peak_mph:.0f} MPH")
-    elif peak_mph >= 10 and speed_conf == "medium":
+    elif peak_mph >= 10 and speed_conf == "medium" and driving:
         do_not_invent.append(
             f"HUD suggests ~{peak_mph:.0f} MPH but it is unverified — omit from titles"
         )
+    elif peak_mph >= 10 and not driving:
+        do_not_invent.append("motion readings are not from a vehicle HUD — never state a speed")
     else:
         do_not_invent.append("no verified speed data — never state a speed")
     vc = getattr(ctx, "vision_context", None) or {}
@@ -369,10 +410,10 @@ def build_content_identity(ctx: Any, evidence: Optional[Dict[str, Any]] = None) 
             peak_metric_candidates.append(f["text"])
     peak_metric_candidates = peak_metric_candidates[:4]
 
-    # Sensor-derived domain inference (GPS speed = a vehicle in motion) —
-    # deterministic physics, not keyword scanning. LLM tags override on merge.
+    # Sensor-derived domain inference — GPS speed alone is not a car (glasses /
+    # backpack walks). Require dashcam filename, HUD, .map points, or windshield.
     domain_tags: List[Dict[str, Any]] = []
-    if peak_mph >= 10 and speed_conf in ("high", "medium"):
+    if driving and peak_mph >= 10 and speed_conf in ("high", "medium"):
         domain_tags.append({"tag": "automotive", "confidence": 0.7})
 
     return {
@@ -466,9 +507,15 @@ def merge_llm_identity(
         fact_class = _clean(item.get("class"), max_len=20).lower()
         if fact_class not in HERO_FACT_CLASSES:
             fact_class = "entity"
-        # Speed facts are consensus-gated regardless of what the LLM says.
-        if fact_class == "speed" and not (peak_mph >= 10 and speed_conf == "high"):
-            continue
+        # Speed facts are consensus-gated and require driving evidence
+        # (deterministic layer already omitted speed without it).
+        if fact_class == "speed":
+            base_has_speed = any(
+                isinstance(f, dict) and f.get("class") == "speed"
+                for f in (base.get("hero_facts") or [])
+            )
+            if not (peak_mph >= 10 and speed_conf == "high" and base_has_speed):
+                continue
         llm_facts.append({
             "text": text,
             "class": fact_class,

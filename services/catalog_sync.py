@@ -900,7 +900,7 @@ async def _backfill_tiktok_video_ids(
     # Catalog rows with a title for this user/account
     cat_rows = await conn.fetch(
         """
-        SELECT id, platform_video_id, title, published_at, views, likes, comments, shares
+        SELECT id, platform_video_id, title, published_at, views, likes, comments, shares, platform_url
           FROM platform_content_items
          WHERE user_id = $1::uuid AND platform = 'tiktok' AND account_id = $2
            AND platform_video_id IS NOT NULL AND platform_video_id != ''
@@ -986,25 +986,27 @@ async def _backfill_tiktok_video_ids(
              for p in pr if isinstance(p, dict) and str(p.get("platform") or "").lower() == "tiktok"),
             "",
         )
-        tiktok_url = (
-            f"https://www.tiktok.com/@{uname_row}/video/{found_vid}"
-            if uname_row else
-            f"https://www.tiktok.com/video/{found_vid}"
+        from services.tiktok_api import rewrite_tiktok_watch_url
+        tiktok_url = rewrite_tiktok_watch_url(
+            str(best_cat.get("platform_url") or ""),
+            video_id=found_vid,
+            username=uname_row,
         )
 
         # Patch the platform_results entry
         if tiktok_idx >= 0:
             pr[tiktok_idx]["platform_video_id"] = found_vid
             pr[tiktok_idx]["video_id"] = found_vid
-            pr[tiktok_idx]["platform_url"] = tiktok_url
-            pr[tiktok_idx]["url"] = tiktok_url
+            if tiktok_url:
+                pr[tiktok_idx]["platform_url"] = tiktok_url
+                pr[tiktok_idx]["url"] = tiktok_url
         else:
             pr.append({
                 "platform": "tiktok",
                 "account_id": account_id,
                 "platform_video_id": found_vid,
                 "video_id": found_vid,
-                "platform_url": tiktok_url,
+                "platform_url": tiktok_url or None,
                 "success": True,
             })
 

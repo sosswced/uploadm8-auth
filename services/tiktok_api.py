@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Mapping, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -105,6 +105,79 @@ def tiktok_video_query_url() -> str:
         "https://open.tiktokapis.com/v2/video/query/"
         f"?fields={quote(TIKTOK_VIDEO_QUERY_FIELDS)}"
     )
+
+
+def tiktok_creator_handle(username: Optional[str]) -> str:
+    return str(username or "").strip().lstrip("@")
+
+
+def tiktok_watch_url(video_id: Optional[str], username: Optional[str] = None) -> str:
+    """Public watch URL that TikTok's web client will open.
+
+    ``https://www.tiktok.com/video/{id}`` (no @handle) redirects to
+    ``/404?fromUrl=/video/{id}``. Only emit ``/@handle/video/{id}``.
+    """
+    vid = str(video_id or "").strip()
+    if not vid:
+        return ""
+    handle = tiktok_creator_handle(username)
+    if not handle:
+        return ""
+    return f"https://www.tiktok.com/@{handle}/video/{vid}"
+
+
+def _tiktok_video_id_from_path(path: str) -> str:
+    parts = [p for p in str(path or "").split("/") if p]
+    lowered = [p.lower() for p in parts]
+    if "video" not in lowered:
+        return ""
+    i = lowered.index("video")
+    if i + 1 >= len(parts):
+        return ""
+    digits = "".join(ch for ch in parts[i + 1] if ch.isdigit())
+    return digits if len(digits) >= 10 else ""
+
+
+def rewrite_tiktok_watch_url(
+    url: Optional[str] = None,
+    *,
+    video_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> str:
+    """Prefer a handle-qualified watch URL; never return the 404 /video/{id} path.
+
+    Short links (vm/vt/v.tiktok.com) and existing ``/@handle/video/{id}`` URLs
+    are kept. Handle-less ``www.tiktok.com/video/{id}`` is rebuilt when a handle
+    is known, otherwise dropped.
+    """
+    raw = str(url or "").strip()
+    handle = tiktok_creator_handle(username)
+    vid = str(video_id or "").strip()
+
+    if raw:
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            parsed = None
+        host = (parsed.hostname or "").lower() if parsed else ""
+        path = parsed.path or "" if parsed else ""
+
+        if host in ("vm.tiktok.com", "vt.tiktok.com", "v.tiktok.com"):
+            return raw
+
+        if host.endswith("tiktok.com"):
+            path_l = path.lower()
+            if path_l.startswith("/@") and "/video/" in path_l:
+                return raw
+            path_vid = _tiktok_video_id_from_path(path)
+            if path_vid:
+                vid = vid or path_vid
+            if "/video/" in path_l and not path_l.startswith("/@"):
+                return tiktok_watch_url(vid, handle)
+            built = tiktok_watch_url(vid, handle)
+            return built or raw
+
+    return tiktok_watch_url(vid, handle)
 
 
 def tiktok_envelope_error(body: Any) -> Optional[str]:

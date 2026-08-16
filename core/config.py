@@ -107,6 +107,11 @@ FACT_LEDGER_ENABLED = _env_active_default_true("UPLOADM8_FACT_LEDGER")
 # When true, publish skips platforms if publishable classes remain missing after weave.
 FACT_LEDGER_STRICT = _env_truthy("UPLOADM8_FACT_LEDGER_STRICT")
 
+# Non-dashcam glasses/travel: second Vision stills at beat peaks + hero window.
+# Default on; set UPLOADM8_VISION_SECOND_PASS=false / UPLOADM8_HERO_WINDOW=false to disable.
+VISION_SECOND_PASS_ENABLED = _env_active_default_true("UPLOADM8_VISION_SECOND_PASS")
+HERO_WINDOW_ENABLED = _env_active_default_true("UPLOADM8_HERO_WINDOW")
+
 # Optional signup email confirmation (stores rows in signup_verifications).
 SIGNUP_EMAIL_VERIFICATION = _env_truthy("SIGNUP_EMAIL_VERIFICATION")
 # Legacy env: unverified users (email_verified=false) are always blocked at login, refresh,

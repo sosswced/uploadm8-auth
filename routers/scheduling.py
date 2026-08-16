@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -12,7 +12,20 @@ from pydantic import BaseModel, Field
 import core.state
 from core.deps import get_current_user_readonly
 from core.helpers import _now_utc
-from services.scheduling_preview import occupancy_from_schedule, preview_response_payload
+from core.scheduling import (
+    SMART_SCHEDULE_MAX_BATCH,
+    SMART_SCHEDULE_PREVIEW_REQUEST_MAX,
+    SMART_SCHEDULE_PREVIEW_RETURN_CAP,
+    clamp_smart_schedule_batch,
+    clamp_smart_schedule_days,
+    get_existing_scheduled_days,
+)
+from services.scheduling_preview import (
+    compact_preview_batch,
+    occupancy_from_schedule,
+    preview_response_payload,
+)
+from services.smart_schedule_insights import build_hour_weights_for_platforms_batch
 from services.upload.schedule_guard import (
     _user_timezone,
     build_smart_schedule_for_upload,
@@ -34,8 +47,8 @@ class SchedulePreviewRequest(BaseModel):
     batch_count: int = Field(
         1,
         ge=1,
-        le=100,
-        description="Number of videos in the batch (staggered seeds + packed occupancy)",
+        le=SMART_SCHEDULE_PREVIEW_REQUEST_MAX,
+        description="Requested video count. Preview compute is capped; upload N is not.",
     )
     video_labels: Optional[List[str]] = Field(
         None,
@@ -54,6 +67,9 @@ async def preview_smart_schedule(
     Pass ``seed`` (same value as presign ``smart_schedule_seed``) so preview matches final slots.
     When ``batch_count`` > 1, returns ``batch[]`` with one schedule per video using
     ``{seed}:slot-{i}`` (same stagger as upload.html / orchestrator).
+
+    Hour-weight SQL and occupancy are loaded **once** per request; per-video slots
+    only re-run pure packing so large batches stay under the browser timeout.
     """
     bill_id = str(user.get("billing_user_id") or user["id"])
     platforms = [p.strip().lower() for p in body.platforms if p and str(p).strip()]
@@ -65,11 +81,23 @@ async def preview_smart_schedule(
         raise HTTPException(503, "Database unavailable")
 
     seed = (body.seed or "").strip() or str(uuid.uuid4())
-    batch_count = int(body.batch_count or 1)
+    requested_count = max(1, int(body.batch_count or 1))
+    batch_count = clamp_smart_schedule_batch(requested_count)
     labels = list(body.video_labels or [])
+    num_days = clamp_smart_schedule_days(body.smart_schedule_days)
 
     async with pool.acquire() as conn:
         tz = await _user_timezone(conn, bill_id)
+        base_occ = await get_existing_scheduled_days(conn, bill_id, num_days)
+        hour_weights: Optional[Dict[str, List[float]]] = None
+        try:
+            hour_weights = await build_hour_weights_for_platforms_batch(
+                conn, bill_id, platforms, user_timezone=tz
+            )
+        except Exception as e:
+            logger.warning("schedule preview hour weights failed user=%s: %s", bill_id[:8], e)
+            hour_weights = None
+
         extra_occ: dict = {}
         batch_items = []
         first_smart = None
@@ -81,10 +109,12 @@ async def preview_smart_schedule(
                 conn,
                 bill_id,
                 platforms,
-                num_days=body.smart_schedule_days,
+                num_days=num_days,
                 random_seed=slot_seed,
                 user_timezone=tz,
                 extra_day_occupancy=extra_occ or None,
+                base_day_occupancy=base_occ,
+                hour_weights_by_platform=hour_weights,
             )
             if not smart:
                 raise HTTPException(
@@ -116,11 +146,18 @@ async def preview_smart_schedule(
                 first_sm = sm
 
     assert first_smart is not None and first_sm is not None
+    shown, truncated = compact_preview_batch(
+        batch_items, cap=SMART_SCHEDULE_PREVIEW_RETURN_CAP
+    )
+    truncated = truncated or requested_count > batch_count
     return preview_response_payload(
         first_smart,
         first_sm,
         seed=seed,
-        smart_schedule_days=body.smart_schedule_days,
+        smart_schedule_days=num_days,
         user_timezone=tz,
-        batch=batch_items,
+        batch=shown,
+        batch_count=requested_count,
+        occupancy=extra_occ,
+        batch_truncated=truncated,
     )

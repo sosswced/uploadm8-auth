@@ -1,8 +1,8 @@
 """
 Meta (Facebook / Instagram) OAuth scope selection and permission checks.
 
-Use META_OAUTH_MODE=minimal during App Review demos when only a subset of permissions
-is approved. Production uses full scopes after Meta approves publishing and insights.
+Use META_OAUTH_MODE=minimal only for a restricted reviewer demo. Production uses
+full scopes now that Meta has approved publishing and insights.
 
 Environment:
   META_OAUTH_MODE   full | minimal | custom (default: full)
@@ -30,12 +30,13 @@ _SCOPES_INSTAGRAM_FULL = (
     "business_management"
 )
 
+# Production: publishing + insights + listing (Meta App Review approved).
+# Do not request publish_video — Meta defines that as LIVE streaming only.
 _SCOPES_FACEBOOK_FULL = (
     "pages_manage_posts,"
     "pages_read_engagement,"
     "pages_read_user_content,"
     "pages_show_list,"
-    "publish_video,"
     "read_insights"
 )
 
@@ -124,17 +125,20 @@ def require_instagram_publish(token_data: dict) -> Optional[str]:
     if g is False:
         return (
             "Instagram publishing requires instagram_content_publish (not granted on this connection). "
-            "Approve the permission in Meta App Review and reconnect with META_OAUTH_MODE=full, "
-            "or use a developer/tester account with advanced access."
+            "Reconnect Instagram in Connected Accounts to grant the approved permission."
         )
     return None
 
 
 def require_facebook_publish(token_data: dict) -> Optional[str]:
-    g = meta_permission_granted_from_blob(token_data, "publish_video")
-    if g is False:
+    """Page VOD/Reels use pages_manage_posts. publish_video is live-streaming only."""
+    posts = meta_permission_granted_from_blob(token_data, "pages_manage_posts")
+    live_stream = meta_permission_granted_from_blob(token_data, "publish_video")
+    if posts is True or live_stream is True:
+        return None
+    if posts is False:
         return (
-            "Facebook publishing requires publish_video (not granted on this connection). "
-            "Approve the permission in Meta App Review and reconnect with META_OAUTH_MODE=full."
+            "Facebook publishing requires pages_manage_posts (not granted on this connection). "
+            "Reconnect Facebook in Connected Accounts to grant the approved Page publish permission."
         )
     return None

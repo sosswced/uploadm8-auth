@@ -188,8 +188,9 @@ async def meta_oauth_config():
         "instagram_scope": meta_instagram_oauth_scope(),
         "facebook_scope": meta_facebook_oauth_scope(),
         "notes": (
-            "META_OAUTH_MODE=minimal requests only pages_show_list, pages_read_engagement, business_management "
-            "for reviewer login and listing Pages; publishing and most insights require full mode after approval."
+            "META_OAUTH_MODE=full is production (Meta-approved publish + insights). "
+            "minimal requests only pages_show_list, pages_read_engagement, business_management "
+            "for a restricted reviewer demo. Facebook Page video uses pages_manage_posts, not publish_video."
         ),
     }
 

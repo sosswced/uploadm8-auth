@@ -95,8 +95,8 @@ def instagram_account_degraded_live(
         "analytics_source": "insufficient_scope",
         "analytics_note": (
             "Instagram media list is not available with the current token "
-            f"(HTTP {http_status}). Approve instagram_basic (and insights scopes as needed) "
-            "and reconnect, or use META_OAUTH_MODE=full."
+            f"(HTTP {http_status}). Reconnect Instagram in Connected Accounts "
+            "so Meta can grant instagram_basic and insights permissions."
         ),
         "views": 0,
         "likes": 0,

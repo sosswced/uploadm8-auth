@@ -295,7 +295,6 @@ OAUTH_CONFIG = {
             "pages_read_engagement,"
             "pages_read_user_content,"
             "pages_show_list,"
-            "publish_video,"
             "read_insights"
         ),
     },

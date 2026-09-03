@@ -427,6 +427,58 @@ def build():
         "Instagram insights separately for every post."
     )
 
+    pdf.h1("5b. Approved Usage guidelines (paste into App Review)")
+    pdf.body(
+        "Meta Allowed Usage is at developers.facebook.com/docs/permissions. "
+        "Each note below quotes Allowed Usage, then UploadM8's in-bounds use. "
+        "Rate limiting is required for Graph API (Platform and Business Use Case)."
+    )
+    pdf.h3("pages_manage_posts")
+    pdf.paste(
+        "Official Allowed Usage: Publish a post, photo, or video to your Page. "
+        "Update a post, photo, or video on your Page. Delete a post, photo, or video on your Page.\n\n"
+        "UploadM8 use: After an explicit Publish click, we publish a recorded video to the Page "
+        "the user administers via POST /{page-id}/videos (organic Page video / Reel).\n"
+        "We do not live-stream (publish_video), run ads, or post to Pages the user does not manage."
+    )
+    pdf.h3("pages_show_list")
+    pdf.paste(
+        "Official Allowed Usage: Show a person the list of Pages they manage. "
+        "Verify that a person manages a Page.\n\n"
+        "UploadM8 use: GET /me/accounts at Connect Facebook/Instagram to verify the Page and store a Page token. "
+        "Requested as a dependency of pages_manage_posts."
+    )
+    pdf.h3("pages_read_engagement")
+    pdf.paste(
+        "Official Allowed Usage: Get content posted by your Page. Get metadata about your Page. "
+        "Get names, PSIDs, and profile pictures of your Page followers.\n\n"
+        "UploadM8 use: Page follower metadata and Page-owned video engagement in Analytics for the connected Page. "
+        "We do not use follower PSIDs for ads."
+    )
+    pdf.h3("pages_read_user_content")
+    pdf.paste(
+        "Official Allowed Usage: Get user generated content on your Page. Get posts that your Page is tagged in. "
+        "Delete comments posted by users on your Page.\n\n"
+        "UploadM8 use: GET /{page-id}/videos to list the Page owner's videos in Analytics. "
+        "We do not delete comments or scrape other Pages."
+    )
+    pdf.h3("read_insights")
+    pdf.paste(
+        "Official Allowed Usage: Integrate Facebook's app, page or domain insights into your own analytics tools.\n\n"
+        "UploadM8 use: Show Page video insights (views/engagement) in the owner's Analytics dashboard only. "
+        "We do not sell or share insights with other customers."
+    )
+    pdf.h3("Rate limiting (Graph API)")
+    pdf.paste(
+        "UploadM8 respects Graph API rate limits "
+        "(https://developers.facebook.com/docs/graph-api/overview/rate-limiting).\n"
+        "Page publish uses a Page access token (Business Use Case limits). "
+        "Outbound Graph calls are gated (concurrent + spacing). "
+        "We treat HTTP 429 and Graph error codes 4, 17, 32, and 613 as PLATFORM_RATE_LIMIT "
+        "and do not retry-storm. Analytics reads are batched (recent videos only). "
+        "We monitor X-App-Usage / X-Business-Use-Case-Usage when present."
+    )
+
     # SECTION 6 narration
     pdf.h1("6. Spoken narration (optional but recommended)")
     pdf.body("If you record voiceover, keep it slow and literal:")

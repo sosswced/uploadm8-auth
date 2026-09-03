@@ -428,6 +428,21 @@ def card_thumbnail_url(
         posted_platform_thumbnail_urls_from_results(platform_results_norm),
     )
 
+    # Custom / Pikzels R2 cover wins over YouTube auto hqdefault so the
+    # dashboard shows the Studio thumb the user paid to generate.
+    if first_verified_thumbnail_r2_key(
+        thumbnail_r2_key=thumbnail_r2_key,
+        output_artifacts=output_artifacts,
+        platform_results=platform_results_norm,
+        upload_platforms=platforms_list,
+    ):
+        sk = str(thumbnail_r2_key or "").strip()
+        if sk and presign_r2_thumbnails:
+            r2_thumb_url = presign_upload_thumbnail_r2_key(sk, expires_in=3600)
+            if r2_thumb_url:
+                return browser_safe_thumbnail_url(r2_thumb_url)
+        return upload_card_thumbnail_href(uid) if uid else None
+
     posted_direct = browser_safe_thumbnail_url(
         pick_primary_thumbnail_url(
             posted=posted_urls,
@@ -455,14 +470,6 @@ def card_thumbnail_url(
     )
     if fallback:
         return fallback
-
-    if first_verified_thumbnail_r2_key(
-        thumbnail_r2_key=thumbnail_r2_key,
-        output_artifacts=output_artifacts,
-        platform_results=platform_results_norm,
-        upload_platforms=platforms_list,
-    ):
-        return upload_card_thumbnail_href(uid) if uid else None
     return None
 
 

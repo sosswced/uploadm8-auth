@@ -217,6 +217,13 @@ def test_m8_brief_and_must_use_prefer_sample_speeds():
     sg = {
         "platforms": ["youtube"],
         "hydration_story": "Logandale run with Fetty Wap.",
+        # Consensus already series-capped — never trust raw OSD 154 into must_use.
+        "speed_consensus": {
+            "peak_mph": 92.0,
+            "candidate_peak_mph": 92.0,
+            "confidence": "high",
+            "source": "osd+series_cap",
+        },
         "dashcam_osd": {
             "max_speed_mph": 154.0,
             "speed_series": osd["speed_series"],
@@ -445,6 +452,279 @@ def test_vi_label_dump_never_enters_title_or_caption_anchor():
     assert "66mphcwalker" not in [t.lower() for t in (ctx.ai_hashtags or [])]
     assert "car" not in [t.lower() for t in (ctx.ai_hashtags or [])]
     assert report.get("title_anchor")
+
+
+def test_creative_voice_title_soft_injects_mph_not_formula_wipe():
+    """Persona title with place/music must keep voice; only prepend trusted MPH."""
+    from services.hydration_enforcer import enforce_hydration
+
+    creative = "Night cabin hush through San Francisco with Famous Dex on the stereo"
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=117.0,
+            avg_speed_mph=90.0,
+            location_city="San Francisco",
+            location_state="California",
+            location_country="US",
+            location_road=None,
+            gazetteer_place_name="San Francisco",
+            padus_unit_name=None,
+            near_padus=False,
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "Famous Dex",
+            "music_title": "Japan",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={},
+        filename="clip.mp4",
+        thumbnail_category="automotive",
+        ai_title=creative,
+        ai_caption=creative + ". Another line keeps the cabin quiet.",
+        ai_hashtags=["sanfrancisco", "famousdex"],
+        m8_platform_captions={"youtube": creative + ". Another line keeps the cabin quiet."},
+        m8_platform_titles={"youtube": creative},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="test-voice-title-soft-mph",
+        user_settings={"captionVoice": "cinematic_narrator", "captionStyle": "story"},
+    )
+    report = enforce_hydration(ctx)
+    yt = ctx.m8_platform_titles.get("youtube") or ctx.ai_title or ""
+    assert "117" in yt
+    assert "San Francisco" in yt
+    assert "Famous Dex" in yt or "cabin" in yt.lower() or "hush" in yt.lower()
+    # Must not collapse to compact evidence formula as the whole title.
+    assert yt.strip() != "117 MPH through San Francisco, CA — with Famous Dex"
+    assert " · " not in yt
+    assert report.get("rewrote_title") is True
+
+
+def test_llm_prose_title_survives_hydration_no_speed_persona():
+    """Caption-stage LLM title must not be wiped to Through-Place compact.
+
+    Live regression: upload 23a3eb23 had ai_title ``Livermore Chill with A Boogie``
+    then hydration replaced it with ``Through Livermore, CA — with A Boogie…``.
+    """
+    from services.hydration_enforcer import enforce_hydration
+    from services.m8_grounding_pass import is_formula_stub_caption
+
+    llm_title = "Livermore Chill with A Boogie"
+    llm_caption = (
+        "Soaking in the night vibes near Livermore — A Boogie Wit da Hoodie "
+        "keeps the cabin loose while the radio host energy stays chaotic."
+    )
+    assert not is_formula_stub_caption(llm_title)
+
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=None,
+            avg_speed_mph=None,
+            location_city="Livermore",
+            location_state="California",
+            location_country="US",
+            location_road=None,
+            gazetteer_place_name="Livermore",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Livermore, California",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "A Boogie Wit da Hoodie",
+            "music_title": "Still Thinking",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={
+            "scene_description": "Night drive vibes near Livermore with A Boogie.",
+        },
+        filename="20250228_0029_CAM.MP4",
+        thumbnail_category="automotive",
+        ai_title=llm_title,
+        ai_caption=llm_caption,
+        ai_hashtags=["livermore", "aboogie"],
+        m8_platform_captions={"facebook": llm_caption},
+        m8_platform_titles={"facebook": llm_title},
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="23a3eb23-llm-title-keep",
+        user_settings={
+            "captionStyle": "punchy",
+            "captionTone": "chaotic",
+            "captionVoice": "radio_host",
+        },
+    )
+    report = enforce_hydration(ctx)
+    assert report.get("persona_required") is True
+    fb = (ctx.m8_platform_titles or {}).get("facebook") or ctx.ai_title or ""
+    assert "Livermore" in fb
+    assert "Boogie" in fb
+    assert not is_formula_stub_caption(fb), f"title collapsed to receipt: {fb!r}"
+    assert "Through Livermore" not in fb
+    assert fb.strip() == llm_title or (
+        "Chill" in fb and "Boogie" in fb and not fb.strip().startswith("Through ")
+    )
+
+
+def test_9020642f_receipt_title_caption_rewritten_under_persona():
+    """Compact timeline + recorded-in caption must not survive punchy/cinematic/teacher."""
+    from services.hydration_enforcer import enforce_hydration
+    from services.m8_grounding_pass import is_formula_stub_caption
+
+    receipt_title = "128 MPH through Allendale, CA — with iLoveMakonnen"
+    receipt_caption = (
+        "128 MPH recorded in Allendale, California. "
+        "C Walker drives with 'Maneuvering' by iLoveMakonnen"
+    )
+    assert is_formula_stub_caption(receipt_title)
+    assert is_formula_stub_caption(receipt_caption)
+
+    ctx = SimpleNamespace(
+        telemetry=SimpleNamespace(
+            max_speed_mph=128.0,
+            avg_speed_mph=114.0,
+            location_city="Allendale",
+            location_state="California",
+            location_country="US",
+            location_road="I 505",
+            gazetteer_place_name="Allendale",
+            padus_unit_name=None,
+            near_padus=False,
+            location_display="Allendale, California",
+        ),
+        telemetry_data=None,
+        dashcam_osd_context={"driver_name": "C Walker"},
+        vision_context={},
+        audio_context={
+            "music_detected": True,
+            "music_artist": "iLoveMakonnen",
+            "music_title": "Maneuvering",
+        },
+        trill=None,
+        trill_score=None,
+        ai_transcript="",
+        video_intelligence={},
+        video_intelligence_context={},
+        video_understanding={
+            "scene_description": (
+                "Fast run in a GAC Group near Allendale, California "
+                "vibing to iLoveMakonnen Maneuvering."
+            ),
+        },
+        filename="20250301_0041_CAM.MP4",
+        thumbnail_category="automotive",
+        ai_title=receipt_title,
+        ai_caption=receipt_caption,
+        ai_hashtags=["allendale", "ilovemakonnen"],
+        m8_platform_captions={
+            "tiktok": receipt_caption,
+            "youtube": receipt_caption,
+            "instagram": receipt_caption,
+            "facebook": receipt_caption,
+        },
+        m8_platform_titles={
+            "tiktok": receipt_title,
+            "youtube": receipt_title,
+            "instagram": receipt_title,
+            "facebook": receipt_title,
+        },
+        m8_platform_hashtags={},
+        output_artifacts={},
+        upload_id="9020642f-receipt-persona",
+        user_settings={
+            "captionStyle": "punchy",
+            "captionTone": "cinematic",
+            "captionVoice": "teacher",
+        },
+    )
+    report = enforce_hydration(ctx)
+    assert report.get("persona_required") is True
+    assert report.get("receipt_rejected") is True
+
+    for pl in ("tiktok", "youtube", "instagram", "facebook"):
+        title = (ctx.m8_platform_titles or {}).get(pl) or ""
+        caption = (ctx.m8_platform_captions or {}).get(pl) or ""
+        assert title.strip(), f"{pl} title must be non-empty"
+        assert not is_formula_stub_caption(title), f"{pl} title still receipt: {title!r}"
+        assert title.strip() != receipt_title
+        assert not is_formula_stub_caption(caption), f"{pl} caption still receipt: {caption!r}"
+        assert "128" in title or "128" in caption or "Allendale" in title or "Allendale" in caption
+
+    assert (ctx.ai_title or "").strip()
+    assert not is_formula_stub_caption(ctx.ai_title or "")
+    assert not is_formula_stub_caption(ctx.ai_caption or "")
+
+
+def test_m8_prompt_general_footage_title_mandate():
+    """Non-dashcam scene graphs must push VU prose + voice into titles."""
+    ctx = SimpleNamespace(
+        user_settings={"captionStyle": "story", "captionTone": "authentic", "captionVoice": "teacher"},
+        audio_context={},
+        vision_context={},
+        video_understanding={
+            "scene_description": "A home cook tosses pasta in a cast-iron skillet.",
+        },
+        video_intelligence=None,
+        video_intelligence_context=None,
+        visual_recognition=None,
+        video_info={"duration": 40},
+        telemetry=None,
+        telemetry_data=None,
+        dashcam_osd_context={},
+        trill=None,
+        trill_score=None,
+        platforms=["youtube"],
+        filename="pasta.mp4",
+        output_artifacts={},
+        hydration_payload={},
+        ai_transcript="",
+        entitlements=None,
+        thumbnail_category="cooking",
+        fusion_context=None,
+        content_signals=None,
+    )
+    sg = {
+        "platforms": ["youtube"],
+        "category": "cooking",
+        "speed_consensus": {},
+        "geo": {},
+        "music": {},
+        "video_understanding": {
+            "scene": "A home cook tosses pasta in a cast-iron skillet under warm kitchen light.",
+        },
+        "timeline": [],
+    }
+    prompt = _build_m8_prompt(
+        ctx,
+        sg,
+        "cooking",
+        "story",
+        "authentic",
+        "mixed",
+        5,
+        True,
+        True,
+        True,
+        caption_voice_ui="teacher",
+    )
+    assert "GENERAL / NON-DASHCAM TITLE MANDATE" in prompt
+    assert "video_understanding.scene" in prompt
+    assert "CREATIVE SPINE" in prompt
 
 
 def test_title_uses_timeline_when_twelvelabs_missing():

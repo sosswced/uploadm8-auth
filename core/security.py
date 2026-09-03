@@ -77,8 +77,12 @@ def client_ip(req: Request) -> str:
     return (req.client.host if req.client else "unknown")
 
 
-def _json_429(detail: str) -> JSONResponse:
-    return JSONResponse(status_code=429, content={"detail": detail})
+def _json_429(detail: str, *, retry_after_sec: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": detail, "code": "rate_limited"},
+        headers={"Retry-After": str(max(1, int(retry_after_sec)))},
+    )
 
 
 def _ip_is_loopback(ip: str) -> bool:
@@ -113,18 +117,18 @@ def install_rate_limit_middleware(app: FastAPI) -> None:
         if not await rate_limit_allowed(
             _rl_bucket(f"ip:{ip}:global"), limit=RATE_LIMIT_GLOBAL_PER_MIN, window_sec=window
         ):
-            return _json_429("Rate limit exceeded (global)")
+            return _json_429("Rate limit exceeded (global)", retry_after_sec=window)
 
         # Sensitive surfaces
         if path.startswith("/api/auth/"):
             if not await rate_limit_allowed(
                 _rl_bucket(f"ip:{ip}:auth"), limit=RATE_LIMIT_AUTH_PER_MIN, window_sec=window
             ):
-                return _json_429("Rate limit exceeded (auth)")
+                return _json_429("Rate limit exceeded (auth)", retry_after_sec=window)
         if path.startswith("/api/admin/"):
             if not await rate_limit_allowed(
                 _rl_bucket(f"ip:{ip}:admin"), limit=RATE_LIMIT_ADMIN_PER_MIN, window_sec=window
             ):
-                return _json_429("Rate limit exceeded (admin)")
+                return _json_429("Rate limit exceeded (admin)", retry_after_sec=window)
 
         return await call_next(request)

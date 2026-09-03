@@ -271,7 +271,7 @@ ASYNC_PUBLISH_QUEUE = (os.environ.get("ASYNC_PUBLISH_QUEUE", "false").lower() in
 STALE_JOB_RECOVERY_ENABLED = (os.environ.get("STALE_JOB_RECOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on"))
 STALE_JOB_RECOVERY_INTERVAL_SEC = max(60, int(os.environ.get("STALE_JOB_RECOVERY_INTERVAL_SEC", "300")))
 STALE_QUEUED_MINUTES = max(15, int(os.environ.get("STALE_QUEUED_MINUTES", "45")))
-STALE_PROCESSING_MINUTES = int(os.environ.get("STALE_PROCESSING_MINUTES", "20"))  # 0 = disable processing recovery
+STALE_PROCESSING_MINUTES = int(os.environ.get("STALE_PROCESSING_MINUTES", "90"))  # 0 = disable processing recovery
 STALE_PROCESSING_RECOVER_CHECKPOINT = (
     os.environ.get("STALE_PROCESSING_RECOVER_CHECKPOINT", "true").lower() in ("1", "true", "yes", "on")
 )
@@ -4248,15 +4248,17 @@ async def _sync_one_upload_analytics(
                         logger.debug(f"[analytics-sync] YouTube HTTP {resp.status_code} for {upload_id}")
 
                 elif plat == "instagram" and video_id:
+                    from services.meta_oauth import meta_graph_slot
                     # Instagram Insights API requires numeric media_id (not shortcode)
                     media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{media_id}/insights",
-                        params={
-                            "access_token": access_token,
-                            "metric": "views,plays,likes,comments,saved,shares,reach",
-                        },
-                    )
+                    async with meta_graph_slot():
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{media_id}/insights",
+                            params={
+                                "access_token": access_token,
+                                "metric": "views,plays,likes,comments,saved,shares,reach",
+                            },
+                        )
                     if resp.status_code == 200:
                         s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
                         ig_views = ig_plays = 0
@@ -4277,13 +4279,15 @@ async def _sync_one_upload_analytics(
                         logger.debug(f"[analytics-sync] Instagram HTTP {resp.status_code} for {upload_id}")
 
                 elif plat == "facebook" and video_id:
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{video_id}",
-                        params={
-                            "access_token": access_token,
-                            "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
-                        },
-                    )
+                    from services.meta_oauth import meta_graph_slot
+                    async with meta_graph_slot():
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{video_id}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
+                            },
+                        )
                     if resp.status_code == 200:
                         s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
                         for m in (resp.json().get("insights", {}) or {}).get("data", []) or []:
@@ -6807,15 +6811,21 @@ async def run_heartbeat_loop() -> None:
                     )
                     if mem.get("memory_pressure") == "hard":
                         try:
-                            import sentry_sdk
+                            from services.worker_admission import unexpected_hard_memory_for_sentry
 
-                            sentry_sdk.capture_message(
-                                f"Worker hard memory pressure {pct}% "
-                                f"(rss={mem.get('rss_mb')} children={mem.get('children_rss_mb')} "
-                                f"effective={mem.get('effective_rss_mb')} "
-                                f"limit={mem.get('limit_mb')})",
-                                level="warning",
-                            )
+                            if unexpected_hard_memory_for_sentry(
+                                process_count=int(jobs.get("process_count") or 0),
+                                process_slots_in_use=int(snap["proc_slots"]["in_use"] or 0),
+                            ):
+                                import sentry_sdk
+
+                                sentry_sdk.capture_message(
+                                    f"Worker hard memory pressure {pct}% "
+                                    f"(rss={mem.get('rss_mb')} children={mem.get('children_rss_mb')} "
+                                    f"effective={mem.get('effective_rss_mb')} "
+                                    f"limit={mem.get('limit_mb')})",
+                                    level="warning",
+                                )
                         except Exception:
                             pass
         except Exception as e:

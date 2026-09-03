@@ -666,15 +666,19 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             pool.music_title = title
             pool.music_genre = genre
 
-    # ── Garage / Trill vehicle — only on real driving evidence ───────────
-    driving_ev = False
+    # ── Garage / Trill vehicle — only when the upload is automotive ──────
+    # A leftover Ford Mustang default must not leak into sports/walk clips.
+    automotive_cat = False
     try:
-        from core.driving_evidence import has_driving_evidence
+        from services.upload.vehicle_defaults import thumbnail_category_is_automotive
 
-        driving_ev = bool(has_driving_evidence(ctx))
+        automotive_cat = thumbnail_category_is_automotive(ctx)
     except Exception:
-        driving_ev = False
-    if driving_ev:
+        automotive_cat = str(getattr(ctx, "thumbnail_category", "") or "").lower() in (
+            "automotive",
+            "dashcam",
+        )
+    if automotive_cat:
         make = getattr(ctx, "vehicle_make_name", None)
         model = getattr(ctx, "vehicle_model_name", None)
         if isinstance(make, str) and make.strip():

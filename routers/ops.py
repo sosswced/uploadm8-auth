@@ -47,12 +47,13 @@ async def api_v1_contract():
         "api_version": "1",
         "openapi_json": "/openapi.json",
         "docs": "/docs",
-        "alias": "Every /api/v1/... request is handled by the same route as /api/...",
+        "canonical_prefix": "/api",
+        "note": "Live routes are /api/... (not /api/v1/...). This document is the v1 contract; OpenAPI lists the paths.",
         "examples": [
-            "/api/v1/auth/login",
-            "/api/v1/me",
-            "/api/v1/uploads/presign",
-            "/api/v1/billing/checkout",
+            "/api/auth/login",
+            "/api/me",
+            "/api/uploads/presign",
+            "/api/billing/checkout",
         ],
         "auth_note": "Bearer header or HttpOnly access cookie (credentials: include).",
     }

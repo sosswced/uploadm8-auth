@@ -97,9 +97,26 @@ def test_drop_localhost_performance_transactions():
 def test_keep_remote_transactions():
     ev = {
         "request": {"url": "https://auth.uploadm8.com/api/me"},
-        "spans": [{"description": "SELECT 1", "op": "db"}],
+        "spans": [{"description": "SELECT id FROM users WHERE id = $1", "op": "db"}],
     }
     assert _before_send_transaction(ev, None) is not None
+
+
+def test_strip_select_1_pool_ping_from_remote_me(monkeypatch):
+    """UPLOADM8-B5 — acquire_db liveness ping must not open Slow DB Query issues."""
+    monkeypatch.delenv("SENTRY_DROP_LOCALHOST_TRACES", raising=False)
+    ev = {
+        "request": {"url": "https://auth.uploadm8.com/api/me"},
+        "spans": [
+            {"description": "SELECT 1", "op": "db"},
+            {"description": "SELECT id, email FROM users WHERE id = $1", "op": "db"},
+        ],
+    }
+    out = _before_send_transaction(ev, None)
+    assert out is not None
+    descs = [str(s.get("description") or "") for s in (out.get("spans") or [])]
+    assert "SELECT 1" not in descs
+    assert any("users" in d.lower() for d in descs)
 
 
 def test_localhost_url_helper():

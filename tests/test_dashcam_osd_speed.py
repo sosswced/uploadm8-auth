@@ -129,10 +129,26 @@ def test_lon_bleed_never_becomes_hud_speed():
         "2025/03/05 04:50 12 PM 41.92226° -122.57585°MPH",
         "2025/03/05 04:50 12 PM 36.136162° -115MPH C Walker",
         "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115°MPH",
+        "2025/03/05 04:50 12 PM 41.92226° -122.57585° 122 MPH",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 36MPH",
         "41.92226 -122MPH ESCORT.",
     ):
         rec = parse_osd_line(line, t_s=0.0)
         assert rec["speed_mph"] is None, line
+
+
+def test_aggregate_rejects_lon_integer_echo_series():
+    """Repeated lon-integer ghosts must not become clip max_speed_mph."""
+    samples = [
+        parse_osd_line(
+            f"2025/03/05 04:50 12 PM 41.9222{i}° -122.5758{i}° 122MPH C Walker",
+            t_s=float(i),
+        )
+        for i in range(6)
+    ]
+    osd = _aggregate(samples)
+    assert osd["max_speed_mph"] == 0.0
+    assert not osd.get("speed_series")
 
 
 def test_ocr_garbled_unit_still_reads_when_designation_present():
@@ -170,3 +186,27 @@ def test_gps_path_does_not_carry_rejected_spike_speed():
     assert osd["max_speed_mph"] == 46.0
     for row in osd["gps_path"]:
         assert row[2] <= 50.0
+
+
+def test_backfill_telemetry_never_copies_hud_peak_onto_tel():
+    """SSOT: OSD backfill keeps geo points but leaves tel.max_speed_mph at 0."""
+    from types import SimpleNamespace
+    from stages.dashcam_osd_stage import _backfill_telemetry
+
+    samples = [
+        parse_osd_line(
+            f"2025/03/05 04:50 12 PM 36.1361{i}° -115.1783{i}° 88MPH C Walker",
+            t_s=float(i),
+        )
+        for i in range(4)
+    ]
+    osd = _aggregate(samples)
+    assert osd["max_speed_mph"] == 88.0
+    ctx = SimpleNamespace(telemetry=None, telemetry_data=None)
+    assert _backfill_telemetry(ctx, osd) is True
+    tel = ctx.telemetry_data
+    assert tel is not None
+    assert float(getattr(tel, "max_speed_mph", 0) or 0) == 0.0
+    assert bool(getattr(tel, "osd_backfilled", False)) is True
+    assert len(tel.points) >= 1
+    assert float(osd.get("max_speed_mph") or 0) == 88.0

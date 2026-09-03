@@ -270,12 +270,9 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         schedule_metadata = {p: schedule_slot_iso(dt) for p, dt in smart_schedule.items()}
         scheduled_time = min(smart_schedule.values())
 
-    vm_id = getattr(data, "vehicle_make_id", None)
-    vmd_id = getattr(data, "vehicle_model_id", None)
-    if vm_id is None:
-        vm_id = user_prefs.get("default_vehicle_make_id")
-    if vmd_id is None:
-        vmd_id = user_prefs.get("default_vehicle_model_id")
+    from services.upload.vehicle_defaults import resolve_presign_vehicle_ids
+
+    vm_id, vmd_id = resolve_presign_vehicle_ids(data, user_prefs)
     if vm_id is not None and vmd_id is not None:
         ok = await conn.fetchrow(
             "SELECT 1 FROM vehicle_models WHERE id = $1 AND make_id = $2",

@@ -227,8 +227,41 @@ def test_formula_stub_detection():
 
     assert is_formula_stub_caption("Anchored in 88 MPH, Garlock Road")
     assert is_formula_stub_caption("110 MPH, Susanville Road")
+    assert is_formula_stub_caption(
+        "128 MPH through Allendale, CA — with iLoveMakonnen"
+    )
+    assert is_formula_stub_caption(
+        "128 MPH recorded in Allendale, California. C Walker drives with 'Maneuvering' by iLoveMakonnen"
+    )
+    assert is_formula_stub_caption(
+        "Captured at 128 MPH, on I 505, near Allendale, CA, with iLoveMakonnen"
+    )
+    assert is_formula_stub_caption(
+        "Through Livermore, CA — with A Boogie Wit da Hoodie"
+    )
+    # Soft-inject creative remainder is NOT a receipt.
+    assert not is_formula_stub_caption(
+        "154 MPH — Kodak Black rattles the cabin near Garlock while the needle climbs"
+    )
+    assert not is_formula_stub_caption("Livermore Chill with A Boogie")
     assert not is_formula_stub_caption(
         "Kodak Black rattles the cabin at 110 MPH near Susanville Road — send it."
+    )
+    # Whisper paraphrase must not be stubbed by bare through+with.
+    assert not is_formula_stub_caption(
+        "128 MPH — through Logandale with the crew still talking"
+    )
+
+
+def test_persona_voice_required_defaults():
+    from services.m8_grounding_pass import persona_voice_required
+
+    assert not persona_voice_required({})
+    assert not persona_voice_required(
+        {"captionStyle": "story", "captionTone": "authentic", "captionVoice": "default"}
+    )
+    assert persona_voice_required(
+        {"captionStyle": "punchy", "captionTone": "cinematic", "captionVoice": "teacher"}
     )
 
 

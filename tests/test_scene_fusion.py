@@ -369,6 +369,7 @@ def test_m8_deterministic_title_speed_first_with_place_sign():
     from stages.m8_engine import _deterministic_evidence_title, _validate_title
 
     sg = {
+        "speed_consensus": {"peak_mph": 88.0, "confidence": "high", "source": "osd"},
         "geo": {
             "place_sign": "Ashland",
             "max_speed_mph": 88.0,
@@ -385,9 +386,11 @@ def test_m8_deterministic_title_speed_first_with_place_sign():
     assert "Ashland" in title
     assert " · " not in title
     assert "through" in title.lower()
+    # Compact ``N MPH through Place — with Artist`` is a formula stub — ranking
+    # must prefer persona voice over this receipt (same shape as 9020642f).
     ok, reason = _validate_title(title, sg, platform="youtube")
-    assert ok, reason
-
+    assert not ok
+    assert reason == "formula_stub"
 
 def test_m8_rejects_checklist_dot_stack_titles():
     from stages.m8_engine import _validate_title

@@ -47,6 +47,37 @@
       },
       "gold_caption": "Packers faithful packing Lambeau Field for kickoff.",
       "bad_caption": "Game day energy is unmatched everywhere tonight."
+    },
+    {
+      "id": "harbor_walk_glasses",
+      "genre": "travel",
+      "evidence": {
+        "video_labels": ["water", "church", "boat"],
+        "vision_ocr_tokens": ["PLACA", "CENTRO"]
+      },
+      "gold_caption": "Church then the harbor water at the end of the street in Centro.",
+      "bad_caption": "Epic vibes only — living my best life out here!"
+    },
+    {
+      "id": "museum_plaque",
+      "genre": "museum",
+      "evidence": {
+        "vision_ocr_tokens": ["BRITISH", "MUSEUM"],
+        "place_monuments": ["British Museum"]
+      },
+      "gold_caption": "Standing at the British Museum plaque in the gallery.",
+      "bad_caption": "Another day another adventure somewhere cool."
+    },
+    {
+      "id": "stadium_glasses_chiefs",
+      "genre": "sports",
+      "evidence": {
+        "transcript_phrase": "Touchback, the Chiefs will have 1st and 10",
+        "transcript_nouns": ["Chiefs", "stadium"],
+        "sports_teams": ["Chiefs"]
+      },
+      "gold_caption": "Chiefs take the field — game day from the stands.",
+      "bad_caption": "Ford Mustang vibes only — living my best life in the garage!"
     }
   ]
 }

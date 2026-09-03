@@ -2,20 +2,20 @@
 
 UploadM8 publishes via TikTok **Content Posting API Direct Post**
 (`POST /v2/post/publish/video/init/` + `FILE_UPLOAD` chunks). This is not Share Kit
-or inbox-draft upload mode.
+or inbox-draft upload mode (inbox remains an optional “Finish in TikTok app” path).
 
-## Production enablement (audit approved)
+## Production status
 
-Audited Direct Post is the **default** (unset / `TIKTOK_APP_AUDITED=1`). Pin on
-**both** API and worker for clarity:
+Content Posting API audit is **approved**. Direct Post honors the creator’s selected
+privacy level from `privacy_level_options` (Everyone / Friends / Followers / Only me).
+There is no private-only clamp and no `TIKTOK_APP_AUDITED` runtime toggle.
 
-| Variable | Value | Effect |
-|----------|-------|--------|
-| `TIKTOK_APP_AUDITED` | `1` (default) | Public Direct Post — honors user privacy (Everyone / Friends / Followers / Only me) |
-| `TIKTOK_FORCE_PRIVATE_UNAUDITED` | unset | Do not set unless rolling back to private-only |
+OAuth scopes (must match TikTok Developer Portal):
 
-Set `TIKTOK_APP_AUDITED=0` only to revert to private-only UX (worker clamps to
-`SELF_ONLY` and Upload disables other visibility options).
+`user.info.basic`, `user.info.profile`, `user.info.stats`, `video.publish`, `video.upload`, `video.list`
+
+- **profile** → `@username` for watch URLs and Connected Accounts
+- **stats + video.list** → Analytics live cards
 
 ## App description (Developer Portal)
 
@@ -40,28 +40,23 @@ Support: https://app.uploadm8.com/support.html
 | Data Deletion Request Callback | https://auth.uploadm8.com/api/webhooks/facebook/data-deletion |
 | Deauthorize Callback | https://auth.uploadm8.com/api/webhooks/facebook/deauthorize |
 
-Requires `META_APP_SECRET` set in production. After deploy, reconnect Facebook/Instagram once so tokens store the Meta user ASID for reliable callback matching.
+Requires `META_APP_SECRET` and `META_OAUTH_MODE=full` in production. After deploy,
+reconnect Facebook/Instagram once so tokens store the Meta user ASID for deletion
+matching. Users who manage multiple Pages (or IG accounts) choose the destination
+in the OAuth popup.
 
-## Smoke test after enabling audited mode
+## Smoke test
 
 1. Sign in → Upload → select short video → TikTok account
-2. Confirm green **Direct Post enabled** banner (not the yellow audit lock banner)
+2. Confirm green **Direct Post enabled** banner
 3. Select **Everyone** (or Friends/Followers) — option must be enabled
 4. Consent + Upload & Publish
 5. On TikTok profile, confirm post is public (not Only me / Inbox-only)
-
-## Rollback
-
-```
-TIKTOK_FORCE_PRIVATE_UNAUDITED=1
-```
-
-Restart API + worker. Publish clamps to ``SELF_ONLY`` only when this force flag is set.
-`TIKTOK_APP_AUDITED=0` affects UI labeling only (does not rewrite privacy at publish).
+6. Analytics → TikTok Live card shows video.list + user.info.stats metrics
 
 ## Reviewer / compliance notes
 
-- Privacy dropdown must not pre-select Public (except unaudited Only-me default)
+- Privacy dropdown must not pre-select Public
 - creator_info before export UI
 - Music Usage Confirmation + consent before publish
-- No silent privacy override without in-app notice when clamped
+- Optional Finish in TikTok app → Inbox draft (not Direct Post)

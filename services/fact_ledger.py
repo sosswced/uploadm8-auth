@@ -272,15 +272,9 @@ def build_fact_ledger(ctx: Any, pool: Any = None) -> FactLedger:
     if bucket:
         _put(facts, "trill_bucket", str(bucket).strip(), source="trill")
 
-    # Garage / Trill vehicle (was never in EvidencePool — root cause for 9020642f)
-    make = (
-        getattr(ctx, "vehicle_make_name", None)
-        or getattr(pool, "vehicle_make", None)
-    )
-    model = (
-        getattr(ctx, "vehicle_model_name", None)
-        or getattr(pool, "vehicle_model", None)
-    )
+    # Garage vehicle — EvidencePool already gated to automotive/dashcam.
+    make = getattr(pool, "vehicle_make", None)
+    model = getattr(pool, "vehicle_model", None)
     if make:
         _put(facts, "vehicle_make", str(make).strip(), source="garage")
     if model:

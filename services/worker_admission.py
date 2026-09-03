@@ -42,7 +42,7 @@ def process_dispatch_limit(
 ) -> int:
     """How many staged→queued jobs this scheduler tick may claim.
 
-    Maximizes throughput by filling free *local* process slots, but backs off
+    Maximize throughput by filling free *local* process slots, but backs off
     when this instance is under memory pressure or the fleet reports hard RAM.
     """
     if memory_blocks or local_free_slots <= 0:
@@ -69,6 +69,29 @@ def process_dispatch_limit(
             limit = min(limit, free_cluster)
 
     return max(0, limit)
+
+
+def unexpected_hard_memory_for_sentry(
+    *,
+    process_count: int = 0,
+    process_slots_in_use: int = 0,
+) -> bool:
+    """True when hard RAM should open a Sentry issue (UPLOADM8-B6).
+
+    A single in-flight encode on a 2GB Render worker routinely peaks past the
+    cgroup limit (FFmpeg children). That is already gated by admission + KPI
+    telemetry. Capture only leaks (0 jobs) or overlapping encodes (>1).
+    """
+    try:
+        jobs = int(process_count or 0)
+    except (TypeError, ValueError):
+        jobs = 0
+    try:
+        slots = int(process_slots_in_use or 0)
+    except (TypeError, ValueError):
+        slots = 0
+    n = max(jobs, slots)
+    return n != 1
 
 
 def scale_out_hint(fleet: Optional[Dict[str, Any]], pending: int) -> Optional[str]:

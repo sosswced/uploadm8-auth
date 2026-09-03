@@ -20,6 +20,22 @@ def test_bootstrap_rank_puts_landmark_before_speed():
     assert order.index("landmark") < order.index("speed")
 
 
+def test_travel_bootstrap_cluster_keeps_speed_last():
+    from core.hero_fact_priors import _BOOTSTRAP_CLUSTERS
+
+    auto_only = {
+        "version": 1,
+        "global": ["speed", "place", "landmark"],
+        "clusters": {"automotive": ["speed", "place"]},
+        "source": "learned",
+    }
+    order = class_rank_for_cluster("travel", priors=auto_only)
+    assert order == list(_BOOTSTRAP_CLUSTERS["travel"])
+    assert order.index("landmark") < order.index("speed")
+    wearable = class_rank_for_cluster("wearable", priors=auto_only)
+    assert wearable == list(_BOOTSTRAP_CLUSTERS["travel"])
+
+
 def test_rank_hero_facts_reorders_by_cluster_prior(tmp_path):
     priors = {
         "version": 1,

@@ -434,9 +434,9 @@ def apply_upload_thumbnail_controls(
         {"usePikzels": use_pikzels, "wantPersona": want_persona, "wantId": want_id},
     )
     if result.get("pikzels"):
-        log.note("Pikzels / AuroraRender: ON for this upload")
+        log.note("Pikzels AI covers: ON for this upload")
     else:
-        log.note("Pikzels / AuroraRender: OFF (gate skip or studio blocked)")
+        log.note("Pikzels AI covers: OFF (gate skip or studio blocked)")
     if result.get("persona"):
         log.note(
             f"Persona applied: {result.get('persona_name') or result.get('persona_id')}"
@@ -641,6 +641,24 @@ def verify_upload_on_dashboard_and_queue(
                 raise AssertionError(f"Demo upload not visible on dashboard (expected {filename_hint})")
             if log:
                 log.note("Dashboard shows recent upload")
+            try:
+                thumb = page.locator("#recentUploads .upload-row img").first
+                src = (thumb.get_attribute("src") or "").strip() if thumb.count() else ""
+                if log:
+                    log.note(f"Dashboard custom thumb src={src[:180] or '(missing)'}")
+                if src and "ytimg.com" not in src.lower() and not any(
+                    x in src.lower() for x in ("placeholder", "data:image/svg", "logo.svg")
+                ):
+                    if log:
+                        log.note("Dashboard shows a custom (non-YouTube-default) thumbnail")
+                elif "ytimg.com" in src.lower():
+                    if log:
+                        log.note(
+                            "Dashboard showing YouTube hqdefault — custom Pikzels/R2 thumb not displayed"
+                        )
+            except Exception as thumb_e:
+                if log:
+                    log.note(f"Dashboard thumb inspect skipped: {thumb_e}")
 
             navigate_to_page_human(page, base_url, "queue.html")
             wait_for_authenticated_shell(page)

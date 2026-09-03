@@ -4,6 +4,7 @@ from services.worker_admission import (
     active_pipeline_stale_minutes,
     process_dispatch_limit,
     scale_out_hint,
+    unexpected_hard_memory_for_sentry,
 )
 
 
@@ -71,3 +72,15 @@ def test_scale_out_hint_none_when_memory_warn():
 def test_active_pipeline_stale_minutes_env(monkeypatch):
     monkeypatch.setenv("ACTIVE_PIPELINE_STALE_MINUTES", "120")
     assert active_pipeline_stale_minutes() == 120
+
+
+def test_unexpected_hard_memory_sentry_skips_single_encode():
+    """UPLOADM8-B6 — FFmpeg peak on one 2GB slot is expected, not a Sentry issue."""
+    assert unexpected_hard_memory_for_sentry(process_count=1, process_slots_in_use=1) is False
+    assert unexpected_hard_memory_for_sentry(process_count=1, process_slots_in_use=0) is False
+    assert unexpected_hard_memory_for_sentry(process_count=0, process_slots_in_use=1) is False
+
+
+def test_unexpected_hard_memory_sentry_flags_leak_or_overlap():
+    assert unexpected_hard_memory_for_sentry(process_count=0, process_slots_in_use=0) is True
+    assert unexpected_hard_memory_for_sentry(process_count=2, process_slots_in_use=1) is True

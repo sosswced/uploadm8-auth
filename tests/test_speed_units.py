@@ -67,19 +67,35 @@ def test_reject_lon_fraction_tail_as_speed():
 
 
 def test_real_hud_speed_still_reads_after_full_gps():
-    """Separate HUD sample after a complete lat/lon pair is still valid —
-    including when the speed happens to equal the lon integer (115)."""
+    """Separate HUD sample after a complete lat/lon pair is still valid
+    when it is *not* the lat/lon integer (OCR ghosts those as MPH)."""
     rec = parse_osd_line(
-        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115MPH C Walker",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 88MPH C Walker",
         t_s=0.0,
     )
-    assert rec.get("speed_mph") == 115.0
+    assert rec.get("speed_mph") == 88.0
     assert rec.get("speed_unit") == "mph"
+
+
+def test_reject_lat_lon_integer_echoed_as_speed():
+    """``122 MPH`` after lon ``-122.57`` / ``36 MPH`` after lat ``36.13`` are ghosts."""
+    for line in (
+        "2025/03/05 04:50 12 PM 41.92226° -122.57585° 122 MPH C Walker",
+        "2025/03/05 04:50 12 PM 41.92226° -122.57585° 122MPH C Walker",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 36MPH C Walker",
+        "2025/03/05 04:50 12 PM 36.136162° -115.178398° 115MPH C Walker",
+        "36.136162° -115.178398° 36 MPH",
+    ):
+        rec = parse_osd_line(line, t_s=0.0)
+        assert rec.get("speed_mph") is None, line
 
 
 def test_vision_ocr_peak_ignores_coordinates_and_headings():
     assert _vision_ocr_peak_mph("36.136162° -115.178398°\n270° HDG") == 0.0
     assert _vision_ocr_peak_mph("36.136162° -115MPH\n41.9° -122°MPH") == 0.0
+    assert _vision_ocr_peak_mph(
+        "2025/03/05 04:50 12 PM 41.92226° -122.57585° 122MPH C Walker"
+    ) == 0.0
     ocr = (
         "2025/03/05 04:50 12 PM 36.136162° -115.178398° 88MPH C Walker\n"
         "2025/03/05 04:51 12 PM 36.136200° -115.178400° 90MPH C Walker"

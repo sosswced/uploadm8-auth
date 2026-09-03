@@ -203,7 +203,7 @@ def split_platform_results(
     return succeeded, deduped
 
 
-STALE_PROCESSING_MINUTES_DEFAULT = 20
+STALE_PROCESSING_MINUTES_DEFAULT = 90
 
 # ready_to_publish past due by this many minutes → user may Retry (republish).
 # Worker auto-redispatch uses a longer window (STUCK_READY_REDISPATCH_MINUTES).

@@ -33,6 +33,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # ============================================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
+# Optional public base for OAuth redirect URIs (ngrok / tunnel). When set, provider
+# callbacks use this instead of BASE_URL so portal redirect URIs match the tunnel.
+OAUTH_PUBLIC_BASE_URL = (os.environ.get("OAUTH_PUBLIC_BASE_URL") or "").strip().rstrip("/") or None
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 # Repo `frontend/` — optional static mount on the API app (same origin as /api/*).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -257,15 +260,17 @@ OAUTH_CONFIG = {
     "tiktok": {
         "auth_url": "https://www.tiktok.com/v2/auth/authorize/",
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
-        # Added:
-        # - video.list (required for /v2/video/list/ stats reads)
-        # - user.info.stats (required to fetch follower_count, etc via /v2/user/info/)
-        "scope": "user.info.basic,user.info.stats,video.publish,video.upload,video.list",
+        # Approved Content Posting + analytics scopes (portal must match).
+        # user.info.profile → @username for watch URLs; video.list + stats → Analytics.
+        "scope": (
+            "user.info.basic,user.info.profile,user.info.stats,"
+            "video.publish,video.upload,video.list"
+        ),
     },
     "youtube": {
         "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
-        # Added yt-analytics.readonly because _fetch_youtube_metrics() calls youtubeanalytics.googleapis.com/v2/reports
+        # yt-analytics.readonly — _fetch_youtube_metrics() youtubeanalytics.googleapis.com
         "scope": (
             "https://www.googleapis.com/auth/youtube.upload "
             "https://www.googleapis.com/auth/youtube.readonly "
@@ -273,23 +278,23 @@ OAUTH_CONFIG = {
         ),
     },
     "instagram": {
-        # Instagram Graph API uses Facebook OAuth (for publishing Reels)
-        "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
-        "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
-        # Added instagram_manage_insights for full Insights API access
+        # Dialog version aligned with Graph publish/insights (v21). Runtime scopes from
+        # meta_instagram_oauth_scope() — this list is documentation / fallback reference.
+        "auth_url": "https://www.facebook.com/v21.0/dialog/oauth",
+        "token_url": "https://graph.facebook.com/v21.0/oauth/access_token",
         "scope": (
             "instagram_basic,"
             "instagram_content_publish,"
             "instagram_manage_insights,"
             "pages_show_list,"
             "pages_read_engagement,"
+            "pages_read_user_content,"
             "business_management"
         ),
     },
     "facebook": {
-        "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
-        "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
-        # Added read_insights + pages_read_user_content to harden page/video insights + video listing
+        "auth_url": "https://www.facebook.com/v21.0/dialog/oauth",
+        "token_url": "https://graph.facebook.com/v21.0/oauth/access_token",
         "scope": (
             "pages_manage_posts,"
             "pages_read_engagement,"
@@ -304,9 +309,9 @@ OAUTH_CONFIG = {
 # TikTok
 TIKTOK_CLIENT_KEY    = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-# Content Posting Direct Post: audited hardcoded True (ignore Render env).
+# Content Posting Direct Post is audit-approved — public privacy levels honored.
+# Legacy env names are ignored (kept only so old Render keys do not confuse ops).
 TIKTOK_APP_AUDITED = True
-# Emergency rollback disabled in code (see tiktok_force_private_unaudited()).
 TIKTOK_FORCE_PRIVATE_UNAUDITED = False
 # Separate secret used to verify TikTok webhook payloads (HMAC-SHA256).
 # Set this to the value shown in TikTok Developer Portal -> your app ->

@@ -34,6 +34,7 @@ from stages.publish_stage import decrypt_token
 from services.catalog_identity import dump_facebook_dual_cursor, parse_facebook_dual_cursor
 from services.canonical_engagement import ROLLUP_VERSION as CANONICAL_ENGAGEMENT_ROLLUP_VERSION
 from services import metric_definitions as metric_definitions_svc
+from services.meta_oauth import META_GRAPH_API_VERSION, meta_graph_slot
 
 logger = logging.getLogger("uploadm8.catalog_sync")
 
@@ -470,9 +471,9 @@ async def _list_instagram_media(
         params["after"] = after_cursor
 
     async def _call():
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
-                f"https://graph.facebook.com/v19.0/{ig_user_id}/media",
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{ig_user_id}/media",
                 params=params,
             )
             resp.raise_for_status()
@@ -538,9 +539,9 @@ async def _list_facebook_videos(
         params["after"] = after_cursor
 
     async def _call():
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
-                f"https://graph.facebook.com/v19.0/{page_id}/videos",
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{page_id}/videos",
                 params=params,
             )
             resp.raise_for_status()
@@ -607,9 +608,9 @@ async def _list_facebook_reels(
         params["after"] = after_cursor
 
     async def _call():
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
-                f"https://graph.facebook.com/v19.0/{page_id}/video_reels",
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{page_id}/video_reels",
                 params=params,
             )
             if resp.status_code != 200:

@@ -216,7 +216,7 @@ async def build_smart_schedule_for_upload(
             if offset >= 1 and count > 0:
                 occupancy[offset] = occupancy.get(offset, 0) + count
 
-    if hour_weights_by_platform:
+    if hour_weights_by_platform is not None:
         weights = {
             str(p).strip().lower(): list(w)
             for p, w in hour_weights_by_platform.items()

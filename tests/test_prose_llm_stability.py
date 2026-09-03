@@ -313,3 +313,90 @@ def test_soft_mph_gate_keeps_place_voice():
     assert _title_is_salvageable_voice(creative, pool) is True
     assert _title_is_timeline_thin(creative, pool) is False
     assert _title_is_timeline_thin("Cruising Logandale at 46 MPH", pool) is True
+
+
+def test_non_dashcam_scene_voice_title_not_thin():
+    """General footage: short VU-grounded persona titles must not be timeline-thin."""
+    from services.hydration_enforcer import EvidencePool, _title_is_timeline_thin
+
+    pool = EvidencePool(
+        max_speed_mph=0.0,
+        video_understanding_phrase="Chef sears scallops while garlic hits the pan",
+        vision_landmarks=[],
+        music_artist="Lo-fi Beats",
+    )
+    title = "Garlic hits the pan before the scallops do"
+    assert _title_is_timeline_thin(title, pool) is False
+
+
+def test_voice_fallback_uses_scene_prose_without_speed():
+    from stages.m8_engine import build_voice_fallback_selection
+    from services.m8_grounding_pass import is_formula_stub_caption
+
+    scene = {
+        "platforms": ["youtube", "instagram"],
+        "geo": {},
+        "speed_consensus": {},
+        "music": {"detected": False},
+        "video_understanding": {
+            "scene": "A home cook tosses pasta in a cast-iron skillet under warm kitchen light.",
+            "title_suggestion": "Cast-iron pasta night under warm kitchen light",
+        },
+        "fusion_narrative": "Pasta night in a small kitchen.",
+    }
+    sel = build_voice_fallback_selection(
+        scene,
+        caption_style="story",
+        caption_tone="documentary",
+        caption_voice="teacher",
+        platforms=["youtube", "instagram"],
+    )
+    yt = str(((sel["platforms"].get("youtube") or {}).get("winner") or {}).get("title") or "")
+    assert yt
+    assert "MPH" not in yt.upper()
+    assert "through" not in yt.lower() or "kitchen" in yt.lower() or "pasta" in yt.lower()
+    assert not is_formula_stub_caption(yt)
+    assert any(tok in yt.lower() for tok in ("pasta", "kitchen", "cast", "cook", "skillet"))
+
+
+def test_rank_prefers_caption_or_scene_over_mph_formula_without_peak():
+    from stages.m8_engine import rank_and_select
+
+    parsed = {
+        "m8_version": "1.4.1",
+        "platforms": {
+            "youtube": {
+                "variants": [
+                    {
+                        "variant_index": 1,
+                        "title": "POV: wait until you see this",  # hard-ban clickbait
+                        "caption": (
+                            "Warm kitchen light catches the cast-iron skillet as pasta "
+                            "gets tossed one more time. Stay for the garlic finish."
+                        ),
+                        "hashtags": ["pastanight"],
+                        "score": 70.0,
+                    }
+                ]
+            }
+        },
+    }
+    scene = {
+        "platforms": ["youtube"],
+        "geo": {},
+        "speed_consensus": {},
+        "music": {},
+        "transcript": {},
+        "video_understanding": {
+            "scene": "A home cook tosses pasta in a cast-iron skillet under warm kitchen light.",
+        },
+    }
+    out = rank_and_select(parsed, scene, {})
+    block = (out.get("platforms") or {}).get("youtube") or {}
+    winner = block.get("winner") or {}
+    title = str(winner.get("title") or "")
+    meta = block.get("title_validation") or {}
+    assert title
+    assert "MPH" not in title.upper()
+    assert meta.get("evidence_fallback_used") is not True
+    assert meta.get("caption_voice_title_used") or meta.get("scene_prose_title_used")

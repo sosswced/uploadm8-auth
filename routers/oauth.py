@@ -1,16 +1,14 @@
 """OAuth routes (/api/oauth/*)."""
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import logging
 import secrets
 from typing import Optional
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 import core.state
@@ -39,9 +37,17 @@ from core.oauth import (
 )
 from core.time_utils import now_utc as _now_utc
 from services.meta_oauth import (
+    FACEBOOK_GRAPH_PERMISSION_PROOF,
+    INSTAGRAM_GRAPH_PERMISSION_PROOF,
+    META_GRAPH_API_VERSION,
+    META_GRAPH_RATE_LIMITING,
+    META_PERMISSION_ALLOWED_USAGE,
+    exchange_long_lived_user_token,
+    facebook_pages_manage_posts_proof,
     fetch_granted_permissions,
     meta_facebook_oauth_scope,
     meta_instagram_oauth_scope,
+    meta_oauth_auth_type,
     meta_oauth_mode,
 )
 from services.workspace import require_can_manage_platforms, resolve_billing_user_id
@@ -65,7 +71,7 @@ async def oauth_start(
     Provider URLs are built so the user always sees an explicit auth/consent step
     (not a silent bind to whoever is already signed in on that browser). TikTok:
     ``disable_auto_auth=1``; Google: ``prompt`` includes ``login``; Meta:
-    ``auth_type=reauthenticate`` and a per-request ``auth_nonce``.
+    ``auth_type=reauthenticate,rerequest`` and a per-request ``auth_nonce``.
     """
     if platform not in OAUTH_CONFIG:
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -150,16 +156,16 @@ async def oauth_start(
             "prompt": "select_account consent login",
         }
     elif platform == "instagram":
-        # Meta Login: `rerequest` only re-prompts for declined permissions; it does not force
-        # a fresh Facebook login. `reauthenticate` requires password again (multi-account).
-        # `auth_nonce` avoids a cached silent dialog when opening the OAuth popup repeatedly.
+        # Meta Login: `reauthenticate` forces a fresh Facebook login (multi-account).
+        # `rerequest` re-prompts declined *and* newly approved permissions (e.g. pages_manage_posts
+        # after App Review). `auth_nonce` avoids a cached silent dialog on repeat popups.
         params = {
             "client_id": INSTAGRAM_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "scope": meta_instagram_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": "reauthenticate",
+            "auth_type": meta_oauth_auth_type(),
             "auth_nonce": secrets.token_hex(12),
         }
     elif platform == "facebook":
@@ -169,7 +175,7 @@ async def oauth_start(
             "scope": meta_facebook_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": "reauthenticate",
+            "auth_type": meta_oauth_auth_type(),
             "auth_nonce": secrets.token_hex(12),
         }
     
@@ -187,10 +193,16 @@ async def meta_oauth_config():
         "meta_oauth_mode": meta_oauth_mode(),
         "instagram_scope": meta_instagram_oauth_scope(),
         "facebook_scope": meta_facebook_oauth_scope(),
+        "facebook_permission_proof": FACEBOOK_GRAPH_PERMISSION_PROOF,
+        "instagram_permission_proof": INSTAGRAM_GRAPH_PERMISSION_PROOF,
+        "pages_manage_posts": facebook_pages_manage_posts_proof(),
+        "approved_usage": META_PERMISSION_ALLOWED_USAGE,
+        "rate_limiting": META_GRAPH_RATE_LIMITING,
         "notes": (
             "META_OAUTH_MODE=full is production (Meta-approved publish + insights). "
             "minimal requests only pages_show_list, pages_read_engagement, business_management "
-            "for a restricted reviewer demo. Facebook Page video uses pages_manage_posts, not publish_video."
+            "for a restricted reviewer demo. Facebook Page video uses pages_manage_posts "
+            "(POST /{page-id}/videos), not publish_video."
         ),
     }
 
@@ -287,6 +299,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             # Exchange code for tokens based on platform
             token_payload = {}
+            meta_llt_ok = False
             if platform == "tiktok":
                 from services.tiktok_api import (
                     fetch_tiktok_user_profile_for_oauth,
@@ -393,6 +406,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     
             elif platform == "instagram":
                 # Instagram Graph API: authenticate via Facebook, get Instagram Business Account
+                from services.meta_oauth_connect import list_instagram_destinations
+
                 token_response = await client.get(config["token_url"], params={
                     "client_id": INSTAGRAM_CLIENT_ID,
                     "client_secret": INSTAGRAM_CLIENT_SECRET,
@@ -405,13 +420,23 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 if not user_access_token:
                     raise Exception(f"No access token: {token_data}")
 
+                user_access_token, meta_user_expires_in = await exchange_long_lived_user_token(
+                    client,
+                    user_access_token,
+                    app_id=INSTAGRAM_CLIENT_ID,
+                    app_secret=INSTAGRAM_CLIENT_SECRET,
+                )
+                if meta_user_expires_in:
+                    token_data["expires_in"] = meta_user_expires_in
+                    meta_llt_ok = True
+
                 meta_perms = await fetch_granted_permissions(client, user_access_token)
 
                 # App-scoped Facebook user id (ASID) — required to honor Meta data-deletion callbacks.
                 facebook_user_asid = None
                 try:
                     me_resp = await client.get(
-                        "https://graph.facebook.com/v18.0/me",
+                        f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/me",
                         params={"fields": "id", "access_token": user_access_token},
                     )
                     if me_resp.status_code == 200:
@@ -419,66 +444,50 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 except Exception as _asid_e:
                     logger.debug("Instagram OAuth ASID fetch skipped: %s", _asid_e)
 
-                # Get Facebook Pages the user manages
-                pages_response = await client.get(
-                    f"https://graph.facebook.com/v18.0/me/accounts?access_token={user_access_token}"
-                )
-                pages_data = pages_response.json()
-                pages = pages_data.get("data", [])
-                
-                if not pages:
-                    raise Exception("No Facebook Pages found. You need a Facebook Page connected to an Instagram Business account.")
-                
-                # Find Instagram Business Account connected to any page
-                instagram_account = None
-                page_access_token = None
-                
-                for page in pages:
-                    page_id = page.get("id")
-                    page_token = page.get("access_token")
-                    
-                    # Check if this page has an Instagram Business Account
-                    ig_response = await client.get(
-                        f"https://graph.facebook.com/v18.0/{page_id}?fields=instagram_business_account&access_token={page_token}"
+                destinations = await list_instagram_destinations(client, user_access_token)
+                if not destinations:
+                    raise Exception(
+                        "No Instagram Business/Creator account found on your Facebook Pages. "
+                        "Connect Instagram to a Page in Meta Business Suite, then try again."
                     )
-                    ig_data = ig_response.json()
-                    
-                    if "instagram_business_account" in ig_data:
-                        ig_account_id = ig_data["instagram_business_account"]["id"]
 
-                        # Profile fields require instagram_basic; minimal OAuth may only grant pages_* + business_management.
-                        ig_details_response = await client.get(
-                            f"https://graph.facebook.com/v18.0/{ig_account_id}?fields=id,username,name,profile_picture_url&access_token={page_token}"
-                        )
-                        if ig_details_response.status_code == 200:
-                            instagram_account = ig_details_response.json()
-                        else:
-                            logger.warning(
-                                "Instagram profile fetch HTTP %s (degraded identity): %s",
-                                ig_details_response.status_code,
-                                (ig_details_response.text or "")[:240],
-                            )
-                            instagram_account = {
-                                "id": ig_account_id,
-                                "username": "",
-                                "name": f"Instagram account {ig_account_id}",
-                                "profile_picture_url": "",
-                            }
+                from core.config import BASE_URL as _API_BASE
+                from services.meta_oauth_connect import resolve_or_pick_destination
 
-                        page_access_token = page_token
-                        break
-                
-                if not instagram_account:
-                    raise Exception("No Instagram Business account found connected to your Facebook Pages. Connect your Instagram Business/Creator account to a Facebook Page first.")
-                
-                account_id = instagram_account.get("id")
-                account_name = instagram_account.get("name") or instagram_account.get("username", "Instagram Account")
-                # username can be empty for some accounts; use name as fallback for display
-                account_username = (instagram_account.get("username") or "").strip() or account_name
-                account_avatar = instagram_account.get("profile_picture_url", "")
-                access_token = page_access_token  # Use Page token for API calls
+                reconnect_expected = state_data.get("reconnect_expected_provider_account_id")
+                chosen, pick_html = await resolve_or_pick_destination(
+                    platform="instagram",
+                    destinations=destinations,
+                    expected_provider_id=reconnect_expected,
+                    pending_fields={
+                        "user_id": user_id,
+                        "token_expires_in": token_data.get("expires_in"),
+                        "meta_llt_ok": meta_llt_ok,
+                        "meta_permissions": meta_perms,
+                        "facebook_user_asid": facebook_user_asid,
+                        "user_access_token": user_access_token,
+                        "reconnect_account_id": state_data.get("reconnect_account_id"),
+                    },
+                    post_target=post_target,
+                    api_base=_API_BASE,
+                )
+                if pick_html is not None:
+                    return pick_html
+                if not chosen:
+                    raise Exception("Could not resolve an Instagram account to connect.")
+
+                account_id = chosen["destination_id"]
+                account_name = chosen.get("name") or chosen.get("username") or "Instagram Account"
+                account_username = (chosen.get("username") or "").strip() or account_name
+                account_avatar = chosen.get("avatar") or ""
+                access_token = chosen["access_token"]
                 
             elif platform == "facebook":
+                from services.meta_oauth_connect import (
+                    list_facebook_page_destinations,
+                    resolve_or_pick_destination,
+                )
+
                 token_response = await client.get(config["token_url"], params={
                     "client_id": FACEBOOK_CLIENT_ID,
                     "client_secret": FACEBOOK_CLIENT_SECRET,
@@ -491,13 +500,22 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 if not user_access_token:
                     raise Exception(f"No access token returned: {token_data}")
 
+                user_access_token, meta_user_expires_in = await exchange_long_lived_user_token(
+                    client,
+                    user_access_token,
+                    app_id=FACEBOOK_CLIENT_ID,
+                    app_secret=FACEBOOK_CLIENT_SECRET,
+                )
+                if meta_user_expires_in:
+                    token_data["expires_in"] = meta_user_expires_in
+                    meta_llt_ok = True
+
                 meta_perms_fb = await fetch_granted_permissions(client, user_access_token)
 
-                # App-scoped Facebook user id (ASID) — required to honor Meta data-deletion callbacks.
                 facebook_user_asid = None
                 try:
                     me_resp = await client.get(
-                        "https://graph.facebook.com/v18.0/me",
+                        f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/me",
                         params={"fields": "id", "access_token": user_access_token},
                     )
                     if me_resp.status_code == 200:
@@ -505,29 +523,42 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 except Exception as _asid_e:
                     logger.debug("Facebook OAuth ASID fetch skipped: %s", _asid_e)
 
-                # Facebook Reels require a Page token, not a user token.
-                # Fetch the user's Pages and use the first one.
-                pages_response = await client.get(
-                    "https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": user_access_token, "fields": "id,name,username,access_token,picture"},
-                )
-                pages_data = pages_response.json()
-                pages = pages_data.get("data", [])
-
-                if not pages:
+                destinations = await list_facebook_page_destinations(client, user_access_token)
+                if not destinations:
                     raise Exception(
                         "No Facebook Pages found. You need a Facebook Page to publish Reels. "
                         "Create a Page at facebook.com/pages/create and try again."
                     )
 
-                # Use the first Page
-                page = pages[0]
-                account_id    = page["id"]                                         # Page ID
-                account_name  = page.get("name", "Facebook Page")
-                # Page username (e.g. for facebook.com/PageName); fallback to page name when empty
-                account_username = (page.get("username") or "").strip() or account_name
-                account_avatar   = page.get("picture", {}).get("data", {}).get("url", "")
-                access_token     = page["access_token"]                            # Page token
+                from core.config import BASE_URL as _API_BASE
+
+                reconnect_expected = state_data.get("reconnect_expected_provider_account_id")
+                chosen, pick_html = await resolve_or_pick_destination(
+                    platform="facebook",
+                    destinations=destinations,
+                    expected_provider_id=reconnect_expected,
+                    pending_fields={
+                        "user_id": user_id,
+                        "token_expires_in": token_data.get("expires_in"),
+                        "meta_llt_ok": meta_llt_ok,
+                        "meta_permissions": meta_perms_fb,
+                        "facebook_user_asid": facebook_user_asid,
+                        "user_access_token": user_access_token,
+                        "reconnect_account_id": state_data.get("reconnect_account_id"),
+                    },
+                    post_target=post_target,
+                    api_base=_API_BASE,
+                )
+                if pick_html is not None:
+                    return pick_html
+                if not chosen:
+                    raise Exception("Could not resolve a Facebook Page to connect.")
+
+                account_id = chosen["destination_id"]
+                account_name = chosen.get("name") or "Facebook Page"
+                account_username = (chosen.get("username") or "").strip() or account_name
+                account_avatar = chosen.get("avatar") or ""
+                access_token = chosen["access_token"]
 
             # Copy profile image into R2 — FB/IG/TikTok CDN URLs often 403 when hotlinked from the browser.
             _avatar_before_mirror = str(account_avatar)[:120] if account_avatar else ""
@@ -561,13 +592,20 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 "refresh_token": token_data.get("refresh_token") or token_payload.get("refresh_token"),
                 **_exp_fields,
             }
-            # Meta page tokens from /me/accounts are typically non-expiring when
-            # derived from a long-lived user token; stamp cadence fields anyway.
-            if platform in ("instagram", "facebook") and not _raw_exp:
-                blob_payload.update(
-                    stamp_token_expiry(blob_payload, non_expiring=True)
-                )
+            # Page tokens derived from a long-lived user token do not expire.
+            # If LLT exchange failed, the page token is short-lived (~1–2h) —
+            # never stamp access_non_expiring or keepalive will skip refresh.
             if platform in ("instagram", "facebook"):
+                if meta_llt_ok:
+                    blob_payload.update(
+                        stamp_token_expiry(blob_payload, non_expiring=True)
+                    )
+                else:
+                    logger.warning(
+                        "Meta LLT exchange failed for %s — storing short-lived page token expiry",
+                        platform,
+                    )
+                    blob_payload.pop("access_non_expiring", None)
                 blob_payload["meta_oauth_mode"] = meta_oauth_mode()
                 if platform == "instagram":
                     blob_payload["meta_permissions"] = meta_perms
@@ -581,6 +619,9 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 _uat = locals().get("user_access_token")
                 if _uat:
                     blob_payload["meta_user_token"] = str(_uat)
+                if _raw_exp:
+                    user_stamp = stamp_token_expiry({}, expires_in=_raw_exp)
+                    blob_payload["meta_user_expires_at"] = user_stamp.get("expires_at")
             if platform == "instagram" and account_id:
                 blob_payload["ig_user_id"] = str(account_id)
             if platform == "facebook" and account_id:
@@ -721,4 +762,25 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
 
         user_msg = str(e) if len(str(e)) < 200 and "token" not in str(e).lower() else "Connection failed. Please try again."
         return popup_response(False, platform, user_msg)
+
+
+@router.post("/api/oauth/{platform}/select-destination")
+async def oauth_select_destination(
+    platform: str,
+    pick_token: str = Form(...),
+    destination_id: str = Form(...),
+    parent_origin: Optional[str] = Form(None),
+):
+    """Complete Meta OAuth after the user picks a Page / Instagram account."""
+    if platform not in ("facebook", "instagram"):
+        raise HTTPException(400, "Destination pick is only for Facebook and Instagram")
+    from services.oauth_meta_finish import finish_meta_destination_pick
+
+    return await finish_meta_destination_pick(
+        platform=platform,
+        pick_token=pick_token,
+        destination_id=destination_id,
+        parent_origin=parent_origin,
+        frontend_url=FRONTEND_URL,
+    )
 

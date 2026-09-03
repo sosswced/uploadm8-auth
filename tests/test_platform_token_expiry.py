@@ -82,6 +82,17 @@ def test_meta_non_expiring_cadence():
     assert should_refresh_access_token("facebook", aged, now=now) is True
 
 
+def test_meta_short_lived_page_token_refreshes_when_llt_failed():
+    """If LLT exchange fails, page tokens must keep a near expiry so keepalive runs."""
+    now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+    blob = stamp_token_expiry({"access_token": "page"}, expires_in=7200, now=now)
+    assert blob.get("access_non_expiring") is not True
+    # Meta refresh lead is 7 days; a 2h token is already inside the lead.
+    assert should_refresh_access_token("instagram", blob, now=now) is True
+    non_exp = stamp_token_expiry({"access_token": "page"}, non_expiring=True, now=now)
+    assert should_refresh_access_token("facebook", non_exp, now=now) is False
+
+
 def test_unknown_expiry_youtube_refreshes_tiktok_refreshes_meta_unknown_age():
     now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
     empty = {}

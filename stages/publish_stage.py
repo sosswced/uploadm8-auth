@@ -45,9 +45,13 @@ from . import r2 as r2_stage
 from .image_format import ensure_jpeg_file, sniff_image_format
 
 from services.publish_metadata_gate import assert_publish_metadata_gate
+from stages.redis_publish_guard import (
+    publish_circuit_open,
+    publish_record_result,
+    publish_wait_slot,
+)
 from services.tiktok_api import (
     resolve_tiktok_post_settings_for_account,
-    tiktok_force_private_unaudited,
     tiktok_post_info_from_settings,
     validate_tiktok_post_settings,
 )
@@ -449,17 +453,8 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
     return level
 
 
-def _tiktok_force_private_unaudited_enabled() -> bool:
-    """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of user privacy choice.
-
-    Always False after Content Posting audit approval — env rollback flags are
-    ignored so a sticky Render ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` cannot clamp
-    public posts to Only me.
-    """
-    return tiktok_force_private_unaudited()
-
-
-def _tiktok_unaudited_private_only_error(body: str) -> bool:
+def _tiktok_private_only_api_error(body: str) -> bool:
+    """True when TikTok rejects non-private Direct Post (portal misconfiguration)."""
     return "unaudited_client_can_only_post_to_private_accounts" in (body or "")
 
 
@@ -1047,117 +1042,85 @@ async def _refresh_meta_token(
     if not exchange_token:
         return token_data
 
-    app_id = os.environ.get("META_APP_ID", "") or os.environ.get("FACEBOOK_CLIENT_ID", "")
-    app_secret = os.environ.get("META_APP_SECRET", "") or os.environ.get("FACEBOOK_CLIENT_SECRET", "")
+    from services.meta_oauth import (
+        exchange_long_lived_user_token,
+        facebook_page_access_token_after_refresh,
+        fetch_granted_permissions,
+        fetch_managed_pages,
+        meta_app_credentials,
+        meta_graph_slot,
+        pick_managed_page,
+    )
+
+    app_id, app_secret = meta_app_credentials(plat)
 
     if not app_id or not app_secret:
         logger.warning(f"{platform}: Missing META_APP_ID/SECRET env vars, cannot refresh token")
         return token_data
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Step 1: Exchange user (preferred) token for a fresh long-lived user token
-            exchange_resp = await client.get(
-                "https://graph.facebook.com/v18.0/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": exchange_token,
-                },
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=30) as client:
+            new_user_token, exchange_expires_in = await exchange_long_lived_user_token(
+                client,
+                str(exchange_token),
+                app_id=app_id,
+                app_secret=app_secret,
             )
-            if exchange_resp.status_code != 200:
-                logger.warning(
-                    f"{platform}: Meta token exchange failed: "
-                    f"{exchange_resp.status_code} {exchange_resp.text[:200]}"
-                )
-                return token_data
-
-            new_user_token = exchange_resp.json().get("access_token")
             if not new_user_token:
                 logger.warning(f"{platform}: Meta exchange returned no access_token")
+                return token_data
+            if new_user_token == str(exchange_token) and exchange_expires_in is None:
+                logger.warning(
+                    "%s: Meta token exchange failed; leaving stored Page token unchanged",
+                    platform,
+                )
                 return token_data
 
             logger.info(f"{platform}: Meta user token refreshed successfully")
 
-            # Step 2: For Instagram/Facebook Page tokens, re-fetch the Page token
-            # Page tokens derived from a long-lived user token do not expire,
-            # so re-fetching gives us a stable non-expiring page token.
-            page_id = token_data.get("page_id") or token_data.get("ig_user_id")
-
-            if platform == "facebook" and page_id:
-                pages_resp = await client.get(
-                    "https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": new_user_token, "fields": "id,access_token"},
-                )
-                if pages_resp.status_code == 200:
-                    pages = pages_resp.json().get("data", [])
-                    matching = next((p for p in pages if p.get("id") == page_id), None)
-                    if matching:
-                        new_page_token = matching.get("access_token", new_user_token)
-                        from core.platform_token_expiry import stamp_token_expiry
-
-                        exchange_body = {}
-                        try:
-                            exchange_body = exchange_resp.json() or {}
-                        except Exception:
-                            exchange_body = {}
-                        updated = stamp_token_expiry(
-                            {
-                                **token_data,
-                                "access_token": new_page_token,
-                                "meta_user_token": new_user_token,
-                            },
-                            non_expiring=True,
-                        )
-                        if exchange_body.get("expires_in"):
-                            user_stamp = stamp_token_expiry(
-                                {}, expires_in=exchange_body.get("expires_in")
-                            )
-                            updated["meta_user_expires_at"] = user_stamp.get("expires_at")
-                        if db_pool and user_id:
-                            try:
-                                await db_stage.save_refreshed_token(
-                                    db_pool,
-                                    user_id=user_id,
-                                    platform=platform,
-                                    access_token=new_page_token,
-                                    token_row_id=token_row_id,
-                                    expires_at=None,
-                                    access_obtained_at=updated.get("access_obtained_at"),
-                                    access_non_expiring=True,
-                                    extra_plain={
-                                        "meta_user_token": new_user_token,
-                                        "meta_user_expires_at": updated.get("meta_user_expires_at"),
-                                    },
-                                )
-                            except Exception as save_err:
-                                logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
-                        return updated
-
-            # ── Recover missing ig_user_id / page_id ────────────────────────
-            # Old tokens stored before the OAuth fix may lack these IDs.
-            # Now that we have a fresh user token we can fetch them on the fly
-            # so the publish succeeds without forcing the user to reconnect.
-            # Step 1: Fetch user's Pages — id, name, page access_token only.
-            # instagram_business_account is NOT a valid inline field on /me/accounts;
-            # it must be fetched per-page via /{page_id}?fields=instagram_business_account
-            pages_resp = await client.get(
-                "https://graph.facebook.com/v18.0/me/accounts",
-                params={"access_token": new_user_token, "fields": "id,name,access_token"},
+            pages = await fetch_managed_pages(
+                client,
+                new_user_token,
+                fields="id,name,access_token",
             )
+            meta_perms = await fetch_granted_permissions(client, new_user_token)
+            from core.platform_token_expiry import stamp_token_expiry
 
+            page_id = token_data.get("page_id") or token_data.get("facebook_page_id")
             recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
-            recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
-            recovered_page_token = new_user_token  # fallback
+            recovered_page_id = page_id
+            recovered_page_token = access_token
 
-            if pages_resp.status_code == 200:
-                pages = pages_resp.json().get("data", [])
-
-                if platform == "instagram" and not recovered_ig_user_id:
-                    # instagram_business_account must be fetched per-page
+            if platform == "facebook":
+                matched = pick_managed_page(pages, page_id=page_id)
+                if not matched and page_id:
+                    logger.warning(
+                        "%s: /me/accounts did not include page_id=%s after refresh; "
+                        "keeping stored Page token (will not persist a user token as access_token)",
+                        platform,
+                        page_id,
+                    )
+                if not recovered_page_id and pages:
+                    first = pages[0]
+                    recovered_page_id = first.get("id")
+                    matched = matched or first
+                    logger.info(
+                        "facebook: Recovered page_id=%s from Page '%s' during token refresh",
+                        recovered_page_id,
+                        first.get("name", "?"),
+                    )
+                recovered_page_token = facebook_page_access_token_after_refresh(
+                    stored_access_token=str(access_token or ""),
+                    stored_page_id=str(recovered_page_id or "") or None,
+                    matched_page=matched,
+                    new_user_token=new_user_token,
+                )
+            else:
+                # Instagram: recover missing ig_user_id from Pages when possible.
+                recovered_page_token = str(access_token or new_user_token)
+                if not recovered_ig_user_id:
                     for page in pages:
-                        page_id_tmp    = page.get("id")
+                        page_id_tmp = page.get("id")
                         page_token_tmp = page.get("access_token", new_user_token)
                         if not page_id_tmp:
                             continue
@@ -1174,36 +1137,23 @@ async def _refresh_meta_token(
                                 recovered_ig_user_id = ig_biz["id"]
                                 recovered_page_token = page_token_tmp
                                 logger.info(
-                                    f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
-                                    f"from Page '{page.get('name', '?')}' during token refresh"
+                                    "instagram: Recovered ig_user_id=%s "
+                                    "from Page '%s' during token refresh",
+                                    recovered_ig_user_id,
+                                    page.get("name", "?"),
                                 )
                                 break
 
-                if platform == "facebook" and not recovered_page_id and pages:
-                    first = pages[0]
-                    recovered_page_id    = first["id"]
-                    recovered_page_token = first.get("access_token", new_user_token)
-                    logger.info(
-                        f"facebook: Recovered page_id={recovered_page_id} "
-                        f"from Page '{first.get('name', '?')}' during token refresh"
-                    )
-
-            # Build updated blob — preserve any existing IDs, override with recovered ones
-            from core.platform_token_expiry import stamp_token_expiry
-
-            exchange_expires_in = None
-            try:
-                exchange_expires_in = exchange_resp.json().get("expires_in")
-            except Exception:
-                exchange_expires_in = None
             updated = stamp_token_expiry(
                 {
                     **token_data,
-                    "access_token": recovered_page_token if platform == "instagram" else new_user_token,
+                    "access_token": recovered_page_token,
                     "meta_user_token": new_user_token,
                 },
                 non_expiring=True,
             )
+            if meta_perms:
+                updated["meta_permissions"] = meta_perms
             if exchange_expires_in:
                 user_stamp = stamp_token_expiry({}, expires_in=exchange_expires_in)
                 updated["meta_user_expires_at"] = user_stamp.get("expires_at")
@@ -1211,10 +1161,17 @@ async def _refresh_meta_token(
                 updated["ig_user_id"] = recovered_ig_user_id
             if platform == "facebook" and recovered_page_id:
                 updated["page_id"] = recovered_page_id
-                updated["access_token"] = recovered_page_token
 
             if db_pool and user_id:
                 try:
+                    extra_plain = {
+                        "meta_user_token": new_user_token,
+                        "meta_user_expires_at": updated.get("meta_user_expires_at"),
+                        "ig_user_id": updated.get("ig_user_id"),
+                        "page_id": updated.get("page_id"),
+                    }
+                    if meta_perms:
+                        extra_plain["meta_permissions"] = meta_perms
                     await db_stage.save_refreshed_token(
                         db_pool,
                         user_id=user_id,
@@ -1224,12 +1181,7 @@ async def _refresh_meta_token(
                         expires_at=None,
                         access_obtained_at=updated.get("access_obtained_at"),
                         access_non_expiring=True,
-                        extra_plain={
-                            "meta_user_token": new_user_token,
-                            "meta_user_expires_at": updated.get("meta_user_expires_at"),
-                            "ig_user_id": updated.get("ig_user_id"),
-                            "page_id": updated.get("page_id"),
-                        },
+                        extra_plain=extra_plain,
                     )
                 except Exception as save_err:
                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -1431,29 +1383,17 @@ async def publish_to_tiktok(
         )
 
         tiktok_privacy = str(tt_settings.get("privacy_level") or "").strip()
-        privacy_overridden_unaudited = False
         post_info: dict = {}
         if not finish_in_app:
-            if _tiktok_force_private_unaudited_enabled():
-                if tiktok_privacy != "SELF_ONLY":
-                    logger.info(
-                        "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY "
-                        "(user was informed of this at upload time; video will be private until audit passes)",
-                        tiktok_privacy,
-                    )
-                    privacy_overridden_unaudited = True
-                tiktok_privacy = "SELF_ONLY"
-
             cover_ms = _tiktok_cover_timestamp_ms(ctx)
             post_info = tiktok_post_info_from_settings(tt_settings, title=tiktok_title)
             post_info["video_cover_timestamp_ms"] = cover_ms
             post_info["privacy_level"] = tiktok_privacy
             logger.info(
-                "TikTok: video_cover_timestamp_ms=%s (%.2fs) privacy=%s unaudited_clamp=%s",
+                "TikTok: video_cover_timestamp_ms=%s (%.2fs) privacy=%s",
                 cover_ms,
                 cover_ms / 1000.0,
                 post_info.get("privacy_level"),
-                privacy_overridden_unaudited,
             )
 
         async with httpx.AsyncClient(timeout=120) as client:
@@ -1478,36 +1418,21 @@ async def publish_to_tiktok(
             if (
                 not finish_in_app
                 and init_resp.status_code != 200
-                and _tiktok_unaudited_private_only_error(init_resp.text)
+                and _tiktok_private_only_api_error(init_resp.text)
                 and post_info.get("privacy_level") != "SELF_ONLY"
             ):
-                if not _tiktok_force_private_unaudited_enabled():
-                    return PlatformResult(
-                        platform="tiktok",
-                        success=False,
-                        http_status=init_resp.status_code,
-                        error_code="TIKTOK_PRIVATE_ONLY_REJECTED",
-                        error_message=(
-                            "TikTok rejected non-private Direct Post "
-                            "(unaudited_client_can_only_post_to_private_accounts). "
-                            "Confirm Content Posting API audit is approved in the "
-                            "TikTok Developer Portal, then retry. "
-                            f"Detail: {init_resp.text[:240]}"
-                        ),
-                    )
-                logger.info(
-                    "TikTok: FORCE_PRIVATE — retrying init with privacy_level=SELF_ONLY "
-                    "(was %s)",
-                    post_info.get("privacy_level"),
-                )
-                post_info = {**post_info, "privacy_level": "SELF_ONLY"}
-                init_resp = await _tiktok_init_direct_post(
-                    client,
-                    access_token=access_token,
-                    post_info=post_info,
-                    file_size=file_size,
-                    chunk_size=chunk_size,
-                    total_chunk_count=total_chunk_count,
+                return PlatformResult(
+                    platform="tiktok",
+                    success=False,
+                    http_status=init_resp.status_code,
+                    error_code="TIKTOK_PRIVATE_ONLY_REJECTED",
+                    error_message=(
+                        "TikTok rejected non-private Direct Post "
+                        "(unaudited_client_can_only_post_to_private_accounts). "
+                        "Confirm Content Posting API audit status and scopes in the "
+                        "TikTok Developer Portal, then reconnect TikTok and retry. "
+                        f"Detail: {init_resp.text[:240]}"
+                    ),
                 )
 
             if init_resp.status_code != 200:
@@ -1575,7 +1500,6 @@ async def publish_to_tiktok(
             )
             payload = {
                 "tiktok_privacy_level": post_info.get("privacy_level") if post_info else None,
-                "tiktok_privacy_overridden_unaudited": privacy_overridden_unaudited,
                 "upload_privacy": (getattr(ctx, "privacy", None) or "public"),
                 "tiktok_disable_comment": post_info.get("disable_comment") if post_info else None,
                 "tiktok_disable_duet": post_info.get("disable_duet") if post_info else None,
@@ -1922,6 +1846,23 @@ async def publish_to_instagram(
         token_row_id=token_row_id,
     )
 
+    from services.meta_oauth import (
+        instagram_reels_container_url,
+        instagram_reels_publish_url,
+        meta_graph_is_rate_limited,
+        meta_graph_slot,
+        require_instagram_publish,
+    )
+
+    denied = require_instagram_publish(token_data)
+    if denied:
+        return PlatformResult(
+            platform="instagram",
+            success=False,
+            error_code="MISSING_PERMISSION",
+            error_message=denied,
+        )
+
     access_token = token_data.get("access_token")
     ig_user_id = (
         token_data.get("ig_user_id")
@@ -1962,7 +1903,7 @@ async def publish_to_instagram(
     ig_privacy = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "instagram")
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=120) as client:
             # Step 1: Create media container
             logger.info(f"Instagram: Creating Reels container for ig_user_id={ig_user_id} (privacy={ig_privacy})")
             ig_params = {
@@ -2051,18 +1992,21 @@ async def publish_to_instagram(
                     method,
                 )
             create_resp = await client.post(
-                f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
+                instagram_reels_container_url(ig_user_id, version=META_API_VERSION),
                 params=ig_params
             )
 
             if create_resp.status_code != 200:
                 error_body = create_resp.text[:300]
                 logger.error(f"Instagram container creation failed: {error_body}")
+                rl = meta_graph_is_rate_limited(
+                    create_resp.status_code, error_body, getattr(create_resp, "headers", None)
+                )
                 return PlatformResult(
                     platform="instagram",
                     success=False,
                     http_status=create_resp.status_code,
-                    error_code="CONTAINER_FAILED",
+                    error_code="PLATFORM_RATE_LIMIT" if rl else "CONTAINER_FAILED",
                     error_message=f"Container creation failed: {error_body}"
                 )
 
@@ -2133,7 +2077,7 @@ async def publish_to_instagram(
 
             # Step 3: Publish the container
             publish_resp = await client.post(
-                f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media_publish",
+                instagram_reels_publish_url(ig_user_id, version=META_API_VERSION),
                 params={
                     "access_token": access_token,
                     "creation_id": creation_id,
@@ -2142,11 +2086,14 @@ async def publish_to_instagram(
 
             if publish_resp.status_code != 200:
                 error_body = publish_resp.text[:300]
+                rl = meta_graph_is_rate_limited(
+                    publish_resp.status_code, error_body, getattr(publish_resp, "headers", None)
+                )
                 return PlatformResult(
                     platform="instagram",
                     success=False,
                     http_status=publish_resp.status_code,
-                    error_code="PUBLISH_FAILED",
+                    error_code="PLATFORM_RATE_LIMIT" if rl else "PUBLISH_FAILED",
                     error_message=f"Publish failed: {error_body}"
                 )
 
@@ -2252,6 +2199,22 @@ async def publish_to_facebook(
         token_row_id=token_row_id,
     )
 
+    from services.meta_oauth import (
+        facebook_page_videos_publish_url,
+        meta_graph_is_rate_limited,
+        meta_graph_slot,
+        require_facebook_publish,
+    )
+
+    denied = require_facebook_publish(token_data)
+    if denied:
+        return PlatformResult(
+            platform="facebook",
+            success=False,
+            error_code="MISSING_PERMISSION",
+            error_message=denied,
+        )
+
     access_token = token_data.get("access_token")
     page_id = (
         token_data.get("page_id")
@@ -2279,7 +2242,7 @@ async def publish_to_facebook(
     fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
     fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
     file_size = video_path.stat().st_size if video_path and video_path.exists() else 0
-    endpoint = f"https://graph.facebook.com/{META_API_VERSION}/{page_id}/videos"
+    endpoint = facebook_page_videos_publish_url(page_id, version=META_API_VERSION)
     post_params = {
         "access_token": access_token,
         "description": description[:5000] if description else "",
@@ -2300,125 +2263,138 @@ async def publish_to_facebook(
         )
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            prefer_url = bool(video_url) and (
-                must_use_file_url
-                or not (video_path and video_path.exists())
-            )
-            resp = None
-            upload_mode = "none"
-
-            if prefer_url and video_url:
-                upload_mode = "file_url"
-                resp = await client.post(
-                    endpoint,
-                    params={**post_params, "file_url": video_url},
+        async with meta_graph_slot():
+            async with httpx.AsyncClient(timeout=300) as client:
+                prefer_url = bool(video_url) and (
+                    must_use_file_url
+                    or not (video_path and video_path.exists())
                 )
-            elif video_path and video_path.exists():
-                upload_mode = "multipart"
-                with open(video_path, "rb") as f:
-                    files = {"source": ("video.mp4", f, "video/mp4")}
-                    resp = await client.post(endpoint, params=post_params, files=files)
-                if resp.status_code == 413:
-                    if video_url:
-                        logger.warning(
-                            "Facebook multipart 413 (%.1f MB) — retrying with file_url",
-                            file_size / 1024 / 1024,
-                        )
-                        upload_mode = "file_url_retry"
-                        resp = await client.post(
-                            endpoint,
-                            params={**post_params, "file_url": video_url},
-                        )
-                    else:
-                        video_url = _get_video_public_url(ctx, "facebook")
+                resp = None
+                upload_mode = "none"
+
+                if prefer_url and video_url:
+                    upload_mode = "file_url"
+                    resp = await client.post(
+                        endpoint,
+                        params={**post_params, "file_url": video_url},
+                    )
+                elif video_path and video_path.exists():
+                    upload_mode = "multipart"
+                    with open(video_path, "rb") as f:
+                        files = {"source": ("video.mp4", f, "video/mp4")}
+                        resp = await client.post(endpoint, params=post_params, files=files)
+                    if resp.status_code == 413:
                         if video_url:
                             logger.warning(
-                                "Facebook multipart 413 (%.1f MB) — resolved file_url on retry",
+                                "Facebook multipart 413 (%.1f MB) — retrying with file_url",
                                 file_size / 1024 / 1024,
                             )
-                            upload_mode = "file_url_late"
+                            upload_mode = "file_url_retry"
                             resp = await client.post(
                                 endpoint,
                                 params={**post_params, "file_url": video_url},
                             )
-            elif video_url:
-                upload_mode = "file_url"
-                resp = await client.post(
-                    endpoint,
-                    params={**post_params, "file_url": video_url},
-                )
-            else:
-                return PlatformResult(
-                    platform="facebook",
-                    success=False,
-                    error_code="NO_VIDEO",
-                    error_message="No video file or URL available for Facebook"
-                )
-
-            if resp.status_code != 200:
-                error_body = (resp.text or "").strip()[:300]
-                is_too_large = resp.status_code == 413
-                if is_too_large:
-                    msg = _facebook_file_too_large_message(
-                        file_size,
-                        upload_mode,
-                        missing_url=False,
+                        else:
+                            video_url = _get_video_public_url(ctx, "facebook")
+                            if video_url:
+                                logger.warning(
+                                    "Facebook multipart 413 (%.1f MB) — resolved file_url on retry",
+                                    file_size / 1024 / 1024,
+                                )
+                                upload_mode = "file_url_late"
+                                resp = await client.post(
+                                    endpoint,
+                                    params={**post_params, "file_url": video_url},
+                                )
+                elif video_url:
+                    upload_mode = "file_url"
+                    resp = await client.post(
+                        endpoint,
+                        params={**post_params, "file_url": video_url},
                     )
-                elif error_body:
-                    msg = f"Facebook upload failed (HTTP {resp.status_code}): {error_body}"
                 else:
-                    msg = (
-                        f"Facebook upload failed (HTTP {resp.status_code}, mode={upload_mode}). "
-                        "Check Meta token/page permissions or try again."
+                    return PlatformResult(
+                        platform="facebook",
+                        success=False,
+                        error_code="NO_VIDEO",
+                        error_message="No video file or URL available for Facebook"
                     )
+
+                if resp.status_code != 200:
+                    error_body = (resp.text or "").strip()[:300]
+                    is_too_large = resp.status_code == 413
+                    is_rate_limited = meta_graph_is_rate_limited(
+                        resp.status_code, error_body, getattr(resp, "headers", None)
+                    )
+                    if is_too_large:
+                        msg = _facebook_file_too_large_message(
+                            file_size,
+                            upload_mode,
+                            missing_url=False,
+                        )
+                    elif is_rate_limited:
+                        msg = (
+                            "Facebook Graph rate-limited this Page publish "
+                            "(error 4/17/32/613). Wait and retry."
+                        )
+                    elif error_body:
+                        msg = f"Facebook upload failed (HTTP {resp.status_code}): {error_body}"
+                    else:
+                        msg = (
+                            f"Facebook upload failed (HTTP {resp.status_code}, mode={upload_mode}). "
+                            "Check Meta token/page permissions or try again."
+                        )
+                    return PlatformResult(
+                        platform="facebook",
+                        success=False,
+                        http_status=resp.status_code,
+                        error_code=(
+                            "FILE_TOO_LARGE"
+                            if is_too_large
+                            else ("PLATFORM_RATE_LIMIT" if is_rate_limited else "UPLOAD_FAILED")
+                        ),
+                        error_message=msg,
+                    )
+
+                video_id = resp.json().get("id")
+                platform_url: Optional[str] = None
+                if video_id:
+                    try:
+                        perm_resp = await client.get(
+                            f"https://graph.facebook.com/{META_API_VERSION}/{video_id}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "permalink_url",
+                            },
+                        )
+                        if perm_resp.status_code == 200:
+                            platform_url = (perm_resp.json().get("permalink_url") or "").strip() or None
+                    except Exception as _e:
+                        logger.warning(f"Facebook: could not fetch permalink_url for {video_id}: {_e}")
+                    if not platform_url:
+                        if str(video_id).isdigit() and str(page_id).isdigit():
+                            platform_url = f"https://www.facebook.com/{page_id}/videos/{video_id}"
+                        else:
+                            platform_url = f"https://www.facebook.com/watch/?v={video_id}"
+                logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
+                # Push thumbnail to Facebook (non-fatal)
+                thumb_path = await _ensure_platform_thumbnail_local(ctx, "facebook")
+                if video_id and thumb_path:
+                    pushed = await _push_thumbnail_to_platform(
+                        "facebook", video_id, thumb_path, access_token, client, ctx=ctx
+                    )
+                    if not pushed:
+                        logger.warning(
+                            "Facebook: custom thumbnail not applied for video_id=%s",
+                            video_id,
+                        )
                 return PlatformResult(
                     platform="facebook",
-                    success=False,
-                    http_status=resp.status_code,
-                    error_code="FILE_TOO_LARGE" if is_too_large else "UPLOAD_FAILED",
-                    error_message=msg,
+                    success=True,
+                    platform_video_id=video_id,
+                    platform_url=platform_url,
+                    verify_status="pending",
                 )
-
-            video_id = resp.json().get("id")
-            platform_url: Optional[str] = None
-            if video_id:
-                try:
-                    perm_resp = await client.get(
-                        f"https://graph.facebook.com/{META_API_VERSION}/{video_id}",
-                        params={
-                            "access_token": access_token,
-                            "fields": "permalink_url",
-                        },
-                    )
-                    if perm_resp.status_code == 200:
-                        platform_url = (perm_resp.json().get("permalink_url") or "").strip() or None
-                except Exception as _e:
-                    logger.warning(f"Facebook: could not fetch permalink_url for {video_id}: {_e}")
-                if not platform_url:
-                    if str(video_id).isdigit() and str(page_id).isdigit():
-                        platform_url = f"https://www.facebook.com/{page_id}/videos/{video_id}"
-                    else:
-                        platform_url = f"https://www.facebook.com/watch/?v={video_id}"
-            logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
-            # Push thumbnail to Facebook (non-fatal)
-            thumb_path = await _ensure_platform_thumbnail_local(ctx, "facebook")
-            if video_id and thumb_path:
-                pushed = await _push_thumbnail_to_platform(
-                    "facebook", video_id, thumb_path, access_token, client, ctx=ctx
-                )
-                if not pushed:
-                    logger.warning(
-                        "Facebook: custom thumbnail not applied for video_id=%s",
-                        video_id,
-                    )
-            return PlatformResult(
-                platform="facebook",
-                success=True,
-                platform_video_id=video_id,
-                platform_url=platform_url,
-                verify_status="pending",
-            )
 
     except httpx.TimeoutException:
         return PlatformResult(
@@ -2627,6 +2603,10 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
     assert_publish_metadata_gate(ctx, pending_targets)
 
+    import core.state as _core_state
+
+    _pub_redis = getattr(_core_state, "redis_client", None)
+
     for platform, token_id in pending_targets:
         # Per-target cancel check — once a single platform has been posted we
         # don't try to "unpost" it (those APIs don't support that), but we DO
@@ -2665,6 +2645,23 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 )
         except Exception as _hb_e:
             logger.debug(f"[{ctx.upload_id}] publish heartbeat skipped: {_hb_e}")
+
+        if await publish_circuit_open(_pub_redis, platform):
+            msg = f"{platform} publish circuit open — backing off"
+            logger.warning("[%s] %s: %s", ctx.upload_id, account_label, msg)
+            ctx.platform_results.append(
+                PlatformResult(
+                    platform=platform,
+                    success=False,
+                    error_code="PLATFORM_RATE_LIMIT",
+                    error_message=msg,
+                    http_status=429,
+                    token_row_id=token_id,
+                )
+            )
+            continue
+
+        await publish_wait_slot(_pub_redis, platform)
 
         # -- Create ledger row (before API call) --
         attempt_id = None
@@ -2856,6 +2853,16 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
             result.account_name     = token_identity.get("account_name")
             result.account_avatar   = token_identity.get("account_avatar")
         ctx.platform_results.append(result)
+
+        try:
+            await publish_record_result(
+                _pub_redis,
+                platform,
+                bool(result.success),
+                http_status=result.http_status,
+            )
+        except Exception as _rl_e:
+            logger.debug("[%s] publish_record_result skipped: %s", ctx.upload_id, _rl_e)
 
         # -- Auto-record per-platform publish failure as an operational incident --
         # Surfaces failures on admin-incidents.html even when the overall pipeline

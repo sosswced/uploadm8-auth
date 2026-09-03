@@ -171,7 +171,7 @@ async def _event_already_processed(conn, event_id: Optional[str]) -> bool:
         return row is not None
     except Exception as e:
         logger.warning("stripe webhook: dedup lookup failed for %s: %s", event_id, e)
-        return False
+        raise
 
 
 async def _mark_event_processed(conn, event_id: Optional[str], event_type: str) -> None:
@@ -594,8 +594,11 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             if await _event_already_processed(_pre_conn, event_id):
                 logger.info("stripe webhook: duplicate event %s (%s) — skipping", event_id, etype)
                 return {"status": "duplicate", "event_id": event_id}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("stripe webhook: preflight check failed: %s", e)
+        raise HTTPException(503, "Webhook temporarily unavailable") from e
 
     # ── checkout.session.completed ──────────────────────────────────────
     if etype == "checkout.session.completed":

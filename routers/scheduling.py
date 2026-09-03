@@ -89,14 +89,17 @@ async def preview_smart_schedule(
     async with pool.acquire() as conn:
         tz = await _user_timezone(conn, bill_id)
         base_occ = await get_existing_scheduled_days(conn, bill_id, num_days)
-        hour_weights: Optional[Dict[str, List[float]]] = None
+        # Always pass a dict (possibly empty) so per-slot packing never
+        # re-enters hour-weight SQL after a batch failure (5000-slot storm).
+        hour_weights: Dict[str, List[float]] = {}
         try:
-            hour_weights = await build_hour_weights_for_platforms_batch(
+            loaded = await build_hour_weights_for_platforms_batch(
                 conn, bill_id, platforms, user_timezone=tz
             )
+            if isinstance(loaded, dict):
+                hour_weights = loaded
         except Exception as e:
             logger.warning("schedule preview hour weights failed user=%s: %s", bill_id[:8], e)
-            hour_weights = None
 
         extra_occ: dict = {}
         batch_items = []

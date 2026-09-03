@@ -1810,15 +1810,17 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             studio_render_report["persona_kind"] = persona_api.get("kind")
             studio_render_report["persona_uuid"] = persona_api.get("id")
         elif _persona_explicitly_required(us):
+            # Persona was requested but not linked. Do not SkipStage the whole
+            # Pikzels pipeline — still render custom covers without a face brand
+            # so queue/dashboard show a Studio thumb instead of YouTube hqdefault.
             studio_render_report["skip_reason"] = "persona_not_linked"
-            studio_render_report["pikzels_requested_but_skipped"] = True
-            if _strict_studio_mode_enabled(us) or _persona_explicitly_required(us):
-                # Skip styled Pikzels — keep frame-extract / non-persona path alive
-                # instead of failing the stage (Sentry UPLOADM8-8P).
-                raise SkipStage(
-                    "Linked Pikzels persona required but not resolved. "
-                    "Open Thumbnail Studio → Personas and Link to Pikzels, or turn off Apply persona."
-                )
+            studio_render_report["persona_unresolved_continue"] = True
+            logger.warning(
+                "[%s] Linked Pikzels persona not resolved — rendering without persona. "
+                "Link the persona in Thumbnail Studio to apply the face brand.",
+                getattr(ctx, "upload_id", ""),
+            )
+            persona_api = None
 
         studio_ok = bool(
             pikzels_studio_eligible_for_styled_thumbnail(

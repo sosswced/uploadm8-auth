@@ -59,7 +59,7 @@ _PRESETS: Dict[str, Dict[str, tuple]] = {
     },
     "standard": {
         "openai": (4, 0),
-        "meta": (4, 0),
+        "meta": (4, 150),
         "tiktok": (4, 0),
         "serpapi": (4, 0),
         "youtube_data": (4, 0),

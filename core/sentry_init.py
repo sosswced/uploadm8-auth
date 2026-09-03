@@ -301,8 +301,10 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str
 
 
 def _is_asyncpg_pool_reset_description(description: str) -> bool:
-    """asyncpg pool release runs RESET ALL — not actionable app SQL (Sentry UPLOADM8-*)."""
-    d = (description or "").lower()
+    """Pool housekeeping SQL — not actionable app queries (Sentry UPLOADM8-B5 / unlock spans)."""
+    d = (description or "").strip().lower().rstrip(";")
+    if d == "select 1":
+        return True
     return (
         "pg_advisory_unlock_all" in d
         or "reset all" in d

@@ -36,11 +36,13 @@ services:
         value: https://app.uploadm8.com
       - key: BASE_URL
         value: https://auth.uploadm8.com
+      - key: TRUST_PROXY_HEADERS
+        value: "1"
+      - key: RATE_LIMIT_LOOPBACK_BYPASS
+        value: "0"
       - key: TOKEN_ENC_KEYS
         sync: false
-      # TikTok Content Posting API audit approved — honor user privacy (not SELF_ONLY clamp)
-      - key: TIKTOK_APP_AUDITED
-        value: "1"
+      # TikTok Content Posting audit approved — Direct Post honors user privacy (no clamp envs)
 
   # Background Worker (needs Docker for FFmpeg)
   # OOM defense: pin concurrency=1 on Standard (2GB). Autoscaling instances does
@@ -64,9 +66,7 @@ services:
         value: uploadm8-media
       - key: TOKEN_ENC_KEYS
         sync: false
-      # TikTok Content Posting API audit approved — honor user privacy (not SELF_ONLY clamp)
-      - key: TIKTOK_APP_AUDITED
-        value: "1"
+      # TikTok Content Posting audit approved — Direct Post honors user privacy
       - key: UPLOAD_JOB_QUEUE
         value: uploadm8:jobs
       - key: PRIORITY_JOB_QUEUE
@@ -112,7 +112,7 @@ services:
       - key: TRANSCODE_PRESERVE_HD_TIER
         value: "false"
       - key: STALE_PROCESSING_MINUTES
-        value: "30"
+        value: "90"
       - key: ORPHAN_PROCESSING_GRACE_SEC
         value: "90"
       - key: ORPHAN_PROCESSING_RECOVERY_INTERVAL_SEC

@@ -142,6 +142,131 @@ def test_consensus_hud_plus_vision_is_high():
     assert publishable_peak_mph(ctx) >= 86.0
 
 
+def test_consensus_rejects_lon_integer_ghost_even_if_vision_agrees():
+    """HUD+vision both reading lon ``122`` as MPH must not publish."""
+    from core.speed_consensus import publishable_peak_mph
+
+    ocr_lines = "\n".join(
+        f"2025/03/05 04:50 12 PM 41.9222{i}° -122.5758{i}° 122MPH C Walker"
+        for i in range(4)
+    )
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 122.0,
+            "speed_series": [{"mph": 122.0, "t_s": float(i)} for i in range(4)],
+            "first_seen": {"lat": 41.92226, "lon": -122.57585},
+            "last_seen": {"lat": 41.92229, "lon": -122.57588},
+            "gps_path": [
+                [41.92226, -122.57585, 0.0],
+                [41.92227, -122.57586, 1.0],
+                [41.92228, -122.57587, 2.0],
+            ],
+            "speed_quality": {"gps_implied_peak_mph": 3.1},
+        },
+        vision_context={"ocr_text": ocr_lines},
+    )
+    c = build_speed_consensus(ctx)
+    assert c["peak_mph"] == 0.0
+    assert c["confidence"] in ("low", "none")
+    assert publishable_peak_mph(ctx) == 0.0
+
+
+def test_consensus_coord_ghost_when_gps_implied_missing():
+    """Missing gps_implied must still kill lat/lon integer peaks (not require motion)."""
+    from core.speed_consensus import publishable_peak_mph
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 122.0,
+            "speed_series": [{"mph": 122.0, "t_s": 1.0}],
+            "first_seen": {"lat": 41.92, "lon": -122.57},
+            "gps_path": [[41.92, -122.57, 0.0]],
+            "speed_quality": {},
+        },
+        vision_context={
+            "ocr_text": "2025/03/05 04:50 12 PM 41.92226° -122.57585° 122MPH C Walker"
+        },
+    )
+    c = build_speed_consensus(ctx)
+    assert publishable_peak_mph(ctx) == 0.0
+    assert c["peak_mph"] == 0.0 or c.get("source") == "coord_ghost" or c["confidence"] != "high"
+
+
+def test_osd_backfilled_telemetry_never_publishes_as_map():
+    """OSD→tel backfill is HUD family — cannot mint high via telemetry source."""
+    from core.speed_consensus import publishable_peak_mph
+
+    tel = _tel(122.0)
+    tel.osd_backfilled = True
+    ctx = _ctx(
+        telemetry=tel,
+        dashcam_osd_context={
+            "max_speed_mph": 122.0,
+            "telemetry_backfilled": True,
+            "speed_series": [{"mph": 122.0, "t_s": 1.0}],
+            "first_seen": {"lat": 41.92, "lon": -122.57},
+            "speed_quality": {"gps_implied_peak_mph": 2.0},
+        },
+    )
+    c = build_speed_consensus(ctx)
+    assert c.get("source") != "telemetry"
+    assert publishable_peak_mph(ctx) == 0.0
+
+
+def test_must_use_fail_closed_without_speed_consensus_key():
+    from stages.m8_engine import build_must_use_shortlist
+
+    tokens = build_must_use_shortlist(
+        {
+            "dashcam_osd": {"max_speed_mph": 122.0},
+            "geo": {"max_speed_mph": 122.0, "city": "Allendale"},
+        }
+    )
+    assert not any("MPH" in t.upper() for t in tokens)
+    assert any("Allendale" in t for t in tokens)
+
+
+def test_collect_evidence_scrub_keeps_medium_hud_peak():
+    """Medium HUD must scrub against the candidate peak — not eat all MPH."""
+    from core.speed_consensus import scrub_untrusted_speed_claims
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 88.0,
+            "speed_series": [{"mph": 86.0, "t_s": 5.0}],
+        },
+    )
+    pool = collect_evidence(ctx)
+    assert pool.max_speed_mph == 0.0  # not publishable
+    assert pool.scrub_speed_mph >= 86.0
+    kept = scrub_untrusted_speed_claims(
+        "Holding 88 MPH on the straight; later 46 MPH traffic.",
+        pool.scrub_speed_mph,
+    )
+    assert "88" in kept
+    assert "46" not in kept
+
+
+def test_title_rewrite_strips_medium_mph_without_inject():
+    """Titles must not keep medium HUD MPH after scrub; no inject when not high."""
+    from core.speed_consensus import scrub_untrusted_speed_claims
+
+    ctx = _ctx(
+        dashcam_osd_context={
+            "max_speed_mph": 88.0,
+            "speed_series": [{"mph": 86.0, "t_s": 5.0}],
+        },
+    )
+    pool = collect_evidence(ctx)
+    assert pool.max_speed_mph == 0.0
+    # Simulate title path: scrub candidate then fail-closed strip when not publishable.
+    mid = scrub_untrusted_speed_claims("88 MPH through Allendale", pool.scrub_speed_mph)
+    assert "88" in mid
+    final = scrub_untrusted_speed_claims(mid, 0.0)
+    assert "88" not in final
+    assert "MPH" not in final.upper()
+
+
 def test_consensus_none_when_no_speed():
     c = build_speed_consensus(_ctx())
     assert c["peak_mph"] == 0.0

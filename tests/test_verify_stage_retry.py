@@ -9,6 +9,7 @@ from stages.verify_stage import (
     _is_terminal_verify_status,
     _next_verify_status,
     _tiktok_items_to_update,
+    _tiktok_video_id_from_status_data,
 )
 
 
@@ -51,6 +52,62 @@ def test_tiktok_items_fallback_to_awaiting_video_id():
     matched = _tiktok_items_to_update(items, "missing")
     assert len(matched) == 1
     assert matched[0]["publish_id"] == "new"
+
+
+def test_tiktok_video_id_from_official_publicaly_available_post_id():
+    """TikTok status/fetch returns publicaly_available_post_id (their typo), not published_element."""
+    assert (
+        _tiktok_video_id_from_status_data(
+            {
+                "status": "PUBLISH_COMPLETE",
+                "publicaly_available_post_id": ["7123456789012345678"],
+                "uploaded_bytes": 10000,
+            }
+        )
+        == "7123456789012345678"
+    )
+    assert (
+        _tiktok_video_id_from_status_data(
+            {"status": "PUBLISH_COMPLETE", "publicaly_available_post_id": []}
+        )
+        is None
+    )
+    assert (
+        _tiktok_video_id_from_status_data(
+            {
+                "status": "PUBLISH_COMPLETE",
+                "publicly_available_post_id": ["9998887776665554443"],
+            }
+        )
+        == "9998887776665554443"
+    )
+    assert (
+        _tiktok_video_id_from_status_data(
+            {
+                "status": "PUBLISH_COMPLETE",
+                "share_url": "https://www.tiktok.com/@creator/video/7123456789012345678?lang=en",
+            }
+        )
+        == "7123456789012345678"
+    )
+    assert (
+        _tiktok_video_id_from_status_data(
+            {"published_element": {"video_id": "legacy-vid-1"}}
+        )
+        == "legacy-vid-1"
+    )
+
+
+def test_verify_tiktok_reads_publicaly_available_field():
+    src = inspect.getsource(verify_stage.verify_tiktok)
+    assert "publicaly_available_post_id" in src
+    assert "_tiktok_video_id_from_status_data" in src
+
+
+def test_maybe_stamp_tiktok_confirmation_exists_for_check_button():
+    src = inspect.getsource(verify_stage.maybe_stamp_tiktok_confirmation)
+    assert "publish_attempts" in src
+    assert "verify_single_attempt" in src
 
 
 def test_verify_loads_token_by_row_id_not_meta_google_alias():

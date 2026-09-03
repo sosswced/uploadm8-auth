@@ -307,7 +307,8 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
+        from services.meta_oauth import meta_graph_slot
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=25) as client:
             media = await client.get(
                 f"https://graph.facebook.com/v21.0/{ig_user_id}/media",
                 params={"access_token": access_token, "fields": "id,media_type,timestamp", "limit": 20},
@@ -400,7 +401,8 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
-        async with httpx.AsyncClient(timeout=25) as client:
+        from services.meta_oauth import meta_graph_slot
+        async with meta_graph_slot(), httpx.AsyncClient(timeout=25) as client:
             vids = await client.get(
                 f"https://graph.facebook.com/v21.0/{page_id}/videos",
                 params={"access_token": access_token, "fields": "id,created_time", "limit": 15},

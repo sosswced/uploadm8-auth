@@ -174,14 +174,16 @@ async def _fetch_platform_video_engagement(
             }
 
         if plat == "instagram" and video_id:
+            from services.meta_oauth import meta_graph_slot
             media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
-            resp = await client.get(
-                f"https://graph.facebook.com/v21.0/{media_id}/insights",
-                params={
-                    "access_token": access_token,
-                    "metric": "views,plays,likes,comments,saved,shares,reach",
-                },
-            )
+            async with meta_graph_slot():
+                resp = await client.get(
+                    f"https://graph.facebook.com/v21.0/{media_id}/insights",
+                    params={
+                        "access_token": access_token,
+                        "metric": "views,plays,likes,comments,saved,shares,reach",
+                    },
+                )
             if resp.status_code != 200:
                 return None
             s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
@@ -204,13 +206,15 @@ async def _fetch_platform_video_engagement(
             return s
 
         if plat == "facebook" and video_id:
-            resp = await client.get(
-                f"https://graph.facebook.com/v21.0/{video_id}",
-                params={
-                    "access_token": access_token,
-                    "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
-                },
-            )
+            from services.meta_oauth import meta_graph_slot
+            async with meta_graph_slot():
+                resp = await client.get(
+                    f"https://graph.facebook.com/v21.0/{video_id}",
+                    params={
+                        "access_token": access_token,
+                        "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
+                    },
+                )
             if resp.status_code != 200:
                 return None
             s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}

@@ -125,7 +125,11 @@ async def _pop_oauth_state(state: str) -> Optional[dict]:
 
 
 def get_oauth_redirect_uri(platform: str) -> str:
-    return f"{BASE_URL}/api/oauth/{platform}/callback"
+    """Provider callback URL. Prefer OAUTH_PUBLIC_BASE_URL for tunnels; else BASE_URL."""
+    from core.config import OAUTH_PUBLIC_BASE_URL
+
+    base = (OAUTH_PUBLIC_BASE_URL or BASE_URL or "").rstrip("/")
+    return f"{base}/api/oauth/{platform}/callback"
 
 
 def sanitize_oauth_parent_origin(origin: Optional[str]) -> str:

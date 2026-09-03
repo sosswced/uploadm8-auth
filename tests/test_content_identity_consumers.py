@@ -53,6 +53,7 @@ def _tel(mph: float) -> SimpleNamespace:
         location_start_display=None,
         gazetteer_place_name=None,
         padus_unit_name=None,
+        points=[{"lat": 35.0, "lon": -115.0}, {"lat": 35.01, "lon": -115.02}],
     )
 
 

@@ -30,6 +30,28 @@ def test_card_thumbnail_prefers_youtube_cdn_over_proxy_when_r2_key_stale():
     assert url != upload_card_thumbnail_href(upload_id)
 
 
+def test_card_thumbnail_prefers_custom_r2_over_youtube_hqdefault():
+    """Pikzels / frame covers must display even after YouTube posts hqdefault."""
+    upload_id = "73bfa9ac-3b44-4f73-a949-8b67d12eef15"
+    platform_results = [
+        {
+            "platform": "youtube",
+            "success": True,
+            "platform_video_id": "D8ujY99dh5c",
+        }
+    ]
+    with patch("services.upload.thumbnails.r2_object_exists", return_value=True):
+        url = card_thumbnail_url(
+            upload_id,
+            thumbnail_r2_key=f"thumbnails/user/{upload_id}/thumbnail.jpg",
+            output_artifacts={},
+            platform_results=platform_results,
+            upload_platforms=["youtube", "tiktok"],
+        )
+    assert url == upload_card_thumbnail_href(upload_id)
+    assert "ytimg.com" not in (url or "")
+
+
 def test_card_thumbnail_uses_proxy_only_when_r2_object_exists():
     upload_id = "e0f77697-efbd-4bec-b8fb-fd853bb270c5"
     with patch("services.upload.thumbnails.r2_object_exists", return_value=True):

@@ -56,41 +56,30 @@ TIKTOK_BRANDED_CONTENT_POLICY_URL = "https://www.tiktok.com/legal/page/global/bc
 
 
 def tiktok_app_audited() -> bool:
-    """True when Content Posting Direct Post may use public privacy levels.
-
-    UploadM8's TikTok Content Posting API audit is approved. Hardcoded True so a
-    mis-set Render ``TIKTOK_APP_AUDITED`` cannot flip UI/publish into unaudited mode.
-    """
+    """Content Posting Direct Post audit is approved — public privacy levels allowed."""
     return True
 
 
 def tiktok_unaudited_mode() -> bool:
-    """True only when explicitly opted out of audited Direct Post (UI banner)."""
-    return not tiktok_app_audited()
+    """Legacy flag for older UI clients; always False after audit approval."""
+    return False
 
 
 def tiktok_force_private_unaudited() -> bool:
-    """Clamp Direct Post privacy to SELF_ONLY — permanently disabled.
-
-    After TikTok audit approval, publish must honor the creator's chosen privacy.
-    Hardcoded False: ignore ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` (Render has been
-    sticky with a stale ``=1`` that privately published public selections).
-    """
+    """Legacy clamp flag; always False — publish honors creator privacy_level."""
     return False
 
 
 def tiktok_direct_post_status() -> dict:
-    """Machine-readable Direct Post capability for API/UI."""
-    audited = tiktok_app_audited()
-    force_private = tiktok_force_private_unaudited()
+    """Machine-readable Direct Post capability for API/UI (approved production)."""
     return {
         "api": "content_posting_direct_post",
         "source": "FILE_UPLOAD",
-        "app_audited": audited,
-        "unaudited_mode": not audited,
-        "privacy_clamped_to_self_only": force_private,
-        "public_publish_enabled": not force_private,
-        "force_private_env": force_private,
+        "app_audited": True,
+        "unaudited_mode": False,
+        "privacy_clamped_to_self_only": False,
+        "public_publish_enabled": True,
+        "force_private_env": False,
     }
 
 def tiktok_video_list_url() -> str:
@@ -328,30 +317,34 @@ async def fetch_tiktok_user_profile_for_oauth(
     access_token: str,
 ) -> dict:
     """
-    Fetch display name + avatar after OAuth using ``user.info.basic`` fields only.
+    Fetch identity after OAuth.
 
-    TikTok scope migration: ``open_id``, ``display_name``, and ``avatar_*`` live under
-    ``user.info.basic``. The old code incorrectly included ``username`` in the basic
-    field list; ``username`` requires ``user.info.profile`` and caused the whole
-    ``/v2/user/info/`` call to fail — empty name/avatar and ui-avatars placeholders.
+    Prefer ``user.info.profile`` fields (includes ``username`` for @handles / watch URLs).
+    Fall back to ``user.info.basic`` if profile scope was not granted yet (reconnect).
     """
     if not access_token or not str(access_token).strip():
         return tiktok_identity_from_user_object({})
 
     user_obj, hint = await _tiktok_user_info_get(
-        client, access_token, TIKTOK_USER_INFO_FIELDS_BASIC
+        client, access_token, TIKTOK_USER_INFO_FIELDS_PROFILE
     )
+    if not user_obj:
+        logger.info("TikTok user/info (profile) unavailable (%s); trying basic", hint)
+        user_obj, hint = await _tiktok_user_info_get(
+            client, access_token, TIKTOK_USER_INFO_FIELDS_BASIC
+        )
     if user_obj:
         ident = tiktok_identity_from_user_object(user_obj)
         logger.info(
-            "TikTok user/info (basic) has_name=%s has_avatar=%s open_id=%s",
+            "TikTok user/info has_name=%s has_username=%s has_avatar=%s open_id=%s",
             bool(ident.get("account_name")),
+            bool(ident.get("account_username")),
             bool(ident.get("account_avatar")),
             bool(ident.get("account_id")),
         )
         return ident
 
-    logger.warning("TikTok user/info (basic) failed: %s", hint)
+    logger.warning("TikTok user/info failed: %s", hint)
     return tiktok_identity_from_user_object({})
 
 

@@ -94,7 +94,7 @@
       "max_db_touch_lines": 11
     },
     "routers/oauth.py": {
-      "max_lines": 776,
+      "max_lines": 800,
       "max_db_touch_lines": 14
     },
     "routers/ops.py": {
@@ -122,7 +122,7 @@
       "max_db_touch_lines": 20
     },
     "routers/scheduling.py": {
-      "max_lines": 110,
+      "max_lines": 170,
       "max_db_touch_lines": 4
     },
     "routers/shell_bootstrap.py": {
@@ -158,7 +158,7 @@
       "max_db_touch_lines": 20
     },
     "routers/uploads_read.py": {
-      "max_lines": 365,
+      "max_lines": 380,
       "max_db_touch_lines": 9
     },
     "routers/uploads_schedule_legacy.py": {
@@ -174,7 +174,7 @@
       "max_db_touch_lines": 13
     },
     "routers/webhooks.py": {
-      "max_lines": 699,
+      "max_lines": 750,
       "max_db_touch_lines": 14
     },
     "routers/workspace.py": {

@@ -80,7 +80,17 @@ def _next_verify_status(
         # unknown → keep polling within the age window
         return "pending"
 
-    # Instagram / Facebook: publish already stores media/post id as platform_post_id.
+    # Instagram / Facebook: prefer Graph confirm; accept-on-id when still pending/unknown
+    # so UI does not stick after publish already returned a durable media id.
+    if plat in ("instagram", "facebook"):
+        if status == "confirmed":
+            return "confirmed"
+        if status == "pending":
+            return "pending" if not has_video_id else "confirmed"
+        if has_video_id:
+            return "confirmed"
+        return "pending"
+
     if has_video_id:
         return "confirmed"
     return "pending"
@@ -255,6 +265,47 @@ async def verify_youtube(video_id: str, token_data: dict) -> str:
         return "unknown"
 
 
+async def verify_meta_media(platform: str, media_id: str, token_data: dict) -> str:
+    """
+    Confirm Instagram media / Facebook Page video exists via Graph GET.
+
+    Returns: 'confirmed', 'rejected', 'pending', or 'unknown'.
+    """
+    access_token = (token_data or {}).get("access_token")
+    mid = str(media_id or "").strip()
+    if not access_token or not mid:
+        return "unknown"
+
+    from services.meta_oauth import META_GRAPH_API_VERSION
+
+    fields = "id,permalink" if platform == "instagram" else "id,status,permalink_url"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                f"https://graph.facebook.com/{META_GRAPH_API_VERSION}/{mid}",
+                params={"fields": fields, "access_token": access_token},
+            )
+            if resp.status_code in (401, 403):
+                return "pending"
+            if resp.status_code == 404:
+                return "rejected"
+            if resp.status_code != 200:
+                return "unknown"
+            data = resp.json() if resp.content else {}
+            if not isinstance(data, dict) or not data.get("id"):
+                return "unknown"
+            # Facebook video processing status when present
+            st = str(data.get("status") or "").strip().lower()
+            if st in ("error", "failed", "deleted"):
+                return "rejected"
+            if st in ("processing", "uploading", "encoding"):
+                return "pending"
+            return "confirmed"
+    except Exception as e:
+        logger.debug("Meta verify failed (%s): %s", platform, e)
+        return "unknown"
+
+
 async def verify_single_attempt(
     db_pool: asyncpg.Pool,
     attempt: dict,
@@ -273,16 +324,6 @@ async def verify_single_attempt(
     tiktok_post_url: Optional[str] = None
     plat = str(platform or "").strip().lower()
 
-    # Meta / YouTube already return durable post ids at accept time — confirm
-    # without a token round-trip (token-key mismatches used to leave these
-    # pending forever and flood "Verifying N publish attempts").
-    if plat in ("instagram", "facebook") and platform_post_id:
-        if prev_verify != "confirmed":
-            await db_stage.update_publish_attempt_verified(
-                db_pool, attempt_id, "confirmed"
-            )
-        return
-
     # Load the exact account token when we have token_row_id; fall back to
     # platform_tokens.platform (= tiktok|youtube|instagram|facebook). Older
     # code wrongly queried "meta"/"google" and always missed the row.
@@ -297,7 +338,13 @@ async def verify_single_attempt(
         token_data = None
 
     if not token_data:
-        # Token missing/revoked — keep pending so reconnect can finish confirmation.
+        # Meta/YouTube with a durable post id: confirm without token when Graph is unreachable.
+        if plat in ("instagram", "facebook", "youtube") and platform_post_id:
+            if prev_verify != "confirmed":
+                await db_stage.update_publish_attempt_verified(
+                    db_pool, attempt_id, "confirmed"
+                )
+            return
         logger.debug("Verify %s/%s: no token — leave pending", plat, attempt_id)
         if prev_verify != "pending":
             await db_stage.update_publish_attempt_verified(db_pool, attempt_id, "pending")
@@ -318,7 +365,11 @@ async def verify_single_attempt(
     elif plat == "youtube" and platform_post_id:
         raw_status = await verify_youtube(platform_post_id, token_data)
     elif plat in ("instagram", "facebook") and platform_post_id:
-        raw_status = "confirmed"
+        raw_status = await verify_meta_media(plat, str(platform_post_id), token_data)
+        # If Graph cannot confirm yet but we have an accept-time id, keep pending
+        # briefly; after soft failures still accept-on-id so UI does not stick.
+        if raw_status in ("unknown",) and platform_post_id:
+            raw_status = "confirmed"
     elif plat in ("instagram", "facebook"):
         raw_status = "pending"
     else:

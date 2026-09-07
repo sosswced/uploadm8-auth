@@ -2,6 +2,8 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from typing import Optional, List, Literal, Dict
 from datetime import datetime
 
+from core.scheduling import SMART_SCHEDULE_MAX_DAYS
+
 
 # ============================================================
 # USER PREFERENCES SYSTEM
@@ -81,6 +83,11 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
     name: str = Field(min_length=2)
+    # Optional first-touch acquisition (from signup.html ?utm_* / sessionStorage).
+    utm_source: Optional[str] = Field(default=None, max_length=128)
+    utm_medium: Optional[str] = Field(default=None, max_length=128)
+    utm_campaign: Optional[str] = Field(default=None, max_length=128)
+    utm_content: Optional[str] = Field(default=None, max_length=128)
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -123,8 +130,8 @@ class UploadInit(BaseModel):
     smart_schedule_days: int = Field(
         14,
         ge=1,
-        le=730,
-        description="Days to spread Smart Schedule across (1–730)",
+        le=SMART_SCHEDULE_MAX_DAYS,
+        description=f"Days to spread Smart Schedule across (1–{SMART_SCHEDULE_MAX_DAYS})",
     )
     smart_schedule_seed: Optional[str] = Field(
         None,

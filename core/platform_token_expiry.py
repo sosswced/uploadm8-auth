@@ -22,6 +22,46 @@ PLATFORM_REFRESH_LEAD: Dict[str, timedelta] = {
 # When Meta marks page tokens non-expiring, still re-mint periodically.
 _META_NON_EXPIRING_REFRESH_AFTER = timedelta(days=50)
 
+# Refresh-token lifetime is the hard ceiling on unattended publishing: once it
+# lapses no sweep can recover the account, only a human reconnect. Providers do
+# not always send refresh_expires_in, so these are the documented defaults used
+# when the blob carries no absolute refresh expiry.
+PLATFORM_REFRESH_TOKEN_LIFETIME: Dict[str, Optional[timedelta]] = {
+    # TikTok refresh tokens expire ~365d and only rotate on use.
+    "tiktok": timedelta(days=365),
+    # Google refresh tokens do not expire for published apps, but go stale after
+    # ~6 months of no use (and are revoked outright while the app is in testing).
+    "youtube": timedelta(days=180),
+    # Meta long-lived user tokens are ~60d; page tokens derived from them inherit it.
+    "instagram": timedelta(days=60),
+    "facebook": timedelta(days=60),
+}
+
+# Warn this far ahead of refresh-token death so the user can reconnect in time.
+REFRESH_EXPIRY_WARN_LEAD = timedelta(days=14)
+
+# Provider responses that mean the grant is genuinely gone. Anything else
+# (timeouts, 5xx, rate limits) is transient and must not kill the connection.
+_PERMANENT_OAUTH_ERROR_MARKERS = (
+    "invalid_grant",
+    "invalid_request",
+    "invalid_client",
+    "unauthorized_client",
+    "invalid_token",
+    "token_revoked",
+    "revoked",
+    "consent_required",
+    "access_denied",
+    "unsupported_grant_type",
+    "oauth2 parameter error",
+    "refresh token is invalid",
+    "refresh token not found",
+    "refresh token expired",
+    "session has been invalidated",
+    "user has not authorized",
+    "code expired",
+)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -147,6 +187,105 @@ def refresh_lead_for_platform(platform: str) -> timedelta:
     return PLATFORM_REFRESH_LEAD.get(str(platform or "").lower(), timedelta(hours=1))
 
 
+def parse_refresh_expires_at(
+    blob: Optional[Mapping[str, Any]],
+    *,
+    platform: str = "",
+    now: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """
+    Absolute UTC expiry of the *refresh* token, or None when it never expires.
+
+    Prefers an absolute value from the provider, then ``refresh_expires_in``
+    relative to when the token was obtained, then the platform default lifetime.
+    """
+    if not isinstance(blob, Mapping):
+        return None
+    if blob.get("refresh_non_expiring") is True:
+        return None
+
+    absolute = parse_dt(blob.get("refresh_expires_at"))
+    if absolute is not None:
+        return absolute
+
+    now = now or _utcnow()
+    obtained = (
+        parse_dt(blob.get("refresh_obtained_at"))
+        or parse_dt(blob.get("access_obtained_at"))
+        or parse_dt(blob.get("connected_at"))
+    )
+
+    raw = blob.get("refresh_expires_in")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            secs = int(float(raw))
+        except (TypeError, ValueError):
+            secs = 0
+        if secs > 0:
+            return (obtained or now) + timedelta(seconds=secs)
+
+    if not str(blob.get("refresh_token") or "").strip():
+        return None
+
+    lifetime = PLATFORM_REFRESH_TOKEN_LIFETIME.get(str(platform or "").lower())
+    if lifetime is None or obtained is None:
+        return None
+    return obtained + lifetime
+
+
+def refresh_token_alive_at(
+    blob: Optional[Mapping[str, Any]],
+    when: datetime,
+    *,
+    platform: str = "",
+    now: Optional[datetime] = None,
+) -> bool:
+    """
+    Can this connection still be refreshed at ``when``?
+
+    Drives the scheduling lookahead: a post scheduled past refresh-token death
+    cannot publish without the user reconnecting first.
+    """
+    expiry = parse_refresh_expires_at(blob, platform=platform, now=now)
+    if expiry is None:
+        return True
+    return when < expiry
+
+
+def refresh_expiry_state(
+    blob: Optional[Mapping[str, Any]],
+    *,
+    platform: str = "",
+    now: Optional[datetime] = None,
+    warn_lead: Optional[timedelta] = None,
+) -> str:
+    """``expired`` / ``expiring_soon`` / ``ok`` for the refresh token."""
+    now = now or _utcnow()
+    expiry = parse_refresh_expires_at(blob, platform=platform, now=now)
+    if expiry is None:
+        return "ok"
+    if now >= expiry:
+        return "expired"
+    if now + (warn_lead or REFRESH_EXPIRY_WARN_LEAD) >= expiry:
+        return "expiring_soon"
+    return "ok"
+
+
+def is_permanent_oauth_error(error: Any) -> bool:
+    """
+    True only when the provider said the grant is gone.
+
+    Transient faults (timeout, 5xx, rate limit, connection reset) return False
+    so the keepalive retries instead of declaring the account dead.
+    """
+    if error is None:
+        return False
+    text = str(error).strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _PERMANENT_OAUTH_ERROR_MARKERS)
+
+
 def should_refresh_access_token(
     platform: str,
     blob: Optional[Mapping[str, Any]],
@@ -186,10 +325,16 @@ def should_refresh_access_token(
 
 __all__ = [
     "PLATFORM_REFRESH_LEAD",
+    "PLATFORM_REFRESH_TOKEN_LIFETIME",
+    "REFRESH_EXPIRY_WARN_LEAD",
+    "is_permanent_oauth_error",
     "normalize_connect_expires_at",
     "parse_access_expires_at",
     "parse_dt",
+    "parse_refresh_expires_at",
+    "refresh_expiry_state",
     "refresh_lead_for_platform",
+    "refresh_token_alive_at",
     "should_refresh_access_token",
     "stamp_token_expiry",
 ]

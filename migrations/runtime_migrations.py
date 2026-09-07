@@ -2180,6 +2180,61 @@ async def run_migrations(db_pool):
                     ON platform_tokens (oauth_health)
                     WHERE revoked_at IS NULL AND oauth_health = 'needs_reconnection';
             """),
+            # First-touch acquisition UTMs for outside new-user attribution.
+            (1103, """
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS utm_source VARCHAR(128),
+                    ADD COLUMN IF NOT EXISTS utm_medium VARCHAR(128),
+                    ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(128),
+                    ADD COLUMN IF NOT EXISTS utm_content VARCHAR(128),
+                    ADD COLUMN IF NOT EXISTS utm_first_touch_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_users_utm_campaign
+                    ON users (utm_campaign)
+                    WHERE utm_campaign IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_users_utm_first_touch
+                    ON users (utm_first_touch_at DESC NULLS LAST)
+                    WHERE utm_first_touch_at IS NOT NULL;
+            """),
+            # Lightweight CRM fields for acquisition desk (no third-party CRM).
+            (1104, """
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS signup_source VARCHAR(64),
+                    ADD COLUMN IF NOT EXISTS lifecycle_stage VARCHAR(32) DEFAULT 'signed_up';
+                UPDATE users
+                    SET lifecycle_stage = COALESCE(NULLIF(lifecycle_stage, ''), 'signed_up')
+                    WHERE lifecycle_stage IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_users_signup_source
+                    ON users (signup_source)
+                    WHERE signup_source IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_users_lifecycle_stage
+                    ON users (lifecycle_stage);
+            """),
+            # OAuth keepalive durability: plaintext expiry mirrors so the sweep can
+            # order by deadline in SQL (expiry itself lives inside the encrypted
+            # blob), plus failure tracking so a provider outage no longer reads as
+            # a dead connection. Mirrors are backfilled by the sweep (NULLS FIRST).
+            (1105, """
+                ALTER TABLE platform_tokens
+                    ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS refresh_expires_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS access_non_expiring BOOLEAN,
+                    ADD COLUMN IF NOT EXISTS oauth_fail_count INT NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS oauth_last_failure_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS oauth_last_error VARCHAR(200),
+                    ADD COLUMN IF NOT EXISTS oauth_next_retry_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS oauth_last_verified_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS oauth_reconnect_alert_at TIMESTAMPTZ;
+                -- Deadline-first sweep cursor: unknown expiry sorts first so the
+                -- sweep stamps the mirror, then soonest-expiring wins.
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_keepalive_due
+                    ON platform_tokens (access_expires_at NULLS FIRST)
+                    WHERE revoked_at IS NULL;
+                -- Long-horizon risk: refresh token expiry is the hard ceiling on
+                -- how far ahead we can promise to publish.
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_refresh_expiry
+                    ON platform_tokens (refresh_expires_at)
+                    WHERE revoked_at IS NULL AND refresh_expires_at IS NOT NULL;
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

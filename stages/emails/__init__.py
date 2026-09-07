@@ -155,6 +155,7 @@ from .lifecycle import (
     send_payment_failed_email,
     send_trial_ending_reminder_email,
     send_low_token_warning_email,
+    send_platform_reconnect_email,
 )
 
 
@@ -201,4 +202,5 @@ __all__ = [
     "send_payment_failed_email",
     "send_trial_ending_reminder_email",
     "send_low_token_warning_email",
+    "send_platform_reconnect_email",
 ]

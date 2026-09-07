@@ -6,8 +6,10 @@ Routers attach cookies / JSONResponse; this module only performs data work.
 
 from __future__ import annotations
 
+import re
 import uuid
-from typing import Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional, Tuple
 
 from fastapi import HTTPException
 
@@ -20,7 +22,21 @@ from core.auth import (
 )
 from core.models import UserCreate, UserLogin
 from core.wallet import ledger_entry
+from services.activation_onboarding import derive_signup_source
 from stages.entitlements import get_entitlements_for_tier
+
+
+_UTM_ALLOWED = re.compile(r"[^A-Za-z0-9._\-/+ ]+")
+
+
+def _clean_utm(value: Any, *, max_len: int = 128) -> Optional[str]:
+    """Normalize a first-touch UTM value: trim, strip markup-capable chars, cap length."""
+    if value is None:
+        return None
+    s = _UTM_ALLOWED.sub("", str(value)).strip()
+    if not s:
+        return None
+    return s[:max_len]
 
 
 async def register_user(
@@ -42,13 +58,35 @@ async def register_user(
     if cc in ("XX", "T1", ""):
         cc = None
 
+    utm_source = _clean_utm(getattr(data, "utm_source", None))
+    utm_medium = _clean_utm(getattr(data, "utm_medium", None))
+    utm_campaign = _clean_utm(getattr(data, "utm_campaign", None))
+    utm_content = _clean_utm(getattr(data, "utm_content", None))
+    has_utm = any((utm_source, utm_medium, utm_campaign, utm_content))
+    utm_at = datetime.now(timezone.utc) if has_utm else None
+    signup_source = derive_signup_source(utm_source, utm_medium, utm_campaign)
+    lifecycle_stage = "signed_up"
+
     await conn.execute(
-        "INSERT INTO users (id, email, password_hash, name, country) VALUES ($1, $2, $3, $4, $5)",
+        """
+        INSERT INTO users (
+            id, email, password_hash, name, country,
+            utm_source, utm_medium, utm_campaign, utm_content, utm_first_touch_at,
+            signup_source, lifecycle_stage
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """,
         user_id,
         data.email.lower(),
         hash_password(data.password),
         data.name,
         cc,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_at,
+        signup_source,
+        lifecycle_stage,
     )
     await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
 

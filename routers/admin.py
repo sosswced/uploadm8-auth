@@ -979,10 +979,21 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
 # ============================================================
 
 @router.get("/users")
-async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(require_admin)):
+async def admin_get_users(
+    search: Optional[str] = None,
+    tier: Optional[str] = None,
+    lifecycle_stage: Optional[str] = None,
+    signup_source: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(require_admin),
+):
+    from services.activation_onboarding import effective_lifecycle_stage
+
     query = (
         "SELECT id, email, name, role, subscription_tier, subscription_status, status, "
-        "email_verified, created_at, last_active_at FROM users WHERE 1=1"
+        "email_verified, created_at, last_active_at, signup_source, lifecycle_stage, "
+        "utm_source, utm_campaign FROM users WHERE 1=1"
     )
     params = []
     if search:
@@ -999,6 +1010,13 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     if tier:
         params.append(tier)
         query += f" AND subscription_tier = ${len(params)}"
+    if signup_source:
+        params.append(signup_source.strip()[:64])
+        query += f" AND signup_source = ${len(params)}"
+    if lifecycle_stage:
+        # Filter on stored column; effective stage may still differ for paid/trial signals.
+        params.append(lifecycle_stage.strip()[:32])
+        query += f" AND lifecycle_stage = ${len(params)}"
     params.extend([limit, offset])
     query += f" ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
 
@@ -1019,6 +1037,15 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
                 "email_verified": bool(u["email_verified"]) if u.get("email_verified") is not None else True,
                 "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
                 "last_active_at": u["last_active_at"].isoformat() if u.get("last_active_at") else None,
+                "signup_source": u.get("signup_source"),
+                "lifecycle_stage": u.get("lifecycle_stage") or "signed_up",
+                "lifecycle_effective": effective_lifecycle_stage(
+                    stored=u.get("lifecycle_stage"),
+                    subscription_status=u.get("subscription_status"),
+                    subscription_tier=u.get("subscription_tier"),
+                ),
+                "utm_source": u.get("utm_source"),
+                "utm_campaign": u.get("utm_campaign"),
             }
         )
     return {"users": rows, "total": total}

@@ -758,11 +758,21 @@ async def run_scheduled_publish_alerts(
 # Top-level dispatcher (used by the admin runner endpoint and the cron loop)
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _run_oauth_reconnect_alerts(
+    pool: asyncpg.Pool, *, triggered_by: str = "manual"
+) -> Dict[str, Any]:
+    # Imported lazily: the alerts module reads this module's run-ledger helpers.
+    from services.oauth_reconnect_alerts import run_oauth_reconnect_alerts
+
+    return await run_oauth_reconnect_alerts(pool, triggered_by=triggered_by)
+
+
 ADMIN_EMAIL_JOBS = {
     "trial_reminders":          run_trial_reminders,
     "monthly_user_digest":      run_monthly_user_digest,
     "weekly_admin_digest":      run_weekly_admin_digest,
     "scheduled_publish_alerts": run_scheduled_publish_alerts,
+    "oauth_reconnect_alerts":   _run_oauth_reconnect_alerts,
 }
 
 
@@ -771,7 +781,7 @@ async def run_admin_email_job(
 ) -> Dict[str, Any]:
     """Run a single named job, or every email job when ``job=='all'``.
 
-    ``all`` runs only the four ADMIN_EMAIL_JOBS entries — never marketing.
+    ``all`` runs only the ADMIN_EMAIL_JOBS entries — never marketing.
     """
     job_norm = (job or "").strip().lower()
     if job_norm == "all":
@@ -787,7 +797,7 @@ async def run_admin_email_job(
 
 
 async def run_admin_email_jobs_loop(pool: asyncpg.Pool, shutdown_event: asyncio.Event) -> None:
-    """Worker background loop: run all four email jobs once per interval."""
+    """Worker background loop: run every email job once per interval."""
     logger.info(
         "[admin-email-jobs] loop started | interval=%ss",
         ADMIN_EMAIL_JOBS_INTERVAL_SEC,

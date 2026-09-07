@@ -90,6 +90,9 @@ def build_me_response(user: dict) -> dict:
     if isinstance(ws, dict):
         out["workspace"] = ws
     out["workspace_capabilities"] = workspace_capabilities(user)
+    onboarding = user.get("onboarding")
+    if isinstance(onboarding, dict):
+        out["onboarding"] = onboarding
     return out
 
 
@@ -150,6 +153,21 @@ async def fetch_me_endpoint_data(pool, user_id: str) -> tuple[dict, list]:
         except Exception:
             logger.debug("GET /api/me trill summary skipped", exc_info=True)
             user_dict["trill"] = {"map_unlocked": False, "enabled": True}
+        try:
+            from services.activation_onboarding import fetch_activation_checklist
+
+            user_dict["onboarding"] = await fetch_activation_checklist(conn, user_id)
+        except Exception:
+            logger.debug("GET /api/me onboarding checklist skipped", exc_info=True)
+            user_dict["onboarding"] = {
+                "steps": [],
+                "done_count": 0,
+                "total": 3,
+                "complete": False,
+                "dismissed": False,
+                "show_card": False,
+                "show_playbook_modal": False,
+            }
         return user_dict, personas
 
 

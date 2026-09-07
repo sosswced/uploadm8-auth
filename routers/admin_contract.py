@@ -1746,8 +1746,9 @@ async def email_jobs_run(
       - monthly_user_digest
       - weekly_admin_digest
       - scheduled_publish_alerts
+      - oauth_reconnect_alerts
       - marketing_execution / marketing_touchpoints  (explicit only — not via ``all``)
-      - all  (the four cron email jobs only; does NOT run marketing)
+      - all  (the cron email jobs only; does NOT run marketing)
     """
     job = (body.job or "").strip().lower()
     admin_email = user.get("email") or "?"

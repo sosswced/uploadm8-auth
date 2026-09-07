@@ -8,6 +8,10 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
     name: str = Field(min_length=2)
+    utm_source: str | None = Field(default=None, max_length=128)
+    utm_medium: str | None = Field(default=None, max_length=128)
+    utm_campaign: str | None = Field(default=None, max_length=128)
+    utm_content: str | None = Field(default=None, max_length=128)
 
 
 class UserLogin(BaseModel):

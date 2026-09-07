@@ -50,6 +50,7 @@ from services.meta_oauth import (
     meta_oauth_auth_type,
     meta_oauth_mode,
 )
+from services.platform_oauth_refresh import OAUTH_RECONNECT_RESET_SQL
 from services.workspace import require_can_manage_platforms, resolve_billing_user_id
 from stages.entitlements import can_user_connect_platform
 
@@ -636,10 +637,10 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 )
 
                 if existing:
-                    await conn.execute("""
+                    await conn.execute(f"""
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
                         account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW(),
-                        oauth_health = 'ok'
+                        {OAUTH_RECONNECT_RESET_SQL}
                         WHERE id = $5
                     """, token_blob, account_name, account_username, account_avatar, existing["id"])
                     connect_action = "PLATFORM_RECONNECTED"
@@ -654,7 +655,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                                 "You authenticated a different account. Please sign in to the same account you selected for reconnect.",
                             )
                         await conn.execute(
-                            """
+                            f"""
                             UPDATE platform_tokens
                             SET token_blob = $1,
                                 account_name = $2,
@@ -663,7 +664,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                                 account_id = $5,
                                 updated_at = NOW(),
                                 last_oauth_reconnect_at = NOW(),
-                                oauth_health = 'ok'
+                                {OAUTH_RECONNECT_RESET_SQL}
                             WHERE id = $6
                               AND user_id = $7
                               AND platform = $8

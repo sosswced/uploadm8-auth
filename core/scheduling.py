@@ -66,6 +66,10 @@ PLATFORM_OPTIMAL_DAYS = {
     "facebook": [0, 1, 2, 3],
 }
 
+# Set form for the per-day membership test in the day-picking loop.
+_DEFAULT_OPTIMAL_DAY_SET = frozenset([0, 1, 2, 3, 4])
+_OPTIMAL_DAY_SET = {k: frozenset(v) for k, v in PLATFORM_OPTIMAL_DAYS.items()}
+
 _EPS = 1e-9
 # Residual mass outside hot windows so data-driven signals can still win.
 _OUTSIDE_WINDOW_FLOOR = 0.04
@@ -238,6 +242,24 @@ SMART_SCHEDULE_MAX_BATCH = 5000
 SMART_SCHEDULE_PREVIEW_RETURN_CAP = 24
 SMART_SCHEDULE_PREVIEW_REQUEST_MAX = 1_000_000
 
+# Day picking costs O(num_days) per slot, so preview latency tracks
+# batch × window, not batch alone. Budget keeps a wide window no slower than
+# the widest batch already served at the old 730-day cap.
+SMART_SCHEDULE_PREVIEW_WORK_BUDGET = 4_000_000
+
+
+def smart_schedule_preview_simulated_count(batch_count: int, num_days: int) -> int:
+    """How many slots the preview can simulate inside the work budget."""
+    if batch_count <= SMART_SCHEDULE_PREVIEW_RETURN_CAP:
+        return batch_count
+    affordable = SMART_SCHEDULE_PREVIEW_WORK_BUDGET // max(1, int(num_days))
+    return max(SMART_SCHEDULE_PREVIEW_RETURN_CAP, min(batch_count, affordable))
+
+# Window ceiling, sized so a max batch can still run at one post per day.
+# Publishing that far out assumes the OAuth keepalive sweep kept the account
+# live (see services/platform_oauth_refresh.py).
+SMART_SCHEDULE_MAX_DAYS = SMART_SCHEDULE_MAX_BATCH
+
 
 def clamp_smart_schedule_batch(n: Any, *, default: int = 1) -> int:
     """Accept any batch size ≥ 1; cap only the preview *compute* loop."""
@@ -251,14 +273,14 @@ def clamp_smart_schedule_batch(n: Any, *, default: int = 1) -> int:
 
 
 def clamp_smart_schedule_days(num_days: Any, *, default: int = 14) -> int:
-    """Normalize Smart Schedule window to 1–730 days (never 0 / NaN)."""
+    """Normalize Smart Schedule window to 1–SMART_SCHEDULE_MAX_DAYS (never 0 / NaN)."""
     try:
         n = int(num_days)
     except (TypeError, ValueError):
         n = int(default)
     if n < 1:
         n = int(default) if int(default) >= 1 else 14
-    return max(1, min(730, n))
+    return max(1, min(SMART_SCHEDULE_MAX_DAYS, n))
 
 
 def smart_schedule_expand_horizon(num_days: int) -> int:
@@ -269,7 +291,7 @@ def smart_schedule_expand_horizon(num_days: int) -> int:
     ``get_existing_scheduled_days`` see older out-of-window rows.
     """
     n = clamp_smart_schedule_days(num_days)
-    return max(n, min(730, n * 2))
+    return max(n, min(SMART_SCHEDULE_MAX_DAYS, n * 2))
 
 
 def _normalize_day_occupancy(raw: Any) -> Dict[int, int]:
@@ -367,8 +389,11 @@ def _pick_day_offset(
     the least-occupied day still inside the window (never past ``num_days``).
     """
     num_days = clamp_smart_schedule_days(num_days)
-    optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
+    optimal_days = _OPTIMAL_DAY_SET.get(platform, _DEFAULT_OPTIMAL_DAY_SET)
     occupancy = _normalize_day_occupancy(day_occupancy)
+    # Weekday by integer arithmetic — a wide window would otherwise build one
+    # datetime per day on every pick. Same values, so slots stay seed-stable.
+    base_weekday = now.weekday()
 
     # Prefer unused + empty days (soft prefer optimal weekdays).
     available_days: list = []
@@ -377,8 +402,7 @@ def _pick_day_offset(
             continue
         if occupancy.get(day_offset, 0) > 0:
             continue
-        target_date = now + timedelta(days=day_offset)
-        weekday = target_date.weekday()
+        weekday = (base_weekday + day_offset) % 7
         priority = 2 if weekday in optimal_days else 1
         available_days.append((day_offset, priority, weekday))
 
@@ -392,8 +416,7 @@ def _pick_day_offset(
     pool = unused_in_call or list(range(1, num_days + 1))
 
     def _score(day_offset: int) -> tuple:
-        target_date = now + timedelta(days=day_offset)
-        weekday = target_date.weekday()
+        weekday = (base_weekday + day_offset) % 7
         optimal_boost = 0 if weekday in optimal_days else 1
         return (occupancy.get(day_offset, 0), optimal_boost, rng.random())
 

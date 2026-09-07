@@ -261,7 +261,7 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "I moved to {location} for 30 days — here's what happened",
-            "The destination nobody talks about 🌍",
+            "Here's what {location} actually looks like 🌍",
             "Budget travel: {location} for under $50/day",
         ],
         "hashtag_seeds": [

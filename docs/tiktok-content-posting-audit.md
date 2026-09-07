@@ -10,12 +10,12 @@ Content Posting API audit is **approved**. Direct Post honors the creator’s se
 privacy level from `privacy_level_options` (Everyone / Friends / Followers / Only me).
 There is no private-only clamp and no `TIKTOK_APP_AUDITED` runtime toggle.
 
-OAuth scopes (must match TikTok Developer Portal):
+OAuth scopes (must match TikTok Developer Portal exactly):
 
-`user.info.basic`, `user.info.profile`, `user.info.stats`, `video.publish`, `video.upload`, `video.list`
+`user.info.basic`, `user.info.stats`, `video.publish`, `video.upload`, `video.list`
 
-- **profile** → `@username` for watch URLs and Connected Accounts
 - **stats + video.list** → Analytics live cards
+- **user.info.profile** → `@username` for watch URLs (add in portal before re-enabling in `OAUTH_CONFIG`)
 
 ## App description (Developer Portal)
 

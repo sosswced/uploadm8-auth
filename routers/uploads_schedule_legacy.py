@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 import core.state
 from core.deps import get_current_user_readonly
+from core.scheduling import SMART_SCHEDULE_MAX_DAYS
 from services.scheduling_preview import preview_response_payload
 from services.upload.schedule_guard import (
     _user_timezone,
@@ -23,7 +24,7 @@ legacy_uploads_router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 async def preview_smart_schedule_legacy(
     response: Response,
     platforms: List[str] = Query(...),
-    days: int = Query(14, ge=1, le=730),
+    days: int = Query(14, ge=1, le=SMART_SCHEDULE_MAX_DAYS),
     seed: Optional[str] = Query(None),
     user: dict = Depends(get_current_user_readonly),
 ):

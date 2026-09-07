@@ -2,6 +2,16 @@
 .env
 .env.*
 !.env.example
+frontend/js/official-brand-secrets.local.js
+**/official-brand-secrets.local.js
+
+# Assisted brand social signup (OTP + screenshots + stop/go flags)
+scripts/agent/.brand_otp
+scripts/agent/.brand_continue
+scripts/agent/.brand_stop
+scripts/agent/.brand_signup_status.json
+scripts/agent/.brand_secrets.local.json
+scripts/agent/.brand_signup_shots/
 
 # Local debug / investigation scripts (PII + prod DB footguns)
 _tmp_*.py

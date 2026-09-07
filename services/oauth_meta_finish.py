@@ -13,6 +13,7 @@ from core.audit import log_system_event
 from core.auth import encrypt_blob
 from core.oauth import mirror_oauth_profile_image_to_r2
 from services.meta_oauth import meta_oauth_mode
+from services.platform_oauth_refresh import OAUTH_RECONNECT_RESET_SQL
 from stages.entitlements import can_user_connect_platform
 
 logger = logging.getLogger("uploadm8-api")
@@ -132,10 +133,10 @@ async def persist_meta_destination(
         )
         if existing:
             await conn.execute(
-                """
+                f"""
                 UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
                 account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW(),
-                oauth_health = 'ok'
+                {OAUTH_RECONNECT_RESET_SQL}
                 WHERE id = $5
                 """,
                 token_blob,
@@ -154,11 +155,11 @@ async def persist_meta_destination(
                     "You authenticated a different account. Please sign in to the same account you selected for reconnect.",
                 )
             await conn.execute(
-                """
+                f"""
                 UPDATE platform_tokens
                 SET token_blob = $1, account_name = $2, account_username = $3,
                     account_avatar = $4, account_id = $5, updated_at = NOW(),
-                    last_oauth_reconnect_at = NOW(), oauth_health = 'ok'
+                    last_oauth_reconnect_at = NOW(), {OAUTH_RECONNECT_RESET_SQL}
                 WHERE id = $6 AND user_id = $7 AND platform = $8
                 """,
                 token_blob,

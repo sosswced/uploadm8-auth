@@ -312,3 +312,114 @@ async def send_low_token_warning_email(
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Platform reconnect needed — OAuth keepalive (services/oauth_reconnect_alerts)
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_platform_reconnect_email(
+    email: str,
+    name: str,
+    platform_label: str,
+    account_label: str = "",
+    urgency: str = "expiring",     # "expiring" | "dead"
+    expires_label: str = "",
+    days_left: int = 0,
+    scheduled_at_risk: int = 0,
+) -> bool:
+    """
+    Ask the user to reconnect a platform before scheduled posts start failing.
+
+    Access tokens are renewed automatically; the refresh grant behind them is not
+    renewable forever. Once it lapses only the user can restore the connection,
+    so this fires ahead of expiry (``expiring``) and on confirmed death (``dead``).
+    """
+    if not mailgun_ready():
+        return False
+
+    who = f"{platform_label} ({account_label})" if account_label else platform_label
+    is_dead = (urgency or "").strip().lower() == "dead"
+
+    if is_dead:
+        gradient = GRAD_RED
+        tag_color = "#ef4444"
+        section = "Reconnect Required"
+        headline = f"{platform_label} is disconnected &#10060;"
+        lead = (
+            f"Hey {name} — we can no longer publish to "
+            f"<strong style='color:#ffffff;'>{who}</strong>. The platform ended our "
+            f"access, which usually means the connection was revoked or simply aged out. "
+            f"Reconnecting takes a few seconds and restores publishing."
+        )
+        subject = f"⚠️ Action needed — reconnect {platform_label}"
+    else:
+        gradient = GRAD_ORANGE
+        tag_color = "#f97316"
+        section = "Connection Expiring"
+        headline = "Reconnect soon to keep publishing"
+        when = f" on <strong style='color:#fb923c;'>{expires_label}</strong>" if expires_label else ""
+        lead = (
+            f"Hey {name} — your connection to "
+            f"<strong style='color:#ffffff;'>{who}</strong> expires{when}. "
+            f"Platforms cap how long an app can keep publishing before you sign in "
+            f"again, so reconnect to avoid a gap."
+        )
+        subject = f"🔗 Reconnect {platform_label} to keep your posts publishing"
+
+    risk_box = (
+        tinted_box(
+            f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
+            f'letter-spacing:1.2px;font-weight:600;">Scheduled posts affected</p>'
+            f'<p style="margin:0;color:#ffffff;font-size:15px;line-height:1.65;">'
+            f"<strong>{scheduled_at_risk}</strong> scheduled post"
+            f"{'s' if scheduled_at_risk != 1 else ''} on this account "
+            f"{'will not' if is_dead else 'may not'} publish until you reconnect.</p>",
+            hex_color=tag_color,
+        )
+        if scheduled_at_risk > 0
+        else ""
+    )
+
+    countdown = (
+        progress_bar(
+            max(0, min(100, int((days_left / 30) * 100))),
+            label=f"{days_left} day{'s' if days_left != 1 else ''} until this connection expires",
+            hex_color=tag_color,
+        )
+        if not is_dead and days_left > 0
+        else ""
+    )
+
+    html = email_shell(
+        gradient=gradient,
+        tagline="Platform connection notice",
+        preheader_text=(
+            f"{platform_label} needs reconnecting"
+            + (f" — {scheduled_at_risk} scheduled post(s) affected" if scheduled_at_risk else "")
+        ),
+        body_rows=(
+            section_tag(section, tag_color)
+            + intro_row(headline, lead)
+            + risk_box
+            + countdown
+            + cta_button("Reconnect Now", URL_SETTINGS, pt="14px", pb="20px")
+            + tinted_box(
+                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
+                f'Your scheduled posts stay exactly where they are — reconnecting restores '
+                f'publishing without rescheduling anything. Questions? Reach us at '
+                f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
+                f'{SUPPORT_EMAIL}</a>.</p>',
+                hex_color="#374151",
+                pb="36px",
+            )
+        ),
+        footer_note="You received this because a connected platform account needs your attention.",
+    )
+
+    return await send_email(
+        email,
+        subject,
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )

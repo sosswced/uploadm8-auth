@@ -14,16 +14,19 @@ from core.deps import get_current_user_readonly
 from core.helpers import _now_utc
 from core.scheduling import (
     SMART_SCHEDULE_MAX_BATCH,
+    SMART_SCHEDULE_MAX_DAYS,
     SMART_SCHEDULE_PREVIEW_REQUEST_MAX,
     SMART_SCHEDULE_PREVIEW_RETURN_CAP,
     clamp_smart_schedule_batch,
     clamp_smart_schedule_days,
     get_existing_scheduled_days,
+    smart_schedule_preview_simulated_count,
 )
 from services.scheduling_preview import (
     compact_preview_batch,
     occupancy_from_schedule,
     preview_response_payload,
+    preview_slot_label,
 )
 from services.smart_schedule_insights import build_hour_weights_for_platforms_batch
 from services.upload.schedule_guard import (
@@ -39,7 +42,7 @@ router = APIRouter(prefix="/api/scheduling", tags=["scheduling"])
 
 class SchedulePreviewRequest(BaseModel):
     platforms: List[str] = Field(..., min_length=1)
-    smart_schedule_days: int = Field(14, ge=1, le=730)
+    smart_schedule_days: int = Field(14, ge=1, le=SMART_SCHEDULE_MAX_DAYS)
     seed: Optional[str] = Field(
         None,
         description="Optional seed for reproducible preview; omit for a fresh draw",
@@ -106,7 +109,8 @@ async def preview_smart_schedule(
         first_smart = None
         first_sm = None
 
-        for i in range(batch_count):
+        simulated_count = smart_schedule_preview_simulated_count(batch_count, num_days)
+        for i in range(simulated_count):
             slot_seed = seed if batch_count == 1 else f"{seed}:slot-{i}"
             smart = await build_smart_schedule_for_upload(
                 conn,
@@ -128,15 +132,10 @@ async def preview_smart_schedule(
                     },
                 )
             sm = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
-            label = ""
-            if i < len(labels) and labels[i]:
-                label = str(labels[i]).strip()
-            if not label:
-                label = f"Video {i + 1}"
             batch_items.append(
                 {
                     "index": i,
-                    "label": label,
+                    "label": preview_slot_label(labels, i),
                     "seed": slot_seed,
                     "smart_schedule": sm,
                     "schedule": sm,
@@ -163,4 +162,7 @@ async def preview_smart_schedule(
         batch_count=requested_count,
         occupancy=extra_occ,
         batch_truncated=truncated,
+        # Occupancy covers only the slots we simulated; it is not scaled up to
+        # the full batch, so the client must present it as partial.
+        simulated_count=simulated_count,
     )

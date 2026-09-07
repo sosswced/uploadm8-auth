@@ -383,18 +383,132 @@ async def build_recommended_comms(levers: Dict[str, Any]) -> List[Dict[str, str]
     return plans
 
 
+async def fetch_acquisition_by_utm(conn, since: datetime, until: datetime) -> Dict[str, Any]:
+    """First-touch UTM rollup for outside new-user acquisition (signup → paid soft join)."""
+    empty = {"signups_with_utm": 0, "paid_converts": 0, "campaigns": []}
+    try:
+        rows = await conn.fetch(
+            """
+            WITH cohort AS (
+                SELECT
+                    u.id AS user_id,
+                    COALESCE(NULLIF(TRIM(u.utm_source), ''), '(none)') AS utm_source,
+                    COALESCE(NULLIF(TRIM(u.utm_medium), ''), '(none)') AS utm_medium,
+                    COALESCE(NULLIF(TRIM(u.utm_campaign), ''), '(none)') AS utm_campaign,
+                    COALESCE(u.utm_first_touch_at, u.created_at) AS touch_at
+                FROM users u
+                WHERE u.utm_first_touch_at IS NOT NULL
+                  AND u.utm_first_touch_at >= $1
+                  AND u.utm_first_touch_at <= $2
+            ),
+            paid AS (
+                SELECT
+                    c.user_id,
+                    SUM(rt.amount)::float AS revenue_usd
+                FROM cohort c
+                JOIN revenue_tracking rt ON rt.user_id = c.user_id
+                 AND rt.created_at >= c.touch_at
+                 AND rt.created_at <= $2
+                GROUP BY c.user_id
+            )
+            SELECT
+                c.utm_source,
+                c.utm_medium,
+                c.utm_campaign,
+                COUNT(*)::int AS signups,
+                COUNT(p.user_id)::int AS paid_converts,
+                COALESCE(SUM(p.revenue_usd), 0)::float AS revenue_usd
+            FROM cohort c
+            LEFT JOIN paid p ON p.user_id = c.user_id
+            GROUP BY c.utm_source, c.utm_medium, c.utm_campaign
+            ORDER BY signups DESC
+            LIMIT 40
+            """,
+            since,
+            until,
+        )
+    except Exception as e:
+        logger.warning("fetch_acquisition_by_utm unavailable: %s", e)
+        return empty
+    campaigns: List[Dict[str, Any]] = []
+    total_signups = 0
+    total_paid = 0
+    for r in rows:
+        sig = int(r["signups"] or 0)
+        paid_n = int(r["paid_converts"] or 0)
+        rev = float(r["revenue_usd"] or 0)
+        total_signups += sig
+        total_paid += paid_n
+        campaigns.append(
+            {
+                "utm_source": r["utm_source"],
+                "utm_medium": r["utm_medium"],
+                "utm_campaign": r["utm_campaign"],
+                "signups": sig,
+                "paid_converts": paid_n,
+                "revenue_usd": round(rev, 2),
+            }
+        )
+    return {
+        "signups_with_utm": total_signups,
+        "paid_converts": total_paid,
+        "campaigns": campaigns,
+    }
+
+
+async def fetch_lifecycle_crm_rollup(conn, since: datetime, until: datetime) -> Dict[str, Any]:
+    """Signup_source + lifecycle_stage counts for admin CRM (best-effort)."""
+    try:
+        by_source = await conn.fetch(
+            """
+            SELECT COALESCE(NULLIF(signup_source, ''), 'unknown') AS signup_source,
+                   COUNT(*)::int AS signups
+            FROM users
+            WHERE created_at >= $1 AND created_at < $2
+            GROUP BY 1
+            ORDER BY signups DESC
+            LIMIT 40
+            """,
+            since,
+            until,
+        )
+        by_stage = await conn.fetch(
+            """
+            SELECT COALESCE(NULLIF(lifecycle_stage, ''), 'signed_up') AS lifecycle_stage,
+                   COUNT(*)::int AS users
+            FROM users
+            GROUP BY 1
+            ORDER BY users DESC
+            """,
+        )
+    except Exception:
+        return {"by_signup_source": [], "by_lifecycle_stage": []}
+    return {
+        "by_signup_source": [
+            {"signup_source": r["signup_source"], "signups": int(r["signups"] or 0)} for r in by_source
+        ],
+        "by_lifecycle_stage": [
+            {"lifecycle_stage": r["lifecycle_stage"], "users": int(r["users"] or 0)} for r in by_stage
+        ],
+    }
+
+
 async def build_marketing_intel_bundle(conn, range_key: str) -> Dict[str, Any]:
     since, until = parse_range_since_until(range_key)
     funnel = await fetch_marketing_funnel(conn, since, until)
     levers = await fetch_sales_opportunity_levers(conn)
     promos = await fetch_promo_schedule_hints(conn, since, until)
     comms = await build_recommended_comms(levers)
+    acquisition = await fetch_acquisition_by_utm(conn, since, until)
+    lifecycle = await fetch_lifecycle_crm_rollup(conn, since, until)
     return {
         "range": range_key,
         "marketing_funnel": funnel,
         "sales_opportunity_levers": levers,
         "promo_schedule_recommendations": promos,
         "recommended_comms_plan": comms,
+        "acquisition_by_utm": acquisition,
+        "lifecycle_crm": lifecycle,
     }
 
 

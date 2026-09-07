@@ -35,6 +35,7 @@ class AdminEmailJobRunRequest(BaseModel):
         "monthly_user_digest",
         "weekly_admin_digest",
         "scheduled_publish_alerts",
+        "oauth_reconnect_alerts",
         "marketing_execution",
         "marketing_touchpoints",
         "all",

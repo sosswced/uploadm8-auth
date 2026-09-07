@@ -260,10 +260,10 @@ OAUTH_CONFIG = {
     "tiktok": {
         "auth_url": "https://www.tiktok.com/v2/auth/authorize/",
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
-        # Approved Content Posting + analytics scopes (portal must match).
-        # user.info.profile → @username for watch URLs; video.list + stats → Analytics.
+        # Must match TikTok Developer Portal scopes exactly (extra → invalid_scope).
+        # user.info.profile omitted until portal-approved; video.list + stats → Analytics.
         "scope": (
-            "user.info.basic,user.info.profile,user.info.stats,"
+            "user.info.basic,user.info.stats,"
             "video.publish,video.upload,video.list"
         ),
     },

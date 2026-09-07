@@ -43,6 +43,13 @@ def occupancy_from_schedule(smart: Dict[str, datetime], *, now: Optional[datetim
     return occ
 
 
+def preview_slot_label(labels: Any, index: int) -> str:
+    """Caller-supplied filename for a batch slot, else a 1-based fallback."""
+    seq = labels if isinstance(labels, (list, tuple)) else []
+    raw = str(seq[index]).strip() if index < len(seq) and seq[index] else ""
+    return raw or f"Video {index + 1}"
+
+
 def compact_preview_batch(
     batch: List[Dict[str, Any]],
     *,
@@ -67,6 +74,7 @@ def preview_response_payload(
     batch_count: Optional[int] = None,
     occupancy: Optional[Dict[int, int]] = None,
     batch_truncated: bool = False,
+    simulated_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Canonical preview JSON for /api/scheduling/preview and legacy shim."""
     explanation = smart_schedule_explanation(smart, user_timezone=user_timezone)
@@ -84,6 +92,10 @@ def preview_response_payload(
         payload["batch_count"] = int(batch_count) if batch_count is not None else len(batch)
         if batch_truncated:
             payload["batch_truncated"] = True
+        if simulated_count is not None and int(simulated_count) < payload["batch_count"]:
+            # Occupancy below reflects these slots only, not the whole batch.
+            payload["preview_estimated"] = True
+            payload["simulated_count"] = int(simulated_count)
     if occupancy:
         payload["occupancy"] = {str(int(k)): int(v) for k, v in occupancy.items() if int(v) > 0}
     return payload

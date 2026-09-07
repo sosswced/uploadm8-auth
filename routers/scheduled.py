@@ -21,6 +21,7 @@ from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col,
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
+from core.scheduling import SMART_SCHEDULE_MAX_DAYS
 from services.upload.list_detail import _upload_error_message
 from services.retry_policy import (
     upload_is_overdue_ready_to_publish,
@@ -450,7 +451,7 @@ def _infer_smart_spread_days(schedule_metadata: Any, default: int = 14) -> int:
     max_off = 0
     for dt in slots.values():
         max_off = max(max_off, (dt.date() - today).days)
-    return max(7, min(730, max(default, max_off + 1)))
+    return max(7, min(SMART_SCHEDULE_MAX_DAYS, max(default, max_off + 1)))
 
 
 # ------------------------------------------------------------------

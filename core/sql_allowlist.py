@@ -68,6 +68,23 @@ UPLOADS_AI_GENERATED_METADATA_COLUMNS: frozenset[str] = frozenset(
 OAUTH_TOKEN_STORAGE_TABLES_ORDERED: tuple[str, ...] = ("platform_tokens", "connected_accounts")
 OAUTH_TOKEN_STORAGE_TABLES: frozenset[str] = frozenset(OAUTH_TOKEN_STORAGE_TABLES_ORDERED)
 
+# Keepalive bookkeeping written by services/platform_oauth_refresh (migration 1105).
+OAUTH_KEEPALIVE_PATCH_COLUMNS: frozenset[str] = frozenset(
+    {
+        "access_expires_at",
+        "refresh_expires_at",
+        "access_non_expiring",
+        "oauth_health",
+        "oauth_fail_count",
+        "oauth_last_failure_at",
+        "oauth_last_error",
+        "oauth_next_retry_at",
+        "oauth_last_verified_at",
+        "oauth_reconnect_alert_at",
+        "updated_at",
+    }
+)
+
 
 def assert_account_deletion_table(table: str) -> str:
     if table not in ACCOUNT_DELETION_COUNT_TABLES:

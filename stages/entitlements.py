@@ -31,10 +31,15 @@ PRIORITY CLASS -> REDIS QUEUE ROUTING:
   Priority queue always drains before normal queue touches a worker slot.
   Agency uploads literally jump every free-tier upload in the system.
 
-LOOKAHEAD HOURS:
-  How far ahead the scheduler starts pre-processing a staged upload.
-  Free = 24h: schedule uploads up to a day out.
-  Agency = 168h: uploads are pre-processed up to a full week early.
+LOOKAHEAD HOURS (display / marketing only — NOT enforced):
+  Surfaced on pricing, Stripe catalog metadata, and guide copy as a
+  "scheduling window" label. It does **not** gate how far ahead a user
+  may schedule, and the worker does **not** use it to start pre-processing.
+  Staged → processing uses a fixed PROCESSING_WINDOW_MINUTES (default 15)
+  for every tier (worker.py). Smart Schedule's real horizon is
+  SMART_SCHEDULE_MAX_DAYS (core/scheduling.py). Publishability past the
+  OAuth refresh-grant ceiling is advisory via services/oauth_readiness.py.
+  Tier defaults (Free=24, Creator Lite=12, Agency=168) exist for copy only.
 
 QUEUE DEPTH:
   Max staged + pending + queued uploads per user at once.

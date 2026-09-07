@@ -98,6 +98,7 @@ from routers.preferences import router as preferences_router
 from routers.groups import router as groups_router
 from routers.workspace import router as workspace_router
 from routers.platforms import router as platforms_router
+from routers.oauth_readiness import router as oauth_readiness_router
 from routers.platform_avatar_redirect import router as platform_avatar_redirect_router
 from routers.user_avatar_redirect import router as user_avatar_redirect_router
 from routers.billing import router as billing_router
@@ -636,6 +637,7 @@ app.include_router(groups_router)
 app.include_router(workspace_router)
 app.include_router(oauth_router)
 app.include_router(platforms_router)
+app.include_router(oauth_readiness_router)
 app.include_router(platform_avatar_redirect_router)
 app.include_router(user_avatar_redirect_router)
 app.include_router(billing_router)

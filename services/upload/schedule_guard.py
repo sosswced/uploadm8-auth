@@ -287,13 +287,58 @@ async def build_smart_schedule_for_upload(
     return out
 
 
-def validate_presign_schedule(data: Any) -> None:
-    """Reject presign when schedule_mode cannot produce concrete times."""
+def assert_smart_days_within_horizon(requested_days: int, schedule_horizon_days: int) -> int:
+    """Clamp/reject a Smart Schedule day window against the caller's tier ceiling."""
+    from core.scheduling import clamp_smart_schedule_days
+    from stages.entitlements import resolve_schedule_horizon_days
+
+    horizon = resolve_schedule_horizon_days(schedule_horizon_days=schedule_horizon_days)
+    days = clamp_smart_schedule_days(requested_days)
+    if days > horizon:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "schedule_horizon_exceeded",
+                "message": (
+                    f"Your plan's Smart Schedule window is {horizon} days "
+                    f"(requested {days}). Shorten the window or upgrade."
+                ),
+                "hint": "Upgrade your plan for a longer Smart Schedule window.",
+                "schedule_horizon_days": horizon,
+            },
+        )
+    return days
+
+
+def validate_presign_schedule(
+    data: Any,
+    *,
+    schedule_horizon_days: Optional[int] = None,
+) -> None:
+    """Reject presign when schedule_mode cannot produce concrete times.
+
+    ``schedule_horizon_days`` is the caller's tier ceiling (from entitlements).
+    Smart windows and manual dates past that ceiling are rejected (or clamped
+    for smart days that only exceed the absolute SMART_SCHEDULE_MAX_DAYS).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from core.scheduling import (
+        SMART_SCHEDULE_MAX_DAYS,
+        clamp_smart_schedule_days,
+    )
+    from stages.entitlements import resolve_schedule_horizon_days
+
     mode = (getattr(data, "schedule_mode", None) or "immediate").strip().lower()
     platforms = list(getattr(data, "platforms", None) or [])
+    horizon = resolve_schedule_horizon_days(
+        schedule_horizon_days=schedule_horizon_days,
+        default=SMART_SCHEDULE_MAX_DAYS,
+    )
 
     if mode == "scheduled":
-        if not getattr(data, "scheduled_time", None):
+        raw_time = getattr(data, "scheduled_time", None)
+        if not raw_time:
             logger.warning(
                 "presign rejected: scheduled mode without scheduled_time platforms=%s",
                 platforms,
@@ -306,6 +351,29 @@ def validate_presign_schedule(data: Any) -> None:
                     "hint": "Set scheduled_time in the presign request or switch to Upload Now.",
                 },
             )
+        when = raw_time
+        if isinstance(when, str):
+            try:
+                when = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            except ValueError:
+                when = None
+        if isinstance(when, datetime):
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if when > now + timedelta(days=horizon):
+                raise HTTPException(
+                    400,
+                    detail={
+                        "code": "schedule_horizon_exceeded",
+                        "message": (
+                            f"Your plan can schedule up to {horizon} days ahead. "
+                            "Pick an earlier time or upgrade for a longer window."
+                        ),
+                        "hint": "Upgrade your plan for a longer scheduling horizon.",
+                        "schedule_horizon_days": horizon,
+                    },
+                )
     elif mode == "smart":
         if not platforms:
             logger.warning("presign rejected: smart schedule without platforms")
@@ -316,18 +384,33 @@ def validate_presign_schedule(data: Any) -> None:
                     "message": UPLOAD_ERROR_MESSAGES[ERROR_SCHEDULE_NO_PLATFORMS],
                 },
             )
-        from core.scheduling import (
-            SMART_SCHEDULE_MAX_DAYS,
-            clamp_smart_schedule_days,
-        )
 
         raw_days = getattr(data, "smart_schedule_days", 14)
         try:
             days_i = int(raw_days)
         except (TypeError, ValueError):
             days_i = -1
-        if days_i < 1 or days_i > SMART_SCHEDULE_MAX_DAYS:
-            # Pydantic also enforces ge/le; this catches raw dict / repair callers.
+        if days_i < 1:
+            clamped = clamp_smart_schedule_days(raw_days)
+            try:
+                setattr(data, "smart_schedule_days", clamped)
+            except Exception:
+                pass
+            days_i = clamped
+        if days_i > horizon:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "schedule_horizon_exceeded",
+                    "message": (
+                        f"Your plan's Smart Schedule window is {horizon} days "
+                        f"(requested {days_i}). Shorten the window or upgrade."
+                    ),
+                    "hint": "Upgrade your plan for a longer Smart Schedule window.",
+                    "schedule_horizon_days": horizon,
+                },
+            )
+        if days_i > SMART_SCHEDULE_MAX_DAYS:
             clamped = clamp_smart_schedule_days(raw_days)
             try:
                 setattr(data, "smart_schedule_days", clamped)

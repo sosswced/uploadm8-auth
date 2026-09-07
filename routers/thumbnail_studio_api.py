@@ -43,6 +43,7 @@ from api.schemas.pikzels_v2 import (
     PikzelsV2ScoreBody,
     PikzelsV2TitlesBody,
 )
+from stages.entitlements import get_entitlements_from_user
 from services.thumbnail_personas_list import list_thumbnail_studio_personas
 from services.pikzels_v2 import PIKZELS_FEATURE_MAP, V2_PIKZONALITY_BY_ID, resolve_public_api_key
 from services.pikzels_v2_client import (
@@ -368,6 +369,28 @@ async def _assert_thumbnail_studio_enabled(user: dict) -> None:
                     "Enable it under Settings → Preferences, then try again."
                 ),
                 "settings_url": "/settings.html#preferences",
+            },
+        )
+
+
+def _assert_ai_thumbnail_styling_allowed(user: dict) -> None:
+    """Gate paid Pikzels / AI thumbnail styling on the user's tier entitlement.
+
+    Mirrors the upload worker gate (``can_ai_thumbnail_styling`` in
+    ``stages/entitlements.py``) so Thumbnail Studio cannot bill Pikzels for
+    tiers that only get template thumbnails (free / starter / creator_lite).
+    """
+    ent = get_entitlements_from_user(user)
+    if not getattr(ent, "can_ai_thumbnail_styling", False):
+        raise HTTPException(
+            403,
+            {
+                "code": "feature_ai_thumbnail_styling",
+                "message": (
+                    "AI thumbnail styling with Pikzels needs Creator Pro or higher. "
+                    "Upgrade your plan to generate AI-styled thumbnails and personas."
+                ),
+                "upgrade_url": "/billing.html",
             },
         )
 
@@ -827,6 +850,7 @@ async def ts_list_personas(user: dict = Depends(get_current_user_readonly)):
 
 @router.post("/api/thumbnail-studio/personas")
 async def ts_create_persona(body: StudioPersonaCreateBody, user: dict = Depends(get_current_user)):
+    _assert_ai_thumbnail_styling_allowed(user)
     pid = uuid.uuid4()
     stored_refs: List[str] = []
     async with core.state.db_pool.acquire() as conn:
@@ -1165,6 +1189,7 @@ async def ts_link_persona_pikzels(persona_id: str, user: dict = Depends(get_curr
     For personas created before Pikzels registration ran (or when linking failed),
     register again using the saved ``creator_persona_images`` rows (needs ≥3 photos).
     """
+    _assert_ai_thumbnail_styling_allowed(user)
     try:
         pid = uuid.UUID(str(persona_id).strip())
     except ValueError:
@@ -1519,6 +1544,7 @@ async def ts_recreate(
     """
     from services.thumbnail_niches import normalize_niche
 
+    _assert_ai_thumbnail_styling_allowed(user)
     await _assert_thumbnail_studio_enabled(user)
 
     title = await fetch_youtube_title(body.youtube_url)
@@ -2437,6 +2463,7 @@ async def _maybe_notify_pikzels_discord(
 
 
 async def _pikzels_debit(user: dict, op: str) -> str:
+    _assert_ai_thumbnail_styling_allowed(user)
     await _assert_thumbnail_studio_enabled(user)
     user_id = str(user["id"])
     put, aic, meta = estimate_pikzels_v2_call_cost(op)

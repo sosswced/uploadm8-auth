@@ -16,7 +16,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.thumbnail_text import clean_thumbnail_headline, is_generic_thumbnail_headline
+from core.thumbnail_text import clean_thumbnail_headline, is_unusable_thumbnail_headline
 from services.thumbnail_sticker_pack import StickerSpec
 
 logger = logging.getLogger("uploadm8-worker.thumbnail_sticker")
@@ -260,7 +260,7 @@ def _render_sync(
         max_words=5,
         max_chars=32,
     )
-    if headline and not is_generic_thumbnail_headline(headline):
+    if headline and not is_unusable_thumbnail_headline(headline):
         bbox = draw.textbbox((0, 0), headline, font=font_lg)
         tw = bbox[2] - bbox[0]
         margin = int(min(target_w, target_h) * 0.06)

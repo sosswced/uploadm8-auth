@@ -58,7 +58,9 @@ AIC_TOPUP_TEMPLATE = (
 #   {max_accounts}                  -> 75
 #   {put_monthly}                   -> 3,500
 #   {aic_monthly}                   -> 1,000
-#   {lookahead_hours}               -> 72
+#   {lookahead_hours}               -> 8760 (legacy hours field)
+#   {schedule_horizon_days}         -> 365
+#   {scheduling_window_label}       -> "1 year"
 #   {queue_depth_phrase}            -> "job queue depth of 2,500" / "unlimited job queue"
 #   {priority_phrase}               -> "turbo throughput processing" / "priority processing lane" / ""
 #   {watermark_phrase}              -> "no watermark applied to published content" / "watermark on published content"
@@ -74,7 +76,7 @@ SUBSCRIPTION_TEMPLATE = (
     "(TikTok, YouTube Shorts, Instagram Reels, Facebook Reels), "
     "{put_monthly:,} PUT upload tokens credited to wallet each billing cycle, "
     "{aic_monthly:,} AIC AI-credit tokens credited to wallet each billing cycle, "
-    "{lookahead_hours}-hour scheduling lookahead, "
+    "{scheduling_window_label} scheduling window, "
     "{queue_depth_phrase}, "
     "{priority_phrase}"
     "{watermark_phrase}, "
@@ -147,21 +149,35 @@ def render_subscription_description(row: Dict[str, Any]) -> str:
     """Render subscription description from a catalog_products row dict.
 
     Required keys: display_name, max_accounts, put_monthly, aic_monthly,
-    lookahead_hours, queue_depth, priority_class, watermark, white_label,
-    team_seats, webhooks, analytics, ai_depth.
+    schedule_horizon_days or lookahead_hours, queue_depth, priority_class,
+    watermark, white_label, team_seats, webhooks, analytics, ai_depth.
     """
+    from stages.entitlements import (
+        resolve_schedule_horizon_days,
+        scheduling_window_display_label,
+    )
+
     qd = int(row.get("queue_depth") or 0)
     pri = (row.get("priority_class") or "p3").lower()
     ad  = (row.get("ai_depth") or "basic").lower()
     an  = (row.get("analytics") or "basic").lower()
     seats = int(row.get("team_seats") or 1)
+    horizon = resolve_schedule_horizon_days(
+        schedule_horizon_days=row.get("schedule_horizon_days"),
+        lookahead_hours=row.get("lookahead_hours"),
+    )
 
     ctx = {
         "display_name":      row["display_name"],
         "max_accounts":      int(row["max_accounts"]),
         "put_monthly":       int(row["put_monthly"]),
         "aic_monthly":       int(row["aic_monthly"]),
-        "lookahead_hours":   int(row["lookahead_hours"]),
+        "lookahead_hours":   int(row.get("lookahead_hours") or (horizon * 24)),
+        "schedule_horizon_days": horizon,
+        "scheduling_window_label": scheduling_window_display_label(
+            int(row.get("lookahead_hours") or 0),
+            schedule_horizon_days=horizon,
+        ),
         "queue_depth_phrase": _queue_depth_phrase(qd),
         "priority_phrase":    _PRIORITY_PHRASES.get(pri, ""),
         "watermark_phrase":   _bool_phrase(

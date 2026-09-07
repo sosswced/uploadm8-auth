@@ -55,6 +55,7 @@ class CatalogProductRead(BaseModel):
     max_accounts: Optional[int] = None
     max_accounts_per_platform: Optional[int] = None
     queue_depth: Optional[int] = None
+    schedule_horizon_days: Optional[int] = None
     lookahead_hours: Optional[int] = None
     trial_days: Optional[int] = None
     team_seats: Optional[int] = None
@@ -83,7 +84,7 @@ _CATALOG_PRODUCT_SELECT = """
     price_usd_yearly::float AS price_usd_yearly,
     wallet, token_amount,
     put_daily, put_monthly, aic_monthly, max_accounts, max_accounts_per_platform,
-    queue_depth, lookahead_hours, trial_days, team_seats,
+    queue_depth, schedule_horizon_days, lookahead_hours, trial_days, team_seats,
     watermark, ads, webhooks, white_label, hud, excel, flex,
     priority_class, ai_depth, analytics,
     image_filename, image_url, image_hash,
@@ -121,6 +122,7 @@ class CatalogProductPatch(BaseModel):
     max_accounts: Optional[int] = Field(None, ge=0)
     max_accounts_per_platform: Optional[int] = Field(None, ge=0)
     queue_depth: Optional[int] = Field(None, ge=0)
+    schedule_horizon_days: Optional[int] = Field(None, ge=1)
     lookahead_hours: Optional[int] = Field(None, ge=0)
     trial_days: Optional[int] = Field(None, ge=0)
     team_seats: Optional[int] = Field(None, ge=1)

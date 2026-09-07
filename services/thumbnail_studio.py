@@ -21,7 +21,7 @@ import httpx
 
 from core.config import R2_BUCKET_NAME
 from core.r2 import generate_presigned_download_url, get_s3_client
-from core.thumbnail_text import clean_thumbnail_headline, is_generic_thumbnail_headline
+from core.thumbnail_text import clean_thumbnail_headline, is_unusable_thumbnail_headline
 
 from services.pikzels_v2 import (
     V2_PIKZONALITY_BY_ID,
@@ -1041,7 +1041,7 @@ def generate_recreate_variants(
         )
         headline_words = 3 + (i % 3)
         headline = clean_thumbnail_headline(base, max_words=headline_words, max_chars=42)
-        if is_generic_thumbnail_headline(headline):
+        if is_unusable_thumbnail_headline(headline):
             headline = clean_thumbnail_headline(f"{niche_clean.replace('_', ' ')} concept", max_words=3) or "VIDEO HIGHLIGHT"
         ctr_score = 62.0 + (i * 4.1) + (0.08 * closeness)
         if competitor_gap_mode:

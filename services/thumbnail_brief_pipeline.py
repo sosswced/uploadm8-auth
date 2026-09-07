@@ -168,12 +168,12 @@ def merge_story_voice_youtube_into_brief(
 
 
 def minimal_thumbnail_brief(*, title: str) -> Dict[str, Any]:
-    from core.thumbnail_text import clean_thumbnail_headline, is_generic_thumbnail_headline
+    from core.thumbnail_text import clean_thumbnail_headline, is_unusable_thumbnail_headline
 
     headline = (
         clean_thumbnail_headline((title or "").strip(), max_words=5, max_chars=24) or "VIDEO HIGHLIGHT"
     )
-    if is_generic_thumbnail_headline(headline):
+    if is_unusable_thumbnail_headline(headline):
         headline = "VIDEO HIGHLIGHT"
     return {
         "selected_headline": headline,

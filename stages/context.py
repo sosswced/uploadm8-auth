@@ -21,6 +21,7 @@ from core.helpers import (
     sanitize_hashtag_body,
     strip_stray_hashtag_json_blob,
 )
+from core.publish_text_sanitize import sanitize_publish_text
 
 from .entitlements import Entitlements
 
@@ -65,6 +66,14 @@ def is_placeholder_upload_title(title: str, filename: str = "") -> bool:
         low,
     ):
         return True
+    # Camera-roll dump names must never stick as the published title.
+    try:
+        from core.thumbnail_text import is_hydration_meta_headline, is_media_dump_filename
+
+        if is_media_dump_filename(t) or is_hydration_meta_headline(t):
+            return True
+    except Exception:
+        pass
     fname = str(filename or "").strip()
     if fname:
         stem = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", Path(fname).name).strip()
@@ -449,26 +458,40 @@ class JobContext:
         return self.local_video_path
 
     def get_effective_title(self, platform: str = "") -> str:
-        # Explicit user copy wins, but client defaults / stock titles must not mask hydration.
-        t = (self.title or "").strip()
-        ai = (self.ai_title or "").strip()
-        if t and not (ai and is_placeholder_upload_title(t, self.filename)):
-            return t
-        pl = (platform or "").strip().lower()
-        if pl:
-            m8_titles = getattr(self, "m8_platform_titles", None) or {}
-            if isinstance(m8_titles, dict) and m8_titles:
-                tt = m8_titles.get(pl) or m8_titles.get(platform or "")
-                if tt is None:
-                    for mk, mv in m8_titles.items():
-                        if str(mk).strip().lower() == pl:
-                            tt = mv
-                            break
-                if tt and str(tt).strip():
-                    return str(tt).strip()
-        if ai:
-            return ai
-        return (self.filename or "").strip() or ""
+        # Explicit user copy wins, but client defaults / stock titles / camera
+        # dump names (IMG_5135.MOV) must not mask hydration or stick as publish titles.
+        def _resolve() -> str:
+            t = (self.title or "").strip()
+            ai = (self.ai_title or "").strip()
+            if t and not is_placeholder_upload_title(t, self.filename):
+                return t
+            pl = (platform or "").strip().lower()
+            if pl:
+                m8_titles = getattr(self, "m8_platform_titles", None) or {}
+                if isinstance(m8_titles, dict) and m8_titles:
+                    tt = m8_titles.get(pl) or m8_titles.get(platform or "")
+                    if tt is None:
+                        for mk, mv in m8_titles.items():
+                            if str(mk).strip().lower() == pl:
+                                tt = mv
+                                break
+                    if tt and str(tt).strip():
+                        return str(tt).strip()
+            if ai and not is_placeholder_upload_title(ai, self.filename):
+                return ai
+            # Prefer AI over dump filename even when AI looks thin; never return
+            # camera-roll names as the published title when anything else exists.
+            if ai:
+                return ai
+            fname = (self.filename or "").strip()
+            if fname and not is_placeholder_upload_title(fname, fname):
+                return fname
+            return ""
+
+        # Publish-time safety net: collapse degenerate LLM stutter
+        # ("the the the the the") so it can never reach a platform even if it
+        # bypassed the hydration rewrite gate.
+        return sanitize_publish_text(_resolve())
 
     def get_effective_caption(self, platform: str = "") -> str:
         """Best caption for display or publish.
@@ -478,23 +501,28 @@ class JobContext:
         ship its own variant (aligned with ``get_effective_hashtags``). Falls back
         to ``ai_caption``. Strips AI JSON-hashtag glitches from all sources.
         """
-        c = (self.caption or "").strip()
-        ac = (self.ai_caption or "").strip()
-        if c and not (ac and is_placeholder_upload_caption(c)):
-            return strip_stray_hashtag_json_blob(c)
-        pl = (platform or "").strip().lower()
-        if pl:
-            m8_caps = getattr(self, "m8_platform_captions", None) or {}
-            if isinstance(m8_caps, dict) and m8_caps:
-                cap = m8_caps.get(pl) or m8_caps.get(platform or "")
-                if cap is None:
-                    for mk, mv in m8_caps.items():
-                        if str(mk).strip().lower() == pl:
-                            cap = mv
-                            break
-                if cap and str(cap).strip():
-                    return strip_stray_hashtag_json_blob(str(cap).strip())
-        return strip_stray_hashtag_json_blob(ac)
+        def _resolve() -> str:
+            c = (self.caption or "").strip()
+            ac = (self.ai_caption or "").strip()
+            if c and not (ac and is_placeholder_upload_caption(c)):
+                return strip_stray_hashtag_json_blob(c)
+            pl = (platform or "").strip().lower()
+            if pl:
+                m8_caps = getattr(self, "m8_platform_captions", None) or {}
+                if isinstance(m8_caps, dict) and m8_caps:
+                    cap = m8_caps.get(pl) or m8_caps.get(platform or "")
+                    if cap is None:
+                        for mk, mv in m8_caps.items():
+                            if str(mk).strip().lower() == pl:
+                                cap = mv
+                                break
+                    if cap and str(cap).strip():
+                        return strip_stray_hashtag_json_blob(str(cap).strip())
+            return strip_stray_hashtag_json_blob(ac)
+
+        # Publish-time safety net: collapse degenerate LLM stutter across every
+        # caption source before display / publish.
+        return sanitize_publish_text(_resolve())
 
     def get_effective_hashtags(self, platform: str = "") -> List[str]:
         """
@@ -920,7 +948,9 @@ HARD RULES
 - No copyrighted logos/brand marks (YouTube logo, TikTok logo, etc).
 - ACCURACY: Headlines and badges must reflect what is actually in the video. No misleading claims (e.g. "TOP 5" when it's not a list, "NEW" when it's not new). Describe visible content truthfully.
 - Do NOT use generic filler text like "EXCITING MOMENTS", "UNBELIEVABLE MOMENTS", "AMAZING MOMENT", "MUST WATCH", "WATCH THIS", "EPIC CLIP", or "CRAZY MOMENT".
+- NEVER use camera filenames (IMG_5135.MOV, VID_0001, DSCN1234), file extensions, or internal labels ("HYDRATION STORY", "FUSION SUMMARY", "UploadM8", "canonical") as headline or badge text.
 - The selected headline must include a concrete noun, place, object, action, OCR phrase, or route/speed detail from the context.
+- If evidence is thin, prefer a short truthful scene noun from vision/location over inventing text — never fall back to the filename.
 - If geo/route evidence is present, use at least one location/road/protected-area detail in visual props, notes, or headline options when truthful.
 - If OSD/HUD or Trill evidence is present, preserve speed, HUD timeline, or Trill energy in the thumbnail strategy when it matches the visible clip.
 - If music/audio evidence is present, preserve artist/track/genre as context for vibe and hashtag strategy, but do not imply the creator owns the song.
@@ -1733,11 +1763,22 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if hook:
         clauses.append("Scene hook: " + hook + ".")
 
-    if not clauses:
-        fname = (ctx.filename or "uploaded video").strip()
-        return f"Hydration story: {fname} has no strong analysis signals yet; use the actual frame and filename only."[:max_chars]
+    try:
+        from core.sports_identity import infer_sports_identity, sports_story_clause
 
-    story = "Hydration story: " + " ".join(clauses)
+        sport_clause = sports_story_clause(infer_sports_identity(ctx))
+        if sport_clause:
+            clauses.append(sport_clause)
+    except Exception:
+        pass
+
+    if not clauses:
+        # Do NOT embed the camera filename or a "Hydration story:" label here.
+        # Those strings previously leaked into Pikzels on-image text
+        # ("HYDRATION STORY" / "IMG_5135.MOV") when analysis was empty.
+        return ""
+
+    story = " ".join(clauses)
     if len(story) > max_chars:
         story = story[: max_chars - 1].rstrip() + "."
     return story

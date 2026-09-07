@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from core.models import UploadInit
 from core.scheduling import (
+    SMART_SCHEDULE_MAX_DAYS,
     _pick_day_offset,
     _rng_from_seed,
     calculate_smart_schedule,
@@ -23,8 +24,17 @@ def test_clamp_smart_schedule_days():
     assert clamp_smart_schedule_days(7) == 7
     assert clamp_smart_schedule_days(14) == 14
     assert clamp_smart_schedule_days(365) == 365
-    assert clamp_smart_schedule_days(9999) == 730
+    assert clamp_smart_schedule_days(730) == 730
+    assert clamp_smart_schedule_days(SMART_SCHEDULE_MAX_DAYS) == SMART_SCHEDULE_MAX_DAYS
+    assert clamp_smart_schedule_days(999999) == SMART_SCHEDULE_MAX_DAYS
     assert clamp_smart_schedule_days("30") == 30
+
+
+def test_max_window_lets_a_max_batch_run_at_one_per_day():
+    """A full batch must be able to spread at 1/day without hitting the cap."""
+    from core.scheduling import SMART_SCHEDULE_MAX_BATCH
+
+    assert SMART_SCHEDULE_MAX_DAYS >= SMART_SCHEDULE_MAX_BATCH
 
 
 def test_upload_init_rejects_zero_smart_days():

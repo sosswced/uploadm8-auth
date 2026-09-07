@@ -304,7 +304,8 @@ def build_fusion_scene(ctx: JobContext) -> Dict[str, Any]:
             bits.append(f"with {artist or track}")
         scene = ("Dashcam clip " + ", ".join(bits)).strip() + "." if bits else ""
 
-    # Title suggestion always uses trusted peak (never a stale TL/hook MPH).
+    # Title: telemetry speed/place still wins for dashcam. When those are
+    # missing, use live Vision/web names from the planned upload domains.
     title_parts: List[str] = []
     if speed >= 5:
         title_parts.append(f"{int(round(speed))} MPH")
@@ -315,10 +316,17 @@ def build_fusion_scene(ctx: JobContext) -> Dict[str, Any]:
         title_parts.append(artist)
     elif track:
         title_parts.append(track)
-    if len(title_parts) >= 2:
-        title_suggestion = " · ".join(title_parts[:3])
-    elif title_parts:
-        title_suggestion = title_parts[0]
+    named = ""
+    try:
+        from core.upload_domain_plan import compose_service_title
+
+        named = (compose_service_title(ctx) or "").strip()
+    except Exception:
+        named = ""
+    if title_parts:
+        title_suggestion = " · ".join(title_parts[:3]) if len(title_parts) >= 2 else title_parts[0]
+    elif named:
+        title_suggestion = named
     else:
         title_suggestion = (hook[:90] if hook else "")
 

@@ -329,7 +329,7 @@ async def build_wallet_marketing_payload(
     put_month = _i(plan.get("put_monthly"))
     aic_month = _i(plan.get("aic_monthly"))
     per_pf = _i(plan.get("max_accounts_per_platform"))
-    lookahead_h = _i(plan.get("lookahead_hours"))
+    horizon_days = _i(plan.get("schedule_horizon_days")) or max(1, (_i(plan.get("lookahead_hours")) + 23) // 24)
 
     internal = _internal_tier(tier)
     period_start = await _period_anchor(conn, user_id)
@@ -531,7 +531,7 @@ async def build_wallet_marketing_payload(
         put_delta = _i(ncfg.get("put_monthly")) - _i(ccfg.get("put_monthly"))
         aic_delta = _i(ncfg.get("aic_monthly")) - _i(ccfg.get("aic_monthly"))
         q_delta = _i(ncfg.get("queue_depth")) - _i(ccfg.get("queue_depth"))
-        lh_delta = _i(ncfg.get("lookahead_hours")) - _i(ccfg.get("lookahead_hours"))
+        lh_delta = _i(ncfg.get("schedule_horizon_days")) - _i(ccfg.get("schedule_horizon_days"))
         active_usage = burn_put >= 0.35 or burn_aic >= 0.35 or sums["put_spent"] >= 15
         if active_usage:
             bits = []
@@ -542,7 +542,7 @@ async def build_wallet_marketing_payload(
             if q_delta > 0:
                 bits.append(f"queue {_i(ccfg.get('queue_depth')):,} → {_i(ncfg.get('queue_depth')):,}")
             if lh_delta > 0:
-                bits.append(f"schedule up to {_i(ncfg.get('lookahead_hours'))}h ahead")
+                bits.append(f"schedule up to {_i(ncfg.get('schedule_horizon_days'))} days ahead")
             detail = "; ".join(bits) if bits else "More capacity and features for growing channels."
             _append_opportunity(
                 opps,
@@ -565,13 +565,16 @@ async def build_wallet_marketing_payload(
             cta_link=links["pricing"],
         )
 
-    if tier in ("free", "creator_lite") and lookahead_h <= 24 and burn_put >= 0.12:
+    if tier in ("free", "creator_lite") and horizon_days < 90 and burn_put >= 0.12:
         _append_opportunity(
             opps,
             type_="scheduler_upgrade",
             severity="info",
             title="Schedule further ahead",
-            body=f"Your plan schedules up to {lookahead_h}h out. Higher tiers add longer lookahead and larger queues for batch workflows.",
+            body=(
+                f"Your plan schedules up to {horizon_days} days out. "
+                "Higher tiers unlock longer Smart Schedule windows and larger queues for batch workflows."
+            ),
             cta_label="See scheduling limits",
             cta_link=links["pricing"],
         )

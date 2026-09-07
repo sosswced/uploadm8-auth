@@ -32,8 +32,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from core.thumbnail_text import (
-    is_evidence_empty_fallback_headline,
-    is_generic_thumbnail_headline,
+    is_empty_hydration_story_fallback,
+    is_unusable_thumbnail_headline,
 )
 from services.pikzels_v2 import (
     V2_THUMBNAIL_EDIT,
@@ -396,7 +396,7 @@ def _build_pikzels_v2_prompt(
     # word, or a token over 5 chars). Even then, we cap to ~30 chars and
     # forbid any other on-image text.
     def _headline_is_concrete(h: str) -> bool:
-        if not h or is_generic_thumbnail_headline(h) or is_evidence_empty_fallback_headline(h):
+        if not h or is_unusable_thumbnail_headline(h):
             return False
         if any(ch.isdigit() for ch in h):
             return True
@@ -512,7 +512,7 @@ def _build_pikzels_v2_prompt(
             prioritized.append("Fusion: " + cfs[:280])
 
         hstory = str(hp.get("hydration_story") or "").strip()
-        if hstory:
+        if hstory and not is_empty_hydration_story_fallback(hstory):
             prioritized.append("Story: " + hstory[:220])
 
         anch = str(hp.get("anchor_phrase") or "").strip()
@@ -530,7 +530,12 @@ def _build_pikzels_v2_prompt(
         prioritized.append(f"Fusion: {fusion[:280]}")
 
     hydration_story_slice = str(brief.get("hydration_story") or "").strip()
-    if hydration_story_slice and len(fusion) < 120 and not any(p.startswith("Story:") for p in prioritized):
+    if (
+        hydration_story_slice
+        and not is_empty_hydration_story_fallback(hydration_story_slice)
+        and len(fusion) < 120
+        and not any(p.startswith("Story:") for p in prioritized)
+    ):
         prioritized.append(f"Story: {hydration_story_slice[:220]}")
 
     text_brief = str(brief.get("pikzels_text_brief") or brief.get("engine_text_brief") or "").strip()

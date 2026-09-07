@@ -42,7 +42,11 @@ from core.content_attribution import (
 from core.thumbnail_text import (
     CATEGORY_HEADLINE_FALLBACKS,
     clean_thumbnail_headline,
+    is_evidence_empty_fallback_headline,
     is_generic_thumbnail_headline,
+    is_hydration_meta_headline,
+    is_media_dump_filename,
+    is_unusable_thumbnail_headline,
 )
 
 from .context import JobContext
@@ -386,7 +390,7 @@ def _hero_fact_headlines(ctx: JobContext, category: str) -> List[str]:
                 continue
         else:
             candidate = clean_thumbnail_headline(str(fact.get("text") or ""), max_words=5)
-        if candidate and not is_generic_thumbnail_headline(candidate) and candidate not in out:
+        if candidate and not is_unusable_thumbnail_headline(candidate) and candidate not in out:
             out.append(candidate)
     return out
 
@@ -397,6 +401,10 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
     Identity hero facts lead; legacy evidence probes (vision, OCR, music,
     title) back them up; CATEGORY_HEADLINE_FALLBACKS is the demoted last
     resort for uploads with no usable evidence at all.
+
+    Camera-roll dump names (IMG_5135.MOV) and internal hydration meta labels
+    ("HYDRATION STORY …") are never eligible — those bled onto published
+    Instagram/YouTube covers when analysis was weak.
     """
     driving_ev = False
     try:
@@ -411,8 +419,17 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
 
             for mark in collect_visual_marks(ctx)[:6]:
                 cleaned = clean_thumbnail_headline(str(mark.get("text") or ""), max_words=4)
-                if cleaned and not is_generic_thumbnail_headline(cleaned):
+                if cleaned and not is_unusable_thumbnail_headline(cleaned):
                     return cleaned
+        except Exception:
+            pass
+        try:
+            from core.sports_identity import infer_sports_identity, sports_title_phrase
+
+            sport_line = sports_title_phrase(infer_sports_identity(ctx))
+            cleaned = clean_thumbnail_headline(sport_line, max_words=5) if sport_line else ""
+            if cleaned and not is_unusable_thumbnail_headline(cleaned):
+                return cleaned
         except Exception:
             pass
 
@@ -425,12 +442,12 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
         concrete = _first_list_value(vc, "landmark_names", "logo_names", "labels", "label_names", "objects")
         if concrete:
             cleaned = clean_thumbnail_headline(concrete, max_words=4)
-            if cleaned and not is_generic_thumbnail_headline(cleaned):
+            if cleaned and not is_unusable_thumbnail_headline(cleaned):
                 return cleaned
         ocr = str(vc.get("ocr_text") or "").strip()
         if ocr:
             cleaned = clean_thumbnail_headline(ocr, max_words=4)
-            if cleaned and not is_generic_thumbnail_headline(cleaned):
+            if cleaned and not is_unusable_thumbnail_headline(cleaned):
                 return cleaned
 
     ac = ctx.audio_context or {}
@@ -439,12 +456,16 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
         artist = ac.get("music_artist") or ac.get("artist")
         if music or artist:
             cleaned = clean_thumbnail_headline(" ".join(str(x) for x in (artist, music) if x), max_words=4)
-            if cleaned and not is_generic_thumbnail_headline(cleaned):
+            if cleaned and not is_unusable_thumbnail_headline(cleaned):
                 return cleaned
 
     for source in (ctx.get_effective_title(), ctx.get_effective_caption(), ctx.filename):
+        if not source:
+            continue
+        if is_media_dump_filename(source):
+            continue
         cleaned = clean_thumbnail_headline(source, max_words=5)
-        if cleaned and not is_generic_thumbnail_headline(cleaned):
+        if cleaned and not is_unusable_thumbnail_headline(cleaned):
             return cleaned
 
     return CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
@@ -478,8 +499,13 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
 
     fallback = _concrete_thumbnail_headline(ctx, category)
     selected = clean_thumbnail_headline(out.get("selected_headline"), max_words=5)
-    if is_generic_thumbnail_headline(selected):
+    if is_unusable_thumbnail_headline(selected):
         selected = fallback
+    # Category fallbacks are intentional last resorts for the brief, but must
+    # never be painted by Pikzels — leave them as selected for strategy only;
+    # pikzels_api treats them as non-concrete (no on-image text).
+    if is_unusable_thumbnail_headline(selected) and not is_evidence_empty_fallback_headline(selected):
+        selected = CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
     out["selected_headline"] = selected
 
     options: List[str] = []
@@ -488,15 +514,21 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
         for item in raw_options:
             candidate = item.get("text") if isinstance(item, dict) else item
             cleaned = clean_thumbnail_headline(candidate, max_words=5)
-            if cleaned and not is_generic_thumbnail_headline(cleaned) and cleaned not in options:
+            if cleaned and not is_unusable_thumbnail_headline(cleaned) and cleaned not in options:
                 options.append(cleaned)
     # Identity hero facts join the rotation so platforms can lead with
     # different verified facts (landmark vs speed vs dish vs on-screen text).
     hero_candidates = _hero_fact_headlines(ctx, category)
     for candidate in (selected, *hero_candidates, fallback, CATEGORY_HEADLINE_FALLBACKS.get(category, "VIDEO HIGHLIGHT")):
         cleaned = clean_thumbnail_headline(candidate, max_words=5)
-        if cleaned and cleaned not in options:
-            options.append(cleaned)
+        if not cleaned or cleaned in options:
+            continue
+        # Keep category fallback in options for strategy; drop dump/meta bleed.
+        if is_media_dump_filename(cleaned) or is_hydration_meta_headline(cleaned):
+            continue
+        if is_generic_thumbnail_headline(cleaned):
+            continue
+        options.append(cleaned)
     out["headline_options"] = options[:3]
 
     badge = clean_thumbnail_headline(out.get("badge_text"), max_words=2)[:14]
@@ -616,7 +648,7 @@ def _render_template_thumbnail(
         max_words=5,
         max_chars=30,
     )
-    if is_generic_thumbnail_headline(headline):
+    if is_unusable_thumbnail_headline(headline):
         headline = ""
     badge_text = (brief.get("badge_text") or "").upper()[:12]
 

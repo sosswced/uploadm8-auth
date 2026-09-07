@@ -16,6 +16,12 @@ Headline views/likes/comments/shares use a **deduplicated** merge:
   • If every successful ``platform_results`` row lacks a video id, the same
     **upload-level** max(row, roll) is used once (not a sum of empty per-entry metrics),
     so ``uploads.views`` / worker-synced columns are not dropped.
+  • The ``uploads`` row columns hold the authoritative *combined* totals summed across
+    every platform a video was posted to (written by per-upload sync-analytics).
+    Single-platform uploads apply that total as a non-destructive max on their one key;
+    multi-platform uploads credit only the **shortfall** (row total minus the per-entry
+    metrics already counted on their keys) as an orphan, so multi-platform combined
+    views/likes are not dropped when per-entry ``platform_results`` metrics are stale/0.
 
 ``live_aggregate`` / ``platform_metrics_cache`` (worker + OAuth account polls) is
 **not** mixed into these totals — it is an account-level snapshot for pills/badges;
@@ -517,6 +523,10 @@ async def compute_canonical_engagement_rollup(
         had_key = False
         upload_resolved_keys: List[Tuple[str, str, str]] = []
         entry_orphan = _zero_vec()
+        # Sum of the per-entry (per-platform) metrics THIS upload contributed to its
+        # deduped keys.  Used to reconcile against the authoritative combined
+        # ``uploads`` row totals (written by sync-analytics as the sum across platforms).
+        upload_key_metrics_sum = _zero_vec()
         for e in successful:
             m = _metrics_from_pr_entry(e)
             dkey = _dedupe_key_from_pr_entry(
@@ -532,6 +542,7 @@ async def compute_canonical_engagement_rollup(
                 continue
             had_key = True
             upload_resolved_keys.append(dkey)
+            upload_key_metrics_sum = _vec_add(upload_key_metrics_sum, m)
             if dkey in combined:
                 combined[dkey] = _vec_max(combined[dkey], m)
             else:
@@ -545,19 +556,38 @@ async def compute_canonical_engagement_rollup(
 
         if had_key:
             orphan = _vec_add(orphan, entry_orphan)
-            # For single-platform uploads the upload row columns (updated by sync-analytics)
-            # hold the authoritative per-video totals.  Apply them as a non-destructive max
-            # so that views/likes/comments/shares synced after publish are reflected even
-            # when platform_content_items hasn't been catalogued yet.
+            # The upload row columns (updated by sync-analytics) hold the authoritative
+            # *combined* per-video totals summed across every platform this video was
+            # posted to.  Per-entry ``platform_results`` metrics are often stale/zero
+            # (captured at publish time), so we must not drop the synced row totals for
+            # multi-platform uploads.
+            row_v: Dict[str, int] = {
+                "views":    _clamp_nonneg(int(row.get("views")    or 0)),
+                "likes":    _clamp_nonneg(int(row.get("likes")    or 0)),
+                "comments": _clamp_nonneg(int(row.get("comments") or 0)),
+                "shares":   _clamp_nonneg(int(row.get("shares")   or 0)),
+            }
             if len(upload_resolved_keys) == 1:
-                row_v: Dict[str, int] = {
-                    "views":    _clamp_nonneg(int(row.get("views")    or 0)),
-                    "likes":    _clamp_nonneg(int(row.get("likes")    or 0)),
-                    "comments": _clamp_nonneg(int(row.get("comments") or 0)),
-                    "shares":   _clamp_nonneg(int(row.get("shares")   or 0)),
-                }
+                # Single platform: the row total IS this video's total — apply directly
+                # to the (single) deduped key as a non-destructive max so it also lifts
+                # a matching PCI/other-upload key that may hold a smaller synced value.
                 k = upload_resolved_keys[0]
                 combined[k] = _vec_max(combined[k], row_v)
+            elif len(upload_resolved_keys) > 1:
+                # Multi platform: the row holds the SUM across platforms, but each
+                # deduped key may be shared with PCI / other uploads, so we cannot max
+                # the full row onto a single key without double-counting.  Instead credit
+                # only the shortfall (authoritative combined total minus what this
+                # upload's per-entry metrics already added to its keys) as an orphan.
+                # This lifts multi-platform totals to the synced truth without corrupting
+                # per-key dedupe.
+                shortfall = {
+                    kk: _clamp_nonneg(
+                        int(row_v.get(kk) or 0) - int(upload_key_metrics_sum.get(kk) or 0)
+                    )
+                    for kk in _ENG_KEYS
+                }
+                orphan = _vec_add(orphan, shortfall)
         else:
             # Successful pr rows but none had a video id — sum(pr) may be all zeros while
             # uploads.views/likes columns hold truth; use one upload-level max(row, roll).
@@ -600,6 +630,7 @@ async def compute_canonical_engagement_rollup(
             "pr_entries_missing_video_key": pr_entries_missing_video_key,
             "upload_jobs_all_pr_keyless_fallback": upload_jobs_all_pr_keyless_fallback,
             "single_platform_upload_row_boost_applied": True,
+            "multi_platform_upload_row_shortfall_applied": True,
         },
         "vectors": {
             "per_video_deduped_total": dict(pv),

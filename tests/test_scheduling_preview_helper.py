@@ -168,6 +168,71 @@ def test_preview_accepts_five_thousand_batch_count():
     assert clamp_smart_schedule_batch(10000) == SMART_SCHEDULE_MAX_BATCH
 
 
+def test_preview_work_budget_bounds_wide_window_batches():
+    """Preview cost tracks batch × window, so a wide window must simulate fewer slots."""
+    from core.scheduling import (
+        SMART_SCHEDULE_MAX_BATCH,
+        SMART_SCHEDULE_MAX_DAYS,
+        SMART_SCHEDULE_PREVIEW_RETURN_CAP,
+        SMART_SCHEDULE_PREVIEW_WORK_BUDGET,
+        smart_schedule_preview_simulated_count as _preview_simulated_count,
+    )
+
+    # Small and mid-size batches stay fully simulated.
+    assert _preview_simulated_count(1, SMART_SCHEDULE_MAX_DAYS) == 1
+    assert _preview_simulated_count(24, SMART_SCHEDULE_MAX_DAYS) == 24
+    assert _preview_simulated_count(500, 30) == 500
+    # The batch that was already served at the old cap must not regress.
+    assert _preview_simulated_count(SMART_SCHEDULE_MAX_BATCH, 730) == SMART_SCHEDULE_MAX_BATCH
+
+    # The pathological corner gets bounded rather than running for ~35s.
+    widest = _preview_simulated_count(SMART_SCHEDULE_MAX_BATCH, SMART_SCHEDULE_MAX_DAYS)
+    assert SMART_SCHEDULE_PREVIEW_RETURN_CAP <= widest < SMART_SCHEDULE_MAX_BATCH
+
+    # Never below what we actually render, and never over budget.
+    for days in (1, 14, 730, SMART_SCHEDULE_MAX_DAYS):
+        n = _preview_simulated_count(SMART_SCHEDULE_MAX_BATCH, days)
+        assert n >= min(SMART_SCHEDULE_PREVIEW_RETURN_CAP, SMART_SCHEDULE_MAX_BATCH)
+        assert n <= SMART_SCHEDULE_MAX_BATCH
+        if n < SMART_SCHEDULE_MAX_BATCH:
+            assert n * days <= SMART_SCHEDULE_PREVIEW_WORK_BUDGET
+
+
+def test_preview_slot_label_falls_back_to_video_number():
+    from services.scheduling_preview import preview_slot_label
+
+    assert preview_slot_label(["clip.mp4", "  b.mp4  "], 0) == "clip.mp4"
+    assert preview_slot_label(["clip.mp4", "  b.mp4  "], 1) == "b.mp4"
+    # Missing, blank, or absent label lists all fall back to a 1-based number.
+    assert preview_slot_label(["clip.mp4"], 1) == "Video 2"
+    assert preview_slot_label(["", "x"], 0) == "Video 1"
+    assert preview_slot_label(None, 4) == "Video 5"
+    assert preview_slot_label([], 0) == "Video 1"
+
+
+def test_preview_payload_flags_partial_simulation():
+    """A bounded preview must declare itself an estimate, not pass as exact."""
+    from services.scheduling_preview import preview_response_payload
+
+    smart = {"tiktok": datetime(2026, 8, 1, 15, 0, tzinfo=timezone.utc)}
+    sm = {"tiktok": "2026-08-01T15:00:00Z"}
+    batch = [{"index": 0, "label": "a", "smart_schedule": sm}]
+
+    partial = preview_response_payload(
+        smart, sm, seed="s", smart_schedule_days=5000,
+        batch=batch, batch_count=5000, simulated_count=800,
+    )
+    assert partial["preview_estimated"] is True
+    assert partial["simulated_count"] == 800
+
+    full = preview_response_payload(
+        smart, sm, seed="s", smart_schedule_days=30,
+        batch=batch, batch_count=500, simulated_count=500,
+    )
+    assert "preview_estimated" not in full
+    assert "simulated_count" not in full
+
+
 def test_one_video_over_one_day_and_n_over_w_never_reject_density():
     """Functional contract: any N over any W packs in-window. Plan limits are separate."""
     now = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)

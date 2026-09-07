@@ -298,3 +298,57 @@ def test_pikzels_v2_recreate_blocked_when_studio_disabled(studio_client: TestCli
         mock_debit.assert_not_awaited()
     finally:
         core.state.db_pool = FakePool()
+
+
+def test_assert_ai_thumbnail_styling_allowed_blocks_lower_tiers():
+    """Free / starter / creator_lite have no AI thumbnail styling entitlement."""
+    from routers.thumbnail_studio_api import _assert_ai_thumbnail_styling_allowed
+    from fastapi import HTTPException
+
+    for tier in ("free", "starter", "creator_lite"):
+        with pytest.raises(HTTPException) as ei:
+            _assert_ai_thumbnail_styling_allowed({"id": USER_ID, "subscription_tier": tier})
+        assert ei.value.status_code == 403
+        assert ei.value.detail.get("code") == "feature_ai_thumbnail_styling"
+
+
+def test_assert_ai_thumbnail_styling_allowed_permits_pro_and_up():
+    from routers.thumbnail_studio_api import _assert_ai_thumbnail_styling_allowed
+
+    for tier in ("creator_pro", "studio", "agency"):
+        # Should not raise.
+        _assert_ai_thumbnail_styling_allowed({"id": USER_ID, "subscription_tier": tier})
+
+
+def test_pikzels_v2_recreate_blocked_for_creator_lite(studio_client: TestClient):
+    """Tier gate blocks Pikzels spend before any wallet debit for Creator Lite."""
+    lite_user = {**FAKE_USER, "subscription_tier": "creator_lite"}
+
+    async def _fake_lite_user():
+        return lite_user
+
+    app.dependency_overrides[get_current_user] = _fake_lite_user
+    try:
+        with patch(
+            "routers.thumbnail_studio_api.atomic_debit_tokens",
+            new=AsyncMock(return_value=True),
+        ) as mock_debit, patch(
+            "routers.thumbnail_studio_api.pikzels_v2_post",
+            new=AsyncMock(return_value=(200, {})),
+        ) as mock_post:
+            r = studio_client.post(
+                "/api/thumbnail-studio/pikzels-v2/recreate",
+                json={
+                    "prompt": "Bold title",
+                    "image_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+                },
+            )
+        assert r.status_code == 403
+        assert r.json()["detail"]["code"] == "feature_ai_thumbnail_styling"
+        mock_debit.assert_not_awaited()
+        mock_post.assert_not_awaited()
+    finally:
+        async def _restore():
+            return FAKE_USER
+
+        app.dependency_overrides[get_current_user] = _restore

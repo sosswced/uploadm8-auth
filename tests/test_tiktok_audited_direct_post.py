@@ -34,17 +34,18 @@ def test_stale_env_cannot_disable_direct_post(monkeypatch):
     assert tiktok_direct_post_status()["public_publish_enabled"] is True
 
 
-def test_oauth_scope_includes_profile_and_list():
+def test_oauth_scope_matches_portal():
     scope = OAUTH_CONFIG["tiktok"]["scope"]
     for part in (
         "user.info.basic",
-        "user.info.profile",
         "user.info.stats",
         "video.publish",
         "video.upload",
         "video.list",
     ):
         assert part in scope
+    # Not on portal yet — requesting it causes invalid_scope on authorize.
+    assert "user.info.profile" not in scope
 
 
 def test_private_only_api_error_detection():

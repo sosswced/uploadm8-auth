@@ -2235,6 +2235,32 @@ async def run_migrations(db_pool):
                     ON platform_tokens (refresh_expires_at)
                     WHERE revoked_at IS NULL AND refresh_expires_at IS NOT NULL;
             """),
+            # Per-tier Smart Schedule / manual schedule horizon (days).
+            # lookahead_hours stays as hours (= days × 24) for Stripe metadata.
+            (1106, """
+                ALTER TABLE catalog_products
+                    ADD COLUMN IF NOT EXISTS schedule_horizon_days INT;
+                UPDATE catalog_products SET
+                    schedule_horizon_days = 30,
+                    lookahead_hours = 720
+                  WHERE tier_slug = 'creator_lite'
+                    AND product_kind = 'subscription';
+                UPDATE catalog_products SET
+                    schedule_horizon_days = 90,
+                    lookahead_hours = 2160
+                  WHERE tier_slug = 'creator_pro'
+                    AND product_kind = 'subscription';
+                UPDATE catalog_products SET
+                    schedule_horizon_days = 365,
+                    lookahead_hours = 8760
+                  WHERE tier_slug = 'studio'
+                    AND product_kind = 'subscription';
+                UPDATE catalog_products SET
+                    schedule_horizon_days = 5000,
+                    lookahead_hours = 120000
+                  WHERE tier_slug = 'agency'
+                    AND product_kind = 'subscription';
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

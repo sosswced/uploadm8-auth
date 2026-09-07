@@ -278,7 +278,23 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
     harbors = _extract_regex_places(ocr, _HARBOR_RE)
     plazas = _extract_regex_places(ocr, _PLAZA_RE)
     plates = _extract_license_plates(ocr)
-    teams = _extract_teams(ocr + " " + speech_blob, logos)
+    web_bits: List[str] = []
+    if isinstance(vc, dict):
+        web_bits.extend(str(x).strip() for x in (vc.get("web_entities") or []) if str(x).strip())
+        web_bits.extend(str(x).strip() for x in (vc.get("web_best_guess") or []) if str(x).strip())
+        web_bits.extend(str(x).strip() for x in (vc.get("landmark_names") or []) if str(x).strip())
+        web_bits.extend(str(x).strip() for x in (vc.get("label_names") or []) if str(x).strip())
+    teams = _extract_teams(ocr + " " + speech_blob + " " + " ".join(web_bits), logos)
+
+    try:
+        from core.sports_identity import infer_sports_identity
+
+        inferred = infer_sports_identity(ctx)
+    except Exception:
+        inferred = {}
+    if isinstance(inferred, dict):
+        teams.extend(str(t) for t in (inferred.get("sports_teams") or []) if str(t).strip())
+        stadiums.extend(str(s) for s in (inferred.get("stadiums") or []) if str(s).strip())
 
     # Landmark names that look like beaches/monuments
     for lm in landmarks:
@@ -329,7 +345,9 @@ def extract_place_evidence(ctx: Any) -> Dict[str, Any]:
         "harbors": _uniq(harbors, limit=8),
         "plazas": _uniq(plazas, limit=8),
         "license_plates": plates,
-        "sports_teams": teams,
+        "sports_teams": _uniq(teams, limit=8),
+        "sport_kind": str((inferred or {}).get("sport_kind") or "") if isinstance(inferred, dict) else "",
+        "kit_colors": list((inferred or {}).get("kit_colors") or [])[:8] if isinstance(inferred, dict) else [],
         "logos": logos[:8],
         "transcript_places": _uniq(transcript_places, limit=8),
         "has_map_telemetry": _telemetry_has_place(ctx),
@@ -451,6 +469,8 @@ def merge_place_evidence_into_pool(pool: Any, place_evidence: Optional[Dict[str,
     setattr(pool, "place_stadiums", list(place_evidence.get("stadiums") or [])[:6])
     setattr(pool, "license_plates", list(place_evidence.get("license_plates") or [])[:6])
     setattr(pool, "sports_teams", list(place_evidence.get("sports_teams") or [])[:6])
+    setattr(pool, "sport_kind", str(place_evidence.get("sport_kind") or ""))
+    setattr(pool, "kit_colors", list(place_evidence.get("kit_colors") or [])[:8])
     setattr(pool, "place_sources", list(place_evidence.get("sources") or []))
 
 

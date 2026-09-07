@@ -237,7 +237,10 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
 
     ws_id = ws_ctx.workspace_id if ws_ctx else None
 
-    validate_presign_schedule(data)
+    validate_presign_schedule(
+        data,
+        schedule_horizon_days=getattr(ent_cost, "schedule_horizon_days", None),
+    )
 
     smart_schedule = None
     schedule_mode = (getattr(data, "schedule_mode", None) or "immediate").strip().lower()
@@ -245,8 +248,15 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         schedule_mode = "immediate"
     if schedule_mode == "smart":
         from core.scheduling import clamp_smart_schedule_days
+        from stages.entitlements import resolve_schedule_horizon_days
 
-        days = clamp_smart_schedule_days(getattr(data, "smart_schedule_days", 14))
+        horizon = resolve_schedule_horizon_days(
+            schedule_horizon_days=getattr(ent_cost, "schedule_horizon_days", None),
+        )
+        days = min(
+            clamp_smart_schedule_days(getattr(data, "smart_schedule_days", 14)),
+            horizon,
+        )
         smart_schedule = await build_smart_schedule_for_upload(
             conn,
             bill_id,

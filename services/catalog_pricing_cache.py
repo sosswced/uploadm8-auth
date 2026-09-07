@@ -56,6 +56,7 @@ def _subscription_row_to_patch(row: asyncpg.Record) -> Dict[str, Any]:
         ("max_accounts", "max_accounts"),
         ("max_accounts_per_platform", "max_accounts_per_platform"),
         ("queue_depth", "queue_depth"),
+        ("schedule_horizon_days", "schedule_horizon_days"),
         ("lookahead_hours", "lookahead_hours"),
         ("trial_days", "trial_days"),
         ("team_seats", "team_seats"),
@@ -95,7 +96,7 @@ async def load_catalog_pricing_cache(conn: asyncpg.Connection) -> None:
             """
             SELECT tier_slug, display_name, price_usd, price_usd_yearly,
                    put_daily, put_monthly, aic_monthly, max_accounts, max_accounts_per_platform,
-                   queue_depth, lookahead_hours, trial_days, team_seats,
+                   queue_depth, schedule_horizon_days, lookahead_hours, trial_days, team_seats,
                    watermark, ads, webhooks, white_label, hud, excel, flex,
                    priority_class, ai_depth, analytics
             FROM catalog_products

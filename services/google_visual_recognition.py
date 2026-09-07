@@ -130,9 +130,11 @@ def build_recognition_catalog(
         if isinstance(row, dict):
             desc = str(row.get("description") or "").strip()
             sc = float(row.get("score") or 0)
+            if desc and sc <= 0:
+                sc = 0.7
         else:
             desc = str(row).strip()
-            sc = 0.0
+            sc = 0.7
         if desc and sc >= _WEB_MIN:
             _append_unique(catalog["web_matches"], desc, source="vision_web", score=sc)
             classify_phrase(desc, catalog=catalog, source="vision_web", score=sc)

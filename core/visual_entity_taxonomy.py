@@ -138,6 +138,7 @@ _SPORTS_RE = re.compile(
     r"\b("
     r"fishing|angler|bass|trout|fly\s*fishing|reel|rod|lure|bait|"
     r"golf|basketball|football|soccer|baseball|tennis|surf|skate|"
+    r"stadium|jersey|soccer\s*ball|football\s*field|kickoff|bleacher|"
     r"workout|gym|yoga|run|running|marathon|cycling|bike|climb|climbing"
     r")\b",
     re.I,

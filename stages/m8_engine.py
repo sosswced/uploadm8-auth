@@ -42,6 +42,7 @@ from core.caption_creative import (
     voice_directive as _m8_voice_directive,
 )
 from core.helpers import strip_stray_hashtag_json_blob
+from core.publish_text_sanitize import is_degenerate_publish_text
 from core.vision_labels import (
     is_generic_vision_label,
     penalize_generic_vision_hashtags,
@@ -3094,6 +3095,11 @@ def _validate_title(
     title = (candidate or "").strip()
     if not title:
         return True, "empty_ok"
+
+    # Degenerate decoding — repeated-token stutter like "the the the the the".
+    # Reject so the ranker never crowns it and falls back to a real evidence title.
+    if is_degenerate_publish_text(title):
+        return False, "degenerate_repetition"
 
     title_lc = title.lower()
     if _TITLE_CLICKBAIT_RE.search(title_lc):

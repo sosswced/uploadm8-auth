@@ -57,6 +57,10 @@ from core.helpers import (
     sanitize_hashtag_body,
     split_hashtag_source_phrases,
 )
+from core.publish_text_sanitize import (
+    collapse_repeated_words,
+    is_degenerate_publish_text,
+)
 from core.vision_labels import (
     HASHTAG_BODY_MAX_LEN,
     evidence_pool_has_strong_hashtag_signals,
@@ -1237,6 +1241,18 @@ def _compact_timeline_title(pool: EvidencePool) -> str:
         core = f"Through {geo}"
     else:
         core = ""
+    team = ""
+    teams = list(getattr(pool, "sports_teams", None) or [])
+    if teams:
+        team = str(teams[0]).strip()
+    if team and core and team.lower() not in core.lower():
+        core = f"{team} — {core}"
+    elif team and not core:
+        stad = ""
+        stads = list(getattr(pool, "place_stadiums", None) or [])
+        if stads:
+            stad = str(stads[0]).strip()
+        core = f"{team} at {stad}" if stad else f"{team} match"
     if music_bit and core:
         core = f"{core} — with {music_bit}"
     elif music_bit:
@@ -1320,6 +1336,24 @@ def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = No
         logo = str(pool.vision_logos[0]).strip()
         if logo and not is_generic_vision_label(logo):
             return _sanitize_anchor_fragment(logo, max_chars=90)
+
+    teams = list(getattr(pool, "sports_teams", None) or [])
+    if teams:
+        team = str(teams[0]).strip()
+        stads = list(getattr(pool, "place_stadiums", None) or [])
+        if team and stads:
+            return _sanitize_anchor_fragment(f"{team} at {stads[0]}", max_chars=90)
+        if team:
+            return _sanitize_anchor_fragment(f"{team} match", max_chars=90)
+    if ctx is not None:
+        try:
+            from core.sports_identity import infer_sports_identity, sports_title_phrase
+
+            phrase = sports_title_phrase(infer_sports_identity(ctx))
+            if phrase:
+                return _sanitize_anchor_fragment(phrase, max_chars=90)
+        except Exception:
+            pass
 
     if ctx is not None:
         fb = _base_file_anchor(ctx).rstrip(".").strip()
@@ -2178,6 +2212,14 @@ def _hydrate_title(title: str, anchor: str, *, max_chars: int = 100) -> str:
     """Replace title with a *title* anchor when empty/generic. Never VI dumps."""
     t = scrub_machine_publish_dump(title or "")
     a = scrub_machine_publish_dump(anchor or "")
+    # Degenerate LLM stutter ("the the the the the") must never publish: collapse
+    # immediate repetition, and if the result is still degenerate prefer the anchor.
+    if t:
+        collapsed = collapse_repeated_words(t)
+        if is_degenerate_publish_text(collapsed) or not collapsed:
+            t = ""
+        else:
+            t = collapsed
     if not a:
         return t[:max_chars]
     if not t:
@@ -2216,6 +2258,11 @@ def _hydrate_caption(caption: str, anchor: str, *, max_chars: int = 520) -> str:
     """
     cap = scrub_machine_publish_dump(caption or "")
     a = scrub_machine_publish_dump(anchor or "")
+    # Collapse immediate word/phrase stutter; drop the caption entirely when it
+    # is dominated by repetition so the evidence anchor takes over.
+    if cap:
+        collapsed = collapse_repeated_words(cap)
+        cap = "" if (is_degenerate_publish_text(collapsed) or not collapsed) else collapsed
     if not a:
         return cap[:max_chars]
     if not cap:
@@ -2572,6 +2619,11 @@ def enforce_hydration(
         Receipt templates under persona prefs → voice-shaped rebuild.
         """
         raw = cap_str or ""
+        # Collapse degenerate stutter first; repetition-dominated captions are
+        # treated as empty so the evidence anchor / voice rebuild takes over.
+        if raw.strip():
+            _collapsed_cap = collapse_repeated_words(raw)
+            raw = "" if (is_degenerate_publish_text(_collapsed_cap) or not _collapsed_cap) else _collapsed_cap
         scrubbed = scrub_machine_publish_dump(raw)
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
             if persona_required:
@@ -2629,6 +2681,15 @@ def enforce_hydration(
         Receipt templates under persona prefs never ship.
         """
         raw = ttl_str or ""
+        # Degenerate LLM stutter ("the the the the the") is collapsed first; if the
+        # collapsed text is still repetition-dominated, treat it as empty so the
+        # evidence/voice anchor path takes over.
+        if raw.strip():
+            _collapsed_raw = collapse_repeated_words(raw)
+            if is_degenerate_publish_text(_collapsed_raw) or not _collapsed_raw:
+                raw = ""
+            else:
+                raw = _collapsed_raw
         scrubbed = scrub_machine_publish_dump(raw)
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
             if persona_required:

@@ -31,15 +31,14 @@ PRIORITY CLASS -> REDIS QUEUE ROUTING:
   Priority queue always drains before normal queue touches a worker slot.
   Agency uploads literally jump every free-tier upload in the system.
 
-LOOKAHEAD HOURS (display / marketing only — NOT enforced):
-  Surfaced on pricing, Stripe catalog metadata, and guide copy as a
-  "scheduling window" label. It does **not** gate how far ahead a user
-  may schedule, and the worker does **not** use it to start pre-processing.
-  Staged → processing uses a fixed PROCESSING_WINDOW_MINUTES (default 15)
-  for every tier (worker.py). Smart Schedule's real horizon is
-  SMART_SCHEDULE_MAX_DAYS (core/scheduling.py). Publishability past the
-  OAuth refresh-grant ceiling is advisory via services/oauth_readiness.py.
-  Tier defaults (Free=24, Creator Lite=12, Agency=168) exist for copy only.
+LOOKAHEAD / SCHEDULE HORIZON (enforced per tier):
+  ``schedule_horizon_days`` is how far ahead a user may Smart Schedule or
+  pick a manual date. Absolute ceiling is SMART_SCHEDULE_MAX_DAYS (5000).
+  ``lookahead_hours`` is the same window in hours (days × 24) for Stripe /
+  catalog metadata that historically named the field in hours.
+  Ladder (days): Free 14 → Creator Lite 30 → Creator Pro 90 → Studio 365
+  → Agency/internal 5000. Staged→processing still uses a fixed
+  PROCESSING_WINDOW_MINUTES for every tier (worker.py) — that is unrelated.
 
 QUEUE DEPTH:
   Max staged + pending + queued uploads per user at once.
@@ -82,7 +81,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": True, "ads": True, "ai": True,
         "scheduling": True, "webhooks": False, "white_label": False,
         "hud": False, "excel": False, "flex": False,
-        "priority_class": "p4", "queue_depth": 50, "lookahead_hours": 24,
+        "priority_class": "p4", "queue_depth": 50,
+        "schedule_horizon_days": 14, "lookahead_hours": 336,
         "max_thumbnails": 3, "ai_depth": "basic",
         "max_caption_frames": 3, "caption_frames": 3,
         "max_parallel_uploads": 1, "parallel_uploads": 1,
@@ -96,7 +96,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": False, "flex": False,
-        "priority_class": "p3", "queue_depth": 100, "lookahead_hours": 12,
+        "priority_class": "p3", "queue_depth": 100,
+        "schedule_horizon_days": 30, "lookahead_hours": 720,
         "max_thumbnails": 5, "ai_depth": "enhanced",
         "max_caption_frames": 5, "caption_frames": 5,
         "max_parallel_uploads": 2, "parallel_uploads": 2,
@@ -110,7 +111,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": False, "flex": False,
-        "priority_class": "p2", "queue_depth": 2500, "lookahead_hours": 24,
+        "priority_class": "p2", "queue_depth": 2500,
+        "schedule_horizon_days": 90, "lookahead_hours": 2160,
         "max_thumbnails": 8, "ai_depth": "advanced",
         "max_caption_frames": 8, "caption_frames": 8,
         "max_parallel_uploads": 3, "parallel_uploads": 3,
@@ -124,7 +126,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": True, "flex": False,
-        "priority_class": "p1", "queue_depth": 10000, "lookahead_hours": 72,
+        "priority_class": "p1", "queue_depth": 10000,
+        "schedule_horizon_days": 365, "lookahead_hours": 8760,
         "max_thumbnails": 12, "ai_depth": "max",
         "max_caption_frames": 15, "caption_frames": 15,
         "max_parallel_uploads": 4, "parallel_uploads": 4,
@@ -138,7 +141,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,
         "hud": False, "excel": True, "flex": True,
-        "priority_class": "p0", "queue_depth": 99999, "lookahead_hours": 168,
+        "priority_class": "p0", "queue_depth": 99999,
+        "schedule_horizon_days": 5000, "lookahead_hours": 120000,
         "max_thumbnails": 20, "ai_depth": "max",
         "max_caption_frames": 15, "caption_frames": 15,
         "max_parallel_uploads": 6, "parallel_uploads": 6,
@@ -153,7 +157,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,
         "hud": False, "excel": True, "flex": True,
-        "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
+        "priority_class": "p0", "queue_depth": 999999,
+        "schedule_horizon_days": 5000, "lookahead_hours": 120000,
         "max_thumbnails": 20, "ai_depth": "max", "max_caption_frames": 20,
         "max_parallel_uploads": 6, "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 9999, "analytics": "full_export", "internal": True,
@@ -165,7 +170,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,
         "hud": False, "excel": True, "flex": True,
-        "priority_class": "p0", "queue_depth": 99999, "lookahead_hours": 168,
+        "priority_class": "p0", "queue_depth": 99999,
+        "schedule_horizon_days": 5000, "lookahead_hours": 120000,
         "max_thumbnails": 20, "ai_depth": "max", "max_caption_frames": 15,
         "max_parallel_uploads": 6, "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 999, "analytics": "full_export", "internal": True,
@@ -177,7 +183,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,
         "hud": False, "excel": True, "flex": True,
-        "priority_class": "p0", "queue_depth": 99999, "lookahead_hours": 168,
+        "priority_class": "p0", "queue_depth": 99999,
+        "schedule_horizon_days": 5000, "lookahead_hours": 120000,
         "max_thumbnails": 20, "ai_depth": "max", "max_caption_frames": 15,
         "max_parallel_uploads": 6, "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 999, "analytics": "full_export", "internal": True,
@@ -190,7 +197,8 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": False, "flex": False,
-        "priority_class": "p3", "queue_depth": 100, "lookahead_hours": 12,
+        "priority_class": "p3", "queue_depth": 100,
+        "schedule_horizon_days": 30, "lookahead_hours": 720,
         "max_thumbnails": 5, "ai_depth": "enhanced", "max_caption_frames": 5,
         "max_parallel_uploads": 2, "custom_thumbnails": True, "ai_thumbnail_styling": False,
         "team_seats": 1, "analytics": "standard", "trial_days": 7, "internal": False,
@@ -285,20 +293,60 @@ def queue_lane_display_label(priority_class: str, slug: str = "") -> str:
     return "Standard"
 
 
-def scheduling_window_display_label(lookahead_hours: int) -> str:
-    """Scheduling lookahead as a short human phrase."""
-    h = int(lookahead_hours or 0)
-    if h >= 168:
-        return "7 days"
-    if h >= 72:
-        return "3 days"
-    if h >= 24:
-        return "24 hours"
-    if h >= 12:
-        return "12 hours"
-    if h > 0:
-        return f"{h} hours"
-    return "—"
+def resolve_schedule_horizon_days(
+    *,
+    schedule_horizon_days: Any = None,
+    lookahead_hours: Any = None,
+    default: int = 14,
+) -> int:
+    """
+    Absolute schedule-ahead ceiling in days for one tier/config row.
+
+    Prefers ``schedule_horizon_days``; falls back to ``ceil(lookahead_hours / 24)``
+    for catalog rows that still only carry the legacy hours field. Always clamped
+    to ``[1, SMART_SCHEDULE_MAX_DAYS]``.
+    """
+    from core.scheduling import SMART_SCHEDULE_MAX_DAYS
+
+    try:
+        if schedule_horizon_days is not None and str(schedule_horizon_days).strip() != "":
+            days = int(schedule_horizon_days)
+            return max(1, min(SMART_SCHEDULE_MAX_DAYS, days))
+    except (TypeError, ValueError):
+        pass
+    try:
+        hours = int(lookahead_hours) if lookahead_hours is not None else 0
+    except (TypeError, ValueError):
+        hours = 0
+    if hours > 0:
+        return max(1, min(SMART_SCHEDULE_MAX_DAYS, (hours + 23) // 24))
+    return max(1, min(SMART_SCHEDULE_MAX_DAYS, int(default or 14)))
+
+
+def scheduling_window_display_label(
+    lookahead_hours: int = 0,
+    *,
+    schedule_horizon_days: Optional[int] = None,
+) -> str:
+    """Scheduling horizon as a short human phrase (days-first)."""
+    days = resolve_schedule_horizon_days(
+        schedule_horizon_days=schedule_horizon_days,
+        lookahead_hours=lookahead_hours,
+        default=0,
+    )
+    if days <= 0:
+        return "—"
+    if days >= 5000:
+        return "up to 5000 days"
+    if days >= 365:
+        years = days // 365
+        rem = days % 365
+        if rem == 0:
+            return "1 year" if years == 1 else f"{years} years"
+        return f"{days} days"
+    if days == 1:
+        return "1 day"
+    return f"{days} days"
 
 
 def tier_cfg_to_api_dict(slug: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -306,7 +354,11 @@ def tier_cfg_to_api_dict(slug: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     pa = cfg.get("price_annual")
     priority_class = cfg.get("priority_class", "p4")
     analytics = cfg.get("analytics", "basic")
-    lookahead = int(cfg.get("lookahead_hours", 2) or 0)
+    horizon_days = resolve_schedule_horizon_days(
+        schedule_horizon_days=cfg.get("schedule_horizon_days"),
+        lookahead_hours=cfg.get("lookahead_hours"),
+    )
+    lookahead = int(cfg.get("lookahead_hours") or (horizon_days * 24))
     return {
         "slug": slug,
         "name": cfg.get("name", slug.replace("_", " ").title()),
@@ -320,6 +372,7 @@ def tier_cfg_to_api_dict(slug: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_accounts_per_platform": cfg.get("max_accounts_per_platform", 1),
         "per_platform": cfg.get("per_platform", cfg.get("max_accounts_per_platform", 1)),
         "queue_depth": cfg.get("queue_depth", 25),
+        "schedule_horizon_days": horizon_days,
         "lookahead_hours": lookahead,
         "trial_days": cfg.get("trial_days", 0),
         "team_seats": cfg.get("team_seats", 1),
@@ -329,7 +382,9 @@ def tier_cfg_to_api_dict(slug: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         "priority_class": priority_class,
         "can_priority": priority_class in PRIORITY_QUEUE_CLASSES,
         "queue_lane_label": queue_lane_display_label(priority_class, slug),
-        "scheduling_window_label": scheduling_window_display_label(lookahead),
+        "scheduling_window_label": scheduling_window_display_label(
+            lookahead, schedule_horizon_days=horizon_days
+        ),
         "max_thumbnails": cfg.get("max_thumbnails", 1),
         "max_caption_frames": cfg.get("max_caption_frames", 3),
         "caption_frames": cfg.get("caption_frames", cfg.get("max_caption_frames", 3)),
@@ -372,7 +427,8 @@ ENTITLEMENT_KEYS = (
     "max_accounts", "max_accounts_per_platform", "can_watermark", "can_ai",
     "can_schedule", "can_webhooks", "can_white_label", "can_excel", "can_priority",
     "can_flex", "show_ads", "priority_class", "queue_depth",
-    "lookahead_hours", "max_caption_frames", "ai_depth", "max_thumbnails",
+    "schedule_horizon_days", "lookahead_hours", "scheduling_window_label",
+    "max_caption_frames", "ai_depth", "max_thumbnails",
     "can_custom_thumbnails", "can_ai_thumbnail_styling", "max_parallel_uploads",
     "team_seats", "analytics", "trial_days", "is_internal", "allowed_ai_services",
 )
@@ -440,7 +496,8 @@ class Entitlements:
     # Queue / scheduler
     priority_class: str = "p4"         # p0 (highest) -> p4 (lowest)
     queue_depth: int = 25
-    lookahead_hours: int = 2
+    schedule_horizon_days: int = 14    # how far ahead posts may be scheduled
+    lookahead_hours: int = 336         # same window in hours (days × 24) for catalog/Stripe
 
     # AI
     max_caption_frames: int = 3
@@ -489,6 +546,10 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         from stages.ai_service_costs import SERVICE_WEIGHTS
 
         allowed_services = frozenset(SERVICE_WEIGHTS.keys()) if cfg.get("ai") else frozenset()
+    horizon_days = resolve_schedule_horizon_days(
+        schedule_horizon_days=cfg.get("schedule_horizon_days"),
+        lookahead_hours=cfg.get("lookahead_hours"),
+    )
     return Entitlements(
         tier=t,
         tier_display=cfg.get("name", t.replace("_", " ").title()),
@@ -508,7 +569,8 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         show_ads=cfg.get("ads", True),
         priority_class=cfg.get("priority_class", "p4"),
         queue_depth=cfg.get("queue_depth", 25),
-        lookahead_hours=cfg.get("lookahead_hours", 2),
+        schedule_horizon_days=horizon_days,
+        lookahead_hours=int(cfg.get("lookahead_hours") or (horizon_days * 24)),
         max_caption_frames=cfg.get("max_caption_frames", 3),
         ai_depth=cfg.get("ai_depth", "basic"),
         max_thumbnails=cfg.get("max_thumbnails", 1),
@@ -556,7 +618,19 @@ def get_entitlements_from_user(
         _ov(ent, overrides, "max_accounts_per_platform", int)
         _ov(ent, overrides, "max_parallel_uploads",       int)
         _ov(ent, overrides, "queue_depth",               int)
+        _ov(ent, overrides, "schedule_horizon_days",     int)
         _ov(ent, overrides, "lookahead_hours",           int)
+        if "schedule_horizon_days" in (overrides or {}) and overrides.get("schedule_horizon_days") is not None:
+            ent.schedule_horizon_days = resolve_schedule_horizon_days(
+                schedule_horizon_days=ent.schedule_horizon_days,
+                lookahead_hours=ent.lookahead_hours,
+            )
+            ent.lookahead_hours = max(ent.lookahead_hours, ent.schedule_horizon_days * 24)
+        elif "lookahead_hours" in (overrides or {}) and overrides.get("lookahead_hours") is not None:
+            ent.schedule_horizon_days = resolve_schedule_horizon_days(
+                schedule_horizon_days=None,
+                lookahead_hours=ent.lookahead_hours,
+            )
         _ov(ent, overrides, "max_caption_frames",        int)
         _ov(ent, overrides, "max_thumbnails",            int)
         _ov(ent, overrides, "can_custom_thumbnails",     bool)
@@ -619,7 +693,11 @@ def entitlements_to_dict(ent: Entitlements) -> dict:
         "show_ads":                  ent.show_ads,
         "priority_class":            ent.priority_class,
         "queue_depth":               ent.queue_depth,
+        "schedule_horizon_days":     ent.schedule_horizon_days,
         "lookahead_hours":           ent.lookahead_hours,
+        "scheduling_window_label":   scheduling_window_display_label(
+            ent.lookahead_hours, schedule_horizon_days=ent.schedule_horizon_days
+        ),
         "max_caption_frames":        ent.max_caption_frames,
         "ai_depth":                  ent.ai_depth,
         "max_thumbnails":            ent.max_thumbnails,

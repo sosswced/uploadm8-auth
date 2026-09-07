@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Dict, FrozenSet
 
 
@@ -99,6 +100,129 @@ def is_evidence_empty_fallback_headline(text: Any) -> bool:
     """True when headline equals a category default from lack of concrete evidence."""
     raw = str(text or "").strip().upper()
     return bool(raw) and raw in THUMBNAIL_CATEGORY_FALLBACK_HEADLINES
+
+
+# Camera-roll / phone dump stems that must never become on-image thumbnail text.
+_MEDIA_DUMP_STEM_RE = re.compile(
+    r"^(?:"
+    r"img[_-]?\d+"
+    r"|vid[_-]?\d+"
+    r"|dsc[_-]?\d+"
+    r"|dscn?\d+"
+    r"|mvi[_-]?\d+"
+    r"|mov[_-]?\d+"
+    r"|pxl[_-]?\d+"
+    r"|photo[_-]?\d+"
+    r"|video[_-]?\d+"
+    r"|clip[_-]?\d+"
+    r"|whatsapp[_ -]?(?:video|image)[_ -]?\d*"
+    r"|screen[_-]?recording[_-]?\d*"
+    r"|rpReplay_Final\d+"
+    r"|gopr\d+"
+    r"|gx\d+"
+    r"|gh\d+"
+    r")$",
+    re.IGNORECASE,
+)
+
+# Internal pipeline labels that LLMs/Pikzels sometimes stamp onto the canvas.
+_HYDRATION_META_PHRASES = frozenset(
+    {
+        "hydration story",
+        "hydration_story",
+        "fusion summary",
+        "fusion_summary",
+        "canonical geo",
+        "canonical music",
+        "canonical dashcam",
+        "signal hashtags",
+        "uploadm8 hydration",
+        "no strong analysis",
+        "use the actual frame",
+        "filename only",
+    }
+)
+
+
+def media_filename_stem(text: Any) -> str:
+    """Basename stem without extension, lowercased alnum-normalized for dump checks."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    name = Path(raw.replace("\\", "/")).name
+    stem = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", name).strip()
+    return stem
+
+
+def is_media_dump_filename(text: Any) -> bool:
+    """True for phone/camera dump names (IMG_5135.MOV, VID_0001, etc.)."""
+    stem = media_filename_stem(text)
+    if not stem:
+        return False
+    compact = re.sub(r"[\s.]+", "", stem)
+    if _MEDIA_DUMP_STEM_RE.match(stem) or _MEDIA_DUMP_STEM_RE.match(compact):
+        return True
+    # Bare "IMG 5135" / "IMG_5135" after clean_thumbnail_headline.
+    body = thumbnail_headline_body(text)
+    if _MEDIA_DUMP_STEM_RE.match(body.replace(" ", "")) or _MEDIA_DUMP_STEM_RE.match(
+        body.replace(" ", "_")
+    ):
+        return True
+    # Entire headline is only a dump stem (+ optional short extension token).
+    words = body.split()
+    if not words:
+        return False
+    joined = "".join(words)
+    if _MEDIA_DUMP_STEM_RE.match(joined):
+        return True
+    if len(words) <= 3 and words[-1] in {"mov", "mp4", "m4v", "avi", "mkv", "hevc", "3gp"}:
+        stemish = "".join(words[:-1])
+        if _MEDIA_DUMP_STEM_RE.match(stemish):
+            return True
+    return False
+
+
+def is_hydration_meta_headline(text: Any) -> bool:
+    """True when headline carries internal hydration / brief meta labels."""
+    body = thumbnail_headline_body(text)
+    if not body:
+        return False
+    if body in _HYDRATION_META_PHRASES:
+        return True
+    for phrase in _HYDRATION_META_PHRASES:
+        if phrase in body:
+            return True
+    # Leading "HYDRATION STORY …" after clean_thumbnail_headline.
+    if body.startswith("hydration story"):
+        return True
+    if body.startswith("fusion summary"):
+        return True
+    return False
+
+
+def is_empty_hydration_story_fallback(text: Any) -> bool:
+    """True for the no-signal hydration_story string that must not feed image prompts."""
+    raw = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not raw:
+        return False
+    if "no strong analysis signals" in raw:
+        return True
+    if "use the actual frame and filename" in raw:
+        return True
+    return False
+
+
+def is_unusable_thumbnail_headline(text: Any) -> bool:
+    """Generic, category-fallback, media-dump, or hydration-meta — never paint on canvas."""
+    if is_generic_thumbnail_headline(text):
+        return True
+    if is_evidence_empty_fallback_headline(text):
+        return True
+    if is_media_dump_filename(text):
+        return True
+    if is_hydration_meta_headline(text):
+        return True
+    return False
 
 
 def clean_thumbnail_headline(text: Any, *, max_words: int = 5, max_chars: int = 34) -> str:

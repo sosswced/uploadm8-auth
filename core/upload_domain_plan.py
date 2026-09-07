@@ -292,6 +292,115 @@ def compose_service_title(ctx: Any) -> str:
     return named[0][:90]
 
 
+# Discovery tags used to pad hashtags up to the user's maxHashtags when the
+# clip is a real sport/stadium scene. Club nicknames are optional boosters
+# once Vision/web already named the side — not a closed world of every club.
+_SOCCER_DISCOVERY: Tuple[str, ...] = (
+    "soccer",
+    "football",
+    "futbol",
+    "stadium",
+    "matchday",
+    "footballmatch",
+    "soccerlife",
+    "gameday",
+    "footballfans",
+    "soccerstadium",
+    "footballstadium",
+    "kickoff",
+    "footballgame",
+    "soccerfans",
+)
+
+_SPORT_DISCOVERY: Dict[str, Tuple[str, ...]] = {
+    "soccer": _SOCCER_DISCOVERY,
+    "american_football": (
+        "football", "nfl", "stadium", "gameday", "americanfootball",
+        "footballgame", "sports",
+    ),
+    "basketball": ("basketball", "nba", "hoops", "gameday", "stadium"),
+    "baseball": ("baseball", "mlb", "gameday", "ballpark", "stadium"),
+}
+
+# Nicknames / league tags once a known slug is already in evidence.
+_CLUB_DISCOVERY_TAGS: Dict[str, Tuple[str, ...]] = {
+    "fcbarcelona": ("barca", "campnou", "laliga", "cules", "blaugrana"),
+    "barcelona": ("fcbarcelona", "barca", "campnou", "laliga"),
+    "barca": ("fcbarcelona", "campnou", "laliga"),
+    "campnou": ("fcbarcelona", "barca", "laliga"),
+    "realmadrid": ("halamadrid", "laliga", "santiagobernabeu"),
+    "santiagobernabeu": ("realmadrid", "laliga"),
+}
+
+
+def _entity_hashtag_variants(name: str) -> List[str]:
+    """FC Barcelona → fcbarcelona, barcelona (strip FC/CF prefixes)."""
+    raw = re.sub(r"\s+", " ", str(name or "").strip())
+    if not raw:
+        return []
+    out = [_slug(raw)]
+    stripped = re.sub(r"^(?:fc|cf|ac|sc|afc)\s+", "", raw, flags=re.I).strip()
+    if stripped and stripped.lower() != raw.lower():
+        out.append(_slug(stripped))
+    return [s for s in out if s]
+
+
+def discovery_hashtags_for_upload(ctx: Any, *, limit: int = 15) -> List[str]:
+    """Deterministic sport/venue discovery tags to fill ``maxHashtags``.
+
+    Does not invent person-name mashups from OCR. Returns sanitized bodies
+    without leading '#'. Empty when the clip is not a sports/stadium scene.
+    """
+    try:
+        from core.helpers import sanitize_hashtag_body
+        from core.sports_identity import infer_sports_identity
+        from core.vision_labels import is_invented_person_hashtag, is_junk_hashtag_body
+    except Exception:
+        return []
+
+    try:
+        ident = infer_sports_identity(ctx)
+    except Exception:
+        ident = {}
+    sport = str((ident or {}).get("sport_kind") or "").strip()
+    domain = detect_planned_domain(ctx)
+    teams = [str(t).strip() for t in ((ident or {}).get("sports_teams") or []) if str(t).strip()]
+    stadiums = [str(s).strip() for s in ((ident or {}).get("stadiums") or []) if str(s).strip()]
+    if not sport and domain != "sports" and not teams and not stadiums:
+        return []
+
+    candidates: List[str] = []
+    for team in teams[:3]:
+        candidates.extend(_entity_hashtag_variants(team))
+    for stad in stadiums[:2]:
+        candidates.extend(_entity_hashtag_variants(stad))
+
+    evidence_slugs = {_slug(x) for x in (teams + stadiums) if _slug(x)}
+    for key, extras in _CLUB_DISCOVERY_TAGS.items():
+        if key in evidence_slugs or any(key in s or s in key for s in evidence_slugs):
+            candidates.extend(extras)
+
+    pack = _SPORT_DISCOVERY.get(sport)
+    if pack:
+        candidates.extend(pack)
+    elif domain == "sports" or teams or stadiums:
+        candidates.extend(("stadium", "gameday", "matchday", "sports"))
+
+    out: List[str] = []
+    seen: set = set()
+    for raw in candidates:
+        if is_invented_person_hashtag(raw):
+            continue
+        body = sanitize_hashtag_body(str(raw))
+        if not body or body in seen or is_junk_hashtag_body(body):
+            continue
+        seen.add(body)
+        out.append(body)
+        if len(out) >= max(1, int(limit or 15)):
+            break
+    return out
+
+
 __all__ = [
     "PLANNED_DOMAINS",
     "PLANNED_KITS",
@@ -300,4 +409,5 @@ __all__ = [
     "service_named_titles",
     "match_planned_kit",
     "compose_service_title",
+    "discovery_hashtags_for_upload",
 ]

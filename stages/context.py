@@ -21,7 +21,7 @@ from core.helpers import (
     sanitize_hashtag_body,
     strip_stray_hashtag_json_blob,
 )
-from core.publish_text_sanitize import sanitize_publish_text
+from core.publish_text_sanitize import sanitize_publish_text, strip_trailing_hashtag_run
 
 from .entitlements import Entitlements
 
@@ -521,8 +521,9 @@ class JobContext:
             return strip_stray_hashtag_json_blob(ac)
 
         # Publish-time safety net: collapse degenerate LLM stutter across every
-        # caption source before display / publish.
-        return sanitize_publish_text(_resolve())
+        # caption source before display / publish. Trailing #tags belong in the
+        # hashtag array (especially Instagram comment placement), not in prose.
+        return sanitize_publish_text(strip_trailing_hashtag_run(_resolve()))
 
     def get_effective_hashtags(self, platform: str = "") -> List[str]:
         """
@@ -873,8 +874,41 @@ class JobContext:
         except Exception:
             identity_line = ""
 
+        title_for_brief = (self.get_effective_title() or "").strip()
+        # Hard invariant: never feed the upload filename (or any dump / .mp4
+        # stem) into thumbnail briefs or Pikzels — even as a last resort.
+        try:
+            from core.thumbnail_text import (
+                is_filename_like_thumbnail_text,
+                safe_thumbnail_prompt_title,
+            )
+
+            if is_placeholder_upload_title(title_for_brief, self.filename):
+                title_for_brief = ""
+            elif is_filename_like_thumbnail_text(title_for_brief, filename=self.filename):
+                title_for_brief = ""
+        except Exception:
+            if title_for_brief and is_placeholder_upload_title(title_for_brief, self.filename):
+                title_for_brief = ""
+        if not title_for_brief:
+            try:
+                from core.upload_domain_plan import compose_service_title
+
+                title_for_brief = (compose_service_title(self) or "").strip()
+            except Exception:
+                title_for_brief = ""
+        try:
+            from core.thumbnail_text import safe_thumbnail_prompt_title
+
+            title_for_brief = safe_thumbnail_prompt_title(
+                title_for_brief, filename=self.filename, fallback="Video"
+            )
+        except Exception:
+            if not title_for_brief:
+                title_for_brief = "Video"
+
         out: Dict[str, str] = {
-            "effective_title": self.get_effective_title() or self.filename or "Video",
+            "effective_title": title_for_brief,
             "effective_caption": self.get_effective_caption() or "",
             "content_identity": identity_line,
             "category": category or getattr(self, "thumbnail_category", None) or "general",

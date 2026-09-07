@@ -62,6 +62,7 @@ from core.helpers import (
 from core.vision_labels import (
     HASHTAG_BODY_MAX_LEN,
     is_generic_vision_label,
+    is_invented_person_hashtag,
     is_junk_hashtag_body,
     road_hashtag_tokens,
     vision_label_slug,
@@ -339,6 +340,17 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
 
     if len(tags) > max_extra:
         tags = tags[:max_extra]
+    try:
+        from core.upload_domain_plan import discovery_hashtags_for_upload
+
+        for tag in discovery_hashtags_for_upload(ctx, limit=max_extra):
+            _push(tags, seen, tag)
+            if len(tags) >= max_extra:
+                break
+    except Exception:
+        pass
+    if len(tags) > max_extra:
+        tags = tags[:max_extra]
     return tags
 
 
@@ -395,7 +407,21 @@ def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> L
 
     Idempotent: re-running on the same context does not duplicate tags.
     """
-    extras = build_signal_hashtags(ctx, max_extra=max_extra)
+    us = getattr(ctx, "user_settings", None) or {}
+    try:
+        target = int(us.get("maxHashtags") or us.get("max_hashtags") or max_extra or 15)
+    except (TypeError, ValueError):
+        target = max_extra or 15
+    target = max(1, min(30, target))
+    signal_cap = max_extra
+    try:
+        from core.upload_domain_plan import discovery_hashtags_for_upload
+
+        if discovery_hashtags_for_upload(ctx, limit=1):
+            signal_cap = max(max_extra, target)
+    except Exception:
+        pass
+    extras = build_signal_hashtags(ctx, max_extra=signal_cap)
     if not extras:
         logger.info("[signal_hashtags] no extra tags from current signals")
         return []
@@ -417,6 +443,8 @@ def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> L
         for b in normalize_hashtag_bodies([str(raw)]):
             if not b or b in seen_ai or b in extras_lower:
                 continue
+            if is_invented_person_hashtag(raw) or is_junk_hashtag_body(b):
+                continue
             seen_ai.add(b)
             existing_ai.append(b)
     ctx.ai_hashtags = _unsquash_delimited_sources(
@@ -434,6 +462,8 @@ def merge_signal_hashtags_into_ctx(ctx: JobContext, *, max_extra: int = 12) -> L
             for raw in raw_list:
                 for b in normalize_hashtag_bodies([str(raw)]):
                     if not b or b in cur_seen or b in extras_lower:
+                        continue
+                    if is_invented_person_hashtag(raw) or is_junk_hashtag_body(b):
                         continue
                     cur_seen.add(b)
                     cur.append(b)

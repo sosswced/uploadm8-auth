@@ -43,6 +43,7 @@ from core.thumbnail_text import (
     CATEGORY_HEADLINE_FALLBACKS,
     clean_thumbnail_headline,
     is_evidence_empty_fallback_headline,
+    is_filename_like_thumbnail_text,
     is_generic_thumbnail_headline,
     is_hydration_meta_headline,
     is_media_dump_filename,
@@ -459,13 +460,22 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
             if cleaned and not is_unusable_thumbnail_headline(cleaned):
                 return cleaned
 
-    for source in (ctx.get_effective_title(), ctx.get_effective_caption(), ctx.filename):
+    for source in (ctx.get_effective_title(), ctx.get_effective_caption()):
         if not source:
             continue
-        if is_media_dump_filename(source):
+        # Never use ctx.filename here — filenames are never paintable cover text.
+        if is_media_dump_filename(source) or is_filename_like_thumbnail_text(
+            source, filename=str(getattr(ctx, "filename", "") or "")
+        ):
             continue
-        cleaned = clean_thumbnail_headline(source, max_words=5)
-        if cleaned and not is_unusable_thumbnail_headline(cleaned):
+        cleaned = clean_thumbnail_headline(
+            source,
+            max_words=5,
+            filename=str(getattr(ctx, "filename", "") or ""),
+        )
+        if cleaned and not is_unusable_thumbnail_headline(
+            cleaned, filename=str(getattr(ctx, "filename", "") or "")
+        ):
             return cleaned
 
     return CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
@@ -498,13 +508,18 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
             out[dst] = v
 
     fallback = _concrete_thumbnail_headline(ctx, category)
-    selected = clean_thumbnail_headline(out.get("selected_headline"), max_words=5)
-    if is_unusable_thumbnail_headline(selected):
+    fname = str(getattr(ctx, "filename", "") or "")
+    selected = clean_thumbnail_headline(
+        out.get("selected_headline"), max_words=5, filename=fname
+    )
+    if is_unusable_thumbnail_headline(selected, filename=fname):
         selected = fallback
     # Category fallbacks are intentional last resorts for the brief, but must
     # never be painted by Pikzels — leave them as selected for strategy only;
     # pikzels_api treats them as non-concrete (no on-image text).
-    if is_unusable_thumbnail_headline(selected) and not is_evidence_empty_fallback_headline(selected):
+    if is_unusable_thumbnail_headline(selected, filename=fname) and not is_evidence_empty_fallback_headline(
+        selected
+    ):
         selected = CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
     out["selected_headline"] = selected
 
@@ -513,8 +528,12 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
     if isinstance(raw_options, list):
         for item in raw_options:
             candidate = item.get("text") if isinstance(item, dict) else item
-            cleaned = clean_thumbnail_headline(candidate, max_words=5)
-            if cleaned and not is_unusable_thumbnail_headline(cleaned) and cleaned not in options:
+            cleaned = clean_thumbnail_headline(candidate, max_words=5, filename=fname)
+            if (
+                cleaned
+                and not is_unusable_thumbnail_headline(cleaned, filename=fname)
+                and cleaned not in options
+            ):
                 options.append(cleaned)
     # Identity hero facts join the rotation so platforms can lead with
     # different verified facts (landmark vs speed vs dish vs on-screen text).
@@ -523,15 +542,33 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
         cleaned = clean_thumbnail_headline(candidate, max_words=5)
         if not cleaned or cleaned in options:
             continue
-        # Keep category fallback in options for strategy; drop dump/meta bleed.
+        # Keep category fallback in options for strategy; drop dump/meta/filename bleed.
         if is_media_dump_filename(cleaned) or is_hydration_meta_headline(cleaned):
+            continue
+        if is_filename_like_thumbnail_text(
+            cleaned, filename=str(getattr(ctx, "filename", "") or "")
+        ):
             continue
         if is_generic_thumbnail_headline(cleaned):
             continue
         options.append(cleaned)
     out["headline_options"] = options[:3]
 
-    badge = clean_thumbnail_headline(out.get("badge_text"), max_words=2)[:14]
+    badge = clean_thumbnail_headline(
+        out.get("badge_text"),
+        max_words=2,
+        filename=str(getattr(ctx, "filename", "") or ""),
+    )[:14]
+    if (
+        not badge
+        or is_unusable_thumbnail_headline(
+            badge, filename=str(getattr(ctx, "filename", "") or "")
+        )
+        or is_filename_like_thumbnail_text(
+            badge, filename=str(getattr(ctx, "filename", "") or "")
+        )
+    ):
+        badge = ""
     try:
         from core.speed_consensus import publishable_peak_mph
 
@@ -1733,7 +1770,10 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             # Set PIKZELS_TEXT_BRIEF_ON_UPLOAD=1 to restore the extra creative call.
             if _upload_pikzels_text_brief_enabled():
                 text_brief = await generate_pikzels_text_brief(
-                    source_title=ctx.get_effective_title() or ctx.filename or "UploadM8 video",
+                    source_title=ctx.get_thumbnail_brief_vars(category=category).get(
+                        "effective_title"
+                    )
+                    or "Video",
                     niche=category,
                     context_summary=ctx.get_thumbnail_brief_vars(category=category).get(
                         "fusion_summary", ""

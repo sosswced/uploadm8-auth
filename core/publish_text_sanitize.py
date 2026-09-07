@@ -25,6 +25,7 @@ __all__ = [
     "collapse_repeated_words",
     "is_degenerate_publish_text",
     "sanitize_publish_text",
+    "strip_trailing_hashtag_run",
 ]
 
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
@@ -141,3 +142,15 @@ def sanitize_publish_text(text: Any) -> str:
     degenerate text prefer replacing with an evidence anchor at the caller.
     """
     return collapse_repeated_words(text, max_run=1)
+
+
+_TRAILING_HASHTAG_RUN = re.compile(r"(?:\s+#[^\s#]+)+\s*$")
+
+
+def strip_trailing_hashtag_run(text: Any) -> str:
+    """Remove a trailing run of #tags so they live in the hashtag array, not prose."""
+    raw = str(text or "").rstrip()
+    if not raw or "#" not in raw:
+        return raw
+    cleaned = _TRAILING_HASHTAG_RUN.sub("", raw).rstrip()
+    return cleaned

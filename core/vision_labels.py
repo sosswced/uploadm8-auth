@@ -302,6 +302,14 @@ COLOR_HASHTAG_SLUGS: frozenset[str] = frozenset(
     }
 )
 
+# Camera-roll stems slugified (img5135, dscn0001) — never discovery tags.
+_MEDIA_DUMP_HASHTAG_RE = re.compile(
+    r"^(?:img|dscn?|pict|vid|mov|mvi|pxl|dji|gopro|gh)\d{2,}$",
+    re.I,
+)
+# LLM/OCR mash of 3+ TitleCase given names (LuisMontosChuty) — not a search term.
+_INVENTED_PERSON_HASHTAG_RE = re.compile(r"^(?:[A-Z][a-z]{2,}){3,}$")
+
 # Filename / HUD OCR / taxonomy dumps that look specific but are useless discovery tags.
 _JUNK_HASHTAG_RE = re.compile(
     r"(?ix)"
@@ -747,6 +755,18 @@ def is_generic_vision_label(raw: Any, *, min_specific_len: int = 4) -> bool:
     return False
 
 
+def is_invented_person_hashtag(raw: Any) -> bool:
+    """True for mashed OCR person-name tags like LuisMontosChuty.
+
+    Real club/venue slugs are 1–2 tokens (FCBarcelona, CampNou). Three or more
+    TitleCase given-name humps are almost always an LLM stitching OCR lines.
+    """
+    text = str(raw or "").strip().lstrip("#")
+    if not text:
+        return False
+    return bool(_INVENTED_PERSON_HASHTAG_RE.match(text))
+
+
 def is_junk_hashtag_body(raw: Any) -> bool:
     """True for HUD OCR mashups, filename timestamps, or taxonomy filler tags.
 
@@ -758,8 +778,12 @@ def is_junk_hashtag_body(raw: Any) -> bool:
     text = str(raw or "").strip().lstrip("#")
     if not text:
         return True
+    if is_invented_person_hashtag(text):
+        return True
     slug = vision_label_slug(text)
     if not slug:
+        return True
+    if _MEDIA_DUMP_HASHTAG_RE.match(slug):
         return True
     # Overrun mashups are never useful discovery tags. Sanitize truncates TO
     # HASHTAG_BODY_MAX_LEN, so exact-length leftovers are the truncated clause.

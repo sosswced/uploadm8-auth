@@ -212,20 +212,79 @@ def is_empty_hydration_story_fallback(text: Any) -> bool:
     return False
 
 
-def is_unusable_thumbnail_headline(text: Any) -> bool:
-    """Generic, category-fallback, media-dump, or hydration-meta — never paint on canvas."""
+# Any string that is literally a media path / extension — never paint or prompt.
+_MEDIA_FILE_EXT_RE = re.compile(
+    r"(?i)\.(?:mov|mp4|m4v|avi|mkv|hevc|3gp|webm|mts|m2ts|wmv|jpg|jpeg|png|heic)$"
+)
+
+
+def is_filename_like_thumbnail_text(text: Any, *, filename: str = "") -> bool:
+    """True when text is (or equals) an upload/media filename — never for Pikzels.
+
+    Hard invariant: camera dump names, bare stems matching the upload file, and
+    any title that still carries a video/image extension must never become
+    ``effective_title``, headline, badge, or Pikzels ``source_title``.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if is_media_dump_filename(raw):
+        return True
+    # Explicit extension still present (holiday.mp4, clip.MOV).
+    if _MEDIA_FILE_EXT_RE.search(raw.replace(" ", "")):
+        return True
+    # Matches the upload filename stem (with or without extension).
+    fname = str(filename or "").strip()
+    if fname:
+        stem = media_filename_stem(fname)
+        title_stem = media_filename_stem(raw) or re.sub(
+            r"[^a-z0-9]+", "", raw.lower()
+        )
+        fname_key = re.sub(r"[^a-z0-9]+", "", stem.lower()) if stem else ""
+        if fname_key and title_stem and fname_key == title_stem:
+            return True
+        # Exact basename match ignoring case/spaces.
+        base = Path(fname.replace("\\", "/")).name
+        if re.sub(r"\s+", "", raw.lower()) == re.sub(r"\s+", "", base.lower()):
+            return True
+    return False
+
+
+def is_unusable_thumbnail_headline(text: Any, *, filename: str = "") -> bool:
+    """Generic, category-fallback, filename, or hydration-meta — never paint on canvas."""
     if is_generic_thumbnail_headline(text):
         return True
     if is_evidence_empty_fallback_headline(text):
         return True
-    if is_media_dump_filename(text):
+    if is_filename_like_thumbnail_text(text, filename=filename):
         return True
     if is_hydration_meta_headline(text):
         return True
     return False
 
 
-def clean_thumbnail_headline(text: Any, *, max_words: int = 5, max_chars: int = 34) -> str:
+def safe_thumbnail_prompt_title(
+    text: Any,
+    *,
+    filename: str = "",
+    fallback: str = "Video",
+) -> str:
+    """Title safe to put in a thumbnail brief / Pikzels prompt — never a filename."""
+    raw = re.sub(r"\s+", " ", str(text or "").strip())
+    if not raw or is_unusable_thumbnail_headline(raw, filename=filename):
+        return fallback
+    if is_filename_like_thumbnail_text(raw, filename=filename):
+        return fallback
+    return raw
+
+
+def clean_thumbnail_headline(
+    text: Any,
+    *,
+    max_words: int = 5,
+    max_chars: int = 34,
+    filename: str = "",
+) -> str:
     raw = str(text or "").strip()
     raw = re.sub(r"https?://\S+", "", raw)
     raw = re.sub(r"#[\w-]+", "", raw)
@@ -234,4 +293,10 @@ def clean_thumbnail_headline(text: Any, *, max_words: int = 5, max_chars: int = 
     words = [w.strip(" .,'&/+:-") for w in raw.split() if w.strip(" .,'&/+:-")]
     if not words:
         return ""
-    return " ".join(words[:max_words]).upper()[:max_chars].strip()
+    cleaned = " ".join(words[:max_words]).upper()[:max_chars].strip()
+    # Camera-roll stems / upload basenames must never become paintable cover text.
+    if is_unusable_thumbnail_headline(cleaned, filename=filename) or is_unusable_thumbnail_headline(
+        raw, filename=filename
+    ):
+        return ""
+    return cleaned

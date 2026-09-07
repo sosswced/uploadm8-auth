@@ -10,6 +10,7 @@ from core.publish_text_sanitize import (
     collapse_repeated_words,
     is_degenerate_publish_text,
     sanitize_publish_text,
+    strip_trailing_hashtag_run,
 )
 
 
@@ -60,6 +61,18 @@ def test_sanitize_publish_text_idempotent():
     once = sanitize_publish_text("the the the the the")
     assert once == "the"
     assert sanitize_publish_text(once) == "the"
+
+
+def test_strip_trailing_hashtag_run_keeps_prose():
+    raw = (
+        "Join the electric atmosphere as Luis Montos Chuty proudly stands "
+        "as Barça's representative. ⚽️ #LuisMontosChuty #Barça"
+    )
+    cleaned = strip_trailing_hashtag_run(raw)
+    assert "#LuisMontosChuty" not in cleaned
+    assert "#Barça" not in cleaned
+    assert "Barça's representative" in cleaned
+    assert strip_trailing_hashtag_run("No tags here") == "No tags here"
 
 
 # --------------------------------------------------------------------------

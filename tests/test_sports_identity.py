@@ -153,3 +153,75 @@ def test_sports_story_clause_mentions_kit_colors():
     assert "soccer" in clause.lower()
     assert "FC Barcelona" in clause
     assert "red" in clause and "blue" in clause
+
+
+def test_invented_person_and_filename_hashtags_are_junk():
+    from core.vision_labels import is_invented_person_hashtag, is_junk_hashtag_body
+
+    assert is_invented_person_hashtag("LuisMontosChuty")
+    assert is_junk_hashtag_body("LuisMontosChuty")
+    assert is_junk_hashtag_body("img5135")
+    assert is_junk_hashtag_body("IMG_5135")
+    assert not is_invented_person_hashtag("FCBarcelona")
+    assert not is_invented_person_hashtag("CampNou")
+    assert not is_invented_person_hashtag("Barca")
+
+
+def test_soccer_discovery_hashtags_fill_to_max_without_name_mash():
+    from core.upload_domain_plan import discovery_hashtags_for_upload
+    from services.hydration_enforcer import enforce_hydration
+    from stages.context import JobContext
+
+    ctx = JobContext(
+        job_id="j-soccer",
+        upload_id="u-soccer",
+        user_id="u-soccer",
+        filename="IMG_5135.MOV",
+        title="IMG_5135.MOV",
+        ai_title="Celebrating Barça's Representation",
+        ai_caption=(
+            "Join the electric atmosphere as Luis Montos Chuty proudly stands "
+            "as Barça's representative. ⚽️ #LuisMontosChuty #Barça"
+        ),
+        ai_hashtags=["LuisMontosChuty", "Barça"],
+        m8_platform_hashtags={"instagram": ["LuisMontosChuty", "Barça"]},
+        m8_platform_captions={
+            "instagram": (
+                "Join the electric atmosphere as Luis Montos Chuty proudly stands "
+                "as Barça's representative. ⚽️ #LuisMontosChuty #Barça"
+            )
+        },
+        user_settings={"maxHashtags": 15},
+        vision_context={
+            "label_names": ["Soccer", "Stadium", "Sports", "Jersey"],
+            "web_entities": ["FC Barcelona"],
+            "logo_names": ["FC Barcelona"],
+            "ocr_text": "FC BARCELONA HYDRATION POINT REPRESENTANTE CHUTY",
+            "dominant_colors": [
+                {"name": "red", "rgb": [190, 20, 40], "score": 0.22},
+                {"name": "blue", "rgb": [20, 40, 170], "score": 0.18},
+            ],
+        },
+    )
+    ctx.thumbnail_category = "sports"
+    discovered = discovery_hashtags_for_upload(ctx, limit=15)
+    low = {t.lower() for t in discovered}
+    assert len(discovered) >= 10
+    assert "soccer" in low
+    assert "football" in low
+    assert "fcbarcelona" in low or "barca" in low
+    assert "luismontoschuty" not in low
+    assert "img5135" not in low
+
+    enforce_hydration(ctx)
+    final = [
+        str(t).lower().lstrip("#")
+        for t in (ctx.m8_platform_hashtags.get("instagram") or ctx.ai_hashtags or [])
+    ]
+    assert len(final) == 15
+    assert "soccer" in final
+    assert "luismontoschuty" not in final
+    assert "img5135" not in final
+    caption = ctx.get_effective_caption("instagram")
+    assert "#LuisMontosChuty" not in caption
+    assert "5135" not in caption

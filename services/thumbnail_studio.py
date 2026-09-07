@@ -1843,7 +1843,16 @@ async def _pikzels_engine_text_brief(
     """Single v2 text call — shared creative direction for all variants (no extra wallet debit)."""
     if not resolve_public_api_key():
         return ""
-    title_line = (source_title or topic or "untitled").strip() or "untitled"
+    title_line = (source_title or topic or "Video").strip() or "Video"
+    try:
+        from core.thumbnail_text import safe_thumbnail_prompt_title
+
+        title_line = safe_thumbnail_prompt_title(title_line, fallback="Video")
+    except Exception:
+        if re.search(r"(?i)\b(?:img|vid|dsc)[_-]?\d+\b", title_line) or re.search(
+            r"(?i)\.(?:mov|mp4|m4v|avi|mkv)$", title_line
+        ):
+            title_line = "Video"
     topic_clean = (topic or "").strip()
     steer = ""
     if topic_clean and topic_clean.lower() != title_line.lower():
@@ -1851,7 +1860,8 @@ async def _pikzels_engine_text_brief(
     prompt = (
         f"YouTube thumbnail brief. Video title: {title_line}. "
         f"Niche: {niche or 'general'}.{steer} "
-        "Reply with exactly two short sentences: (1) emotional hook angle (2) visual layout emphasis."
+        "Reply with exactly two short sentences: (1) emotional hook angle (2) visual layout emphasis. "
+        "Never mention filenames, IMG_/VID_ codes, or file extensions."
     )[:1000]
     status, data = await pikzels_v2_post(
         V2_THUMBNAIL_TEXT,

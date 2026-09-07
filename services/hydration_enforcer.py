@@ -60,12 +60,14 @@ from core.helpers import (
 from core.publish_text_sanitize import (
     collapse_repeated_words,
     is_degenerate_publish_text,
+    strip_trailing_hashtag_run,
 )
 from core.vision_labels import (
     HASHTAG_BODY_MAX_LEN,
     evidence_pool_has_strong_hashtag_signals,
     filter_vision_labels_for_hashtags,
     is_generic_vision_label,
+    is_invented_person_hashtag,
     is_junk_hashtag_body,
     primary_road_display,
     road_hashtag_tokens,
@@ -942,6 +944,15 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             if isinstance(arts, dict):
                 pe = arts.get("place_evidence_v1")
         merge_place_evidence_into_pool(pool, pe if isinstance(pe, dict) else None)
+        if not getattr(pool, "sports_teams", None) and not getattr(pool, "place_stadiums", None):
+            try:
+                from services.place_evidence import extract_place_evidence
+
+                live = extract_place_evidence(ctx)
+                if isinstance(live, dict) and live:
+                    merge_place_evidence_into_pool(pool, live)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -2258,9 +2269,8 @@ def _hydrate_caption(caption: str, anchor: str, *, max_chars: int = 520) -> str:
     """
     cap = scrub_machine_publish_dump(caption or "")
     a = scrub_machine_publish_dump(anchor or "")
-    # Collapse immediate word/phrase stutter; drop the caption entirely when it
-    # is dominated by repetition so the evidence anchor takes over.
     if cap:
+        cap = strip_trailing_hashtag_run(cap)
         collapsed = collapse_repeated_words(cap)
         cap = "" if (is_degenerate_publish_text(collapsed) or not collapsed) else collapsed
     if not a:
@@ -2280,6 +2290,8 @@ def _merge_hashtag_lists(*lists: Iterable[str], cap: Optional[int] = None) -> Li
     seen: set = set()
     for lst in lists:
         for raw in lst or []:
+            if is_invented_person_hashtag(raw):
+                continue
             body = sanitize_hashtag_body(str(raw), max_len=_HASHTAG_MAX_LEN)
             if not body or body in seen or is_junk_hashtag_body(body):
                 continue
@@ -2869,19 +2881,32 @@ def enforce_hydration(
         _max_htags = 15
     _max_htags = max(1, min(30, _max_htags))
 
+    discovery_tags: List[str] = []
+    try:
+        from core.upload_domain_plan import discovery_hashtags_for_upload
+
+        discovery_tags = discovery_hashtags_for_upload(ctx, limit=_max_htags)
+    except Exception:
+        discovery_tags = []
+    report["discovery_hashtags"] = list(discovery_tags[:8])
+
+    def _fill_hashtags(existing: List[str]) -> List[str]:
+        seed_only, _seed_n, _total_n = _hashtags_are_seed_only(existing)
+        filler = evidence_tags or discovery_tags
+        purged = _purge_seed_tags_when_evidence(existing, filler)
+        merged = _merge_hashtag_lists(evidence_tags, discovery_tags, purged, cap=_max_htags)
+        if seed_only and filler and merged == existing:
+            merged = _merge_hashtag_lists(evidence_tags, discovery_tags, existing, cap=_max_htags)
+        return merged
+
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
             tags = list(raw_list) if isinstance(raw_list, list) else []
-            seed_only, _seed_n, _total_n = _hashtags_are_seed_only(tags)
-            purged = _purge_seed_tags_when_evidence(tags, evidence_tags)
-            cap = max(len(tags), len(evidence_tags), _max_htags)
-            merged = _merge_hashtag_lists(evidence_tags, purged, cap=cap)
+            merged = _fill_hashtags(tags)
             if merged != tags:
-                report["purged_seed_tags"] += len(tags) - len(purged)
-                report["added_evidence_tags"] += max(0, len(merged) - len(purged))
-                m8_hashtags[pl] = merged
-            elif seed_only and evidence_tags:
-                m8_hashtags[pl] = _merge_hashtag_lists(evidence_tags, tags, cap=cap)
+                report["purged_seed_tags"] += max(0, len(tags) - len(merged))
+                report["added_evidence_tags"] += max(0, len(merged) - len(tags))
+            m8_hashtags[pl] = merged
 
     # ── Legacy ai_caption / ai_title / ai_hashtags fallbacks ────────────
     ai_caption = getattr(ctx, "ai_caption", "") or ""
@@ -2896,23 +2921,28 @@ def enforce_hydration(
         ctx.ai_title = new
         report["rewrote_title"] = True
 
-    if evidence_tags:
+    if evidence_tags or discovery_tags:
         existing = list(getattr(ctx, "ai_hashtags", None) or [])
-        seed_only, _s, _t = _hashtags_are_seed_only(existing)
-        purged = _purge_seed_tags_when_evidence(existing, evidence_tags)
-        cap = max(len(existing), len(evidence_tags), _max_htags)
-        merged = _merge_hashtag_lists(evidence_tags, purged, cap=cap)
+        merged = _fill_hashtags(existing)
         if merged != existing:
-            report["purged_seed_tags"] += len(existing) - len(purged)
-            report["added_evidence_tags"] += max(0, len(merged) - len(purged))
-            ctx.ai_hashtags = merged
-        elif seed_only:
-            ctx.ai_hashtags = _merge_hashtag_lists(evidence_tags, existing, cap=cap)
+            report["purged_seed_tags"] += max(0, len(existing) - len(merged))
+            report["added_evidence_tags"] += max(0, len(merged) - len(existing))
+        ctx.ai_hashtags = merged
 
-    ctx.ai_hashtags = _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or []))
+    ctx.ai_hashtags = _merge_hashtag_lists(
+        _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or [])),
+        evidence_tags,
+        discovery_tags,
+        cap=_max_htags,
+    )
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
-            m8_hashtags[pl] = _scrub_leaked_junk_hashtags(list(raw_list or []))
+            m8_hashtags[pl] = _merge_hashtag_lists(
+                _scrub_leaked_junk_hashtags(list(raw_list or [])),
+                evidence_tags,
+                discovery_tags,
+                cap=_max_htags,
+            )
 
     # ── FactLedger: soft-weave missing classes + pad hashtags (LLM titles stay) ─
     try:
@@ -2923,13 +2953,22 @@ def enforce_hydration(
             report["fact_ledger"] = fl_report
             if fl_report.get("woven_classes"):
                 report["rewrote_caption"] = True
-            # Re-scrub after pad (ledger slugs are already sanitized).
-            ctx.ai_hashtags = _scrub_leaked_junk_hashtags(
-                list(getattr(ctx, "ai_hashtags", None) or [])
+            # Re-scrub after pad (ledger slugs are already sanitized), then
+            # refill discovery tags so soccer clips still hit maxHashtags.
+            ctx.ai_hashtags = _merge_hashtag_lists(
+                _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or [])),
+                evidence_tags,
+                discovery_tags,
+                cap=_max_htags,
             )
             if isinstance(m8_hashtags, dict):
                 for pl, raw_list in list(m8_hashtags.items()):
-                    m8_hashtags[pl] = _scrub_leaked_junk_hashtags(list(raw_list or []))
+                    m8_hashtags[pl] = _merge_hashtag_lists(
+                        _scrub_leaked_junk_hashtags(list(raw_list or [])),
+                        evidence_tags,
+                        discovery_tags,
+                        cap=_max_htags,
+                    )
     except Exception as fl_exc:
         report.setdefault("warnings", []).append(f"fact_ledger_error:{fl_exc}")
 

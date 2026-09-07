@@ -33,6 +33,8 @@ import httpx
 
 from core.thumbnail_text import (
     is_empty_hydration_story_fallback,
+    is_filename_like_thumbnail_text,
+    is_media_dump_filename,
     is_unusable_thumbnail_headline,
 )
 from services.pikzels_v2 import (
@@ -398,7 +400,16 @@ def _build_pikzels_v2_prompt(
     def _headline_is_concrete(h: str) -> bool:
         if not h or is_unusable_thumbnail_headline(h):
             return False
-        if any(ch.isdigit() for ch in h):
+        if is_filename_like_thumbnail_text(h):
+            return False
+        # Digits alone are not enough — IMG 5135 has digits but is forbidden.
+        if is_media_dump_filename(h):
+            return False
+        if any(ch.isdigit() for ch in h) and not is_filename_like_thumbnail_text(h):
+            # Only treat digits as concrete when the rest is not a dump stem.
+            body = re.sub(r"[^a-z0-9]+", "", h.lower())
+            if re.match(r"^(?:img|vid|dscn?|pxl|dji|mvi|mov)\d+$", body):
+                return False
             return True
         # at least one capitalised proper-noun-ish token of 4+ chars (not all-caps stop word)
         for tok in h.split():
@@ -755,10 +766,21 @@ async def generate_pikzels_text_brief(*, source_title: str, niche: str, context_
     """One ``/v2/thumbnail/text`` call; merged into the prompt if it succeeds."""
     if not resolve_public_api_key():
         return ""
+    try:
+        from core.thumbnail_text import safe_thumbnail_prompt_title
+
+        title = safe_thumbnail_prompt_title(source_title, fallback="Video")
+    except Exception:
+        title = str(source_title or "").strip() or "Video"
+        if re.search(r"(?i)\b(?:img|vid|dsc)[_-]?\d+\b", title) or re.search(
+            r"(?i)\.(?:mov|mp4|m4v|avi|mkv)$", title
+        ):
+            title = "Video"
     ctx = f" Context: {context_summary[:500]}." if str(context_summary or "").strip() else ""
     prompt = (
-        f"YouTube thumbnail brief. Title: {source_title or 'untitled'}. Niche: {niche or 'general'}. "
-        f"{ctx} Reply with two short sentences: (1) emotional hook angle, (2) visual layout emphasis."
+        f"YouTube thumbnail brief. Title: {title}. Niche: {niche or 'general'}. "
+        f"{ctx} Reply with two short sentences: (1) emotional hook angle, (2) visual layout emphasis. "
+        "Never mention filenames, IMG_/VID_ codes, or file extensions."
     )[:1000]
     status, data = await pikzels_v2_post(
         V2_THUMBNAIL_TEXT,

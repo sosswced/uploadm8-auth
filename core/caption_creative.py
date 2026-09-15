@@ -467,6 +467,32 @@ _EVIDENCE_LEAD_ROTATION: Tuple[str, ...] = (
 )
 
 
+def title_lead_facet(style_ui: str, tone_ui: str = "") -> str:
+    """Which evidence class should lead the title for this writing mix.
+
+    Writing mix changes diction; this changes *what* leads so Surprise mixes
+    produce distinct title spines under identical scene evidence.
+
+    Freestyle intentionally returns ``free/any-evidence`` — no forced geo lead —
+    so the free-hook contract is not overridden by a mandatory place token.
+    """
+    s = normalize_caption_style(style_ui)
+    t = normalize_caption_tone(tone_ui)
+    if s == "freestyle":
+        return "free/any-evidence"
+    if s == "factual":
+        return "place/geo"
+    if s == "listicle":
+        return "sign/OCR"
+    if s == "diary":
+        return "music/audio"
+    if s == "punchy" or t == "hype":
+        return "speed/telemetry"
+    if s == "story":
+        return "env/route"
+    return "object/visual"
+
+
 def total_combinations() -> int:
     return len(STYLE_DIRECTIVES) * len(TONE_DIRECTIVES) * len(VOICE_DIRECTIVES)
 
@@ -844,6 +870,10 @@ def _interaction_rules(style_key: str, tone_key: str, voice_key: str) -> List[st
             f"High heat ({intensity}/5) through a disciplined voice: the speaker stays composed — energy "
             "shows in verbs and pacing, never slang or caps beyond the voice's own rules."
         )
+    if intensity >= 4:
+        from core.prose_cliche_patterns import interaction_motorsport_ban_rule
+
+        rules.append(interaction_motorsport_ban_rule(intensity=intensity))
     if intensity <= 2 and voice_key == "hypebeast":
         rules.append(
             f"Hypebeast at low heat ({intensity}/5): keep the cadence and diction, drop the caps and emphatics."
@@ -905,14 +935,40 @@ def compose_creative_directive(
 
     interaction = "\n".join(f"- {r}" for r in _interaction_rules(s_key, t_key, v_key))
 
+    # Ownership: TITLE LEAD FACET owns the mix title spine for structured styles.
+    # FRESHNESS ROTATION must not contradict that for variant 1 — except freestyle,
+    # which has no forced lead class, so the seed owns variant-1 evidence class.
+    lead_facet = title_lead_facet(s_key, t_key)
+    if lead_facet == "free/any-evidence":
+        title_lead_line = (
+            "TITLE LEAD FACET (freestyle): no forced evidence class — invent shape; "
+            "still cite ≥1 real place/speed/music/driver/OCR token when present. "
+            "Keep under platform char caps; never mid-word truncate; do not invent evidence.\n"
+        )
+    else:
+        title_lead_line = (
+            f"TITLE LEAD FACET (owned by this mix): foreground a {lead_facet} token in the title "
+            "when that evidence exists — before other facts. Keep under platform char caps; "
+            "never mid-word truncate; do not invent evidence.\n"
+        )
+
     rotation_line = ""
     if variant_seed is not None:
         lead = _EVIDENCE_LEAD_ROTATION[int(variant_seed) % len(_EVIDENCE_LEAD_ROTATION)]
-        rotation_line = (
-            f"\nFRESHNESS ROTATION (seed {int(variant_seed)}): variant 1 foregrounds a {lead} token "
-            "(when that evidence exists), then continue the style's own rotation order. "
-            "This keeps repeat uploads with identical settings from opening the same way.\n"
-        )
+        if lead_facet == "free/any-evidence":
+            rotation_line = (
+                f"\nFRESHNESS ROTATION (seed {int(variant_seed)}): variant 1 foregrounds a {lead} token "
+                "(when that evidence exists), then continue the style's own rotation order. "
+                "Freestyle has no mix-owned lead — this seed owns the variant-1 evidence class "
+                "so repeat uploads with identical settings do not open the same way.\n"
+            )
+        else:
+            rotation_line = (
+                f"\nFRESHNESS ROTATION (seed {int(variant_seed)}): variant 1 follows TITLE LEAD FACET above. "
+                f"Variants 2–5 rotate evidence class starting from {lead} "
+                "(when that evidence exists), then continue the style's own rotation order. "
+                "This keeps repeat uploads fresh without overriding the mix-owned title spine.\n"
+            )
 
     return f"""━━ CREATIVE COMBINATION BRIEF — {combo} (combination {idx}/{total_combinations()}) ━━
 This is ONE composed contract, not three stacked essays. Each axis owns different levers; apply all
@@ -945,7 +1001,7 @@ INTERACTION CONTRACT (composed for THIS combination — non-negotiable):
 - Do NOT fall back to a neutral house voice. The selected voice's diction and point of view must be
   audible in every variant; the tone's temperature must be felt in every sentence.
 - Stay evidence-grounded: this brief is HOW it is said; the Scene Graph is WHAT is said.
-{rotation_line}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+{title_lead_line}{rotation_line}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
 
 
 def cell_micro_brief(style_ui: str, tone_ui: str, voice_ui: str) -> str:

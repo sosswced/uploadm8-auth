@@ -57,10 +57,28 @@ def test_build_prompt_carries_hero_facts_and_do_not_invent():
         },
         platform="youtube",
     )
-    assert "TOMATO HARVEST" in prompt
+    # Composition-first: non-MPH headlines are not painted.
+    assert 'Add only the short speed hook "TOMATO HARVEST"' not in prompt
+    assert "Do NOT add any on-image text" in prompt
     assert "ripe roma tomatoes" in prompt
     assert "never state a speed" in prompt
     assert "do not add people" in prompt.lower()
+
+
+def test_build_prompt_paints_earned_speed_only():
+    prompt = build_openai_edit_prompt(
+        {
+            "selected_headline": "78 MPH",
+            "_uploadm8_paint_policy": "hook_only",
+            "_uploadm8_hook_line": "78 MPH",
+            "hook_line": "78 MPH",
+            "_uploadm8_hook_class": "speed",
+        },
+        {"subject": "highway run", "hero_facts": [{"text": "78 MPH"}], "do_not_invent": []},
+        platform="youtube",
+    )
+    assert 'Add only the short speed hook "78 MPH"' in prompt
+    assert "Do NOT add any on-image text" not in prompt
 
 
 def test_call_cap_is_two():

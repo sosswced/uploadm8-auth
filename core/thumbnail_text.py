@@ -250,8 +250,26 @@ def is_filename_like_thumbnail_text(text: Any, *, filename: str = "") -> bool:
     return False
 
 
+def is_location_banner_headline(text: Any) -> bool:
+    """True for LOCATION-labeled or bare gazetteer plaster — never on-image typography.
+
+    Catches ``Location: Federal Way, Washington`` after clean → ``LOCATION FEDERAL WAY…``
+    and similar lower-third city/state banners. Place evidence still fuels creative briefs.
+    """
+    body = thumbnail_headline_body(text)
+    if not body:
+        return False
+    if body == "location" or body.startswith("location "):
+        return True
+    # Common labeled prefixes that survive cleaning into ALL-CAPS banners.
+    raw = str(text or "").strip()
+    if re.match(r"(?i)^\s*location\s*[:\-–—]", raw):
+        return True
+    return False
+
+
 def is_unusable_thumbnail_headline(text: Any, *, filename: str = "") -> bool:
-    """Generic, category-fallback, filename, or hydration-meta — never paint on canvas."""
+    """Generic, category-fallback, filename, hydration-meta, or LOCATION banner — never paint."""
     if is_generic_thumbnail_headline(text):
         return True
     if is_evidence_empty_fallback_headline(text):
@@ -259,6 +277,8 @@ def is_unusable_thumbnail_headline(text: Any, *, filename: str = "") -> bool:
     if is_filename_like_thumbnail_text(text, filename=filename):
         return True
     if is_hydration_meta_headline(text):
+        return True
+    if is_location_banner_headline(text):
         return True
     return False
 
@@ -286,11 +306,18 @@ def clean_thumbnail_headline(
     filename: str = "",
 ) -> str:
     raw = str(text or "").strip()
+    # Strip labeled Location: prefixes so they never become LOCATION … banners.
+    raw = re.sub(r"(?i)^\s*location\s*[:\-–—]\s*", "", raw)
     raw = re.sub(r"https?://\S+", "", raw)
     raw = re.sub(r"#[\w-]+", "", raw)
     raw = re.sub(r"[\r\n\t]+", " ", raw)
     raw = re.sub(r"[^A-Za-z0-9 .,'&/+:-]+", " ", raw)
     words = [w.strip(" .,'&/+:-") for w in raw.split() if w.strip(" .,'&/+:-")]
+    if not words:
+        return ""
+    # Drop a leftover leading LOCATION token after partial cleans.
+    if words and words[0].upper() == "LOCATION":
+        words = words[1:]
     if not words:
         return ""
     cleaned = " ".join(words[:max_words]).upper()[:max_chars].strip()

@@ -109,6 +109,23 @@ def test_variant_seed_rotates_lead_and_is_deterministic():
     assert again == seeded[3]
 
 
+def test_title_lead_and_freshness_do_not_fight_for_variant_1():
+    """Structured mixes: TITLE LEAD owns v1; seed rotates v2–5 only.
+    Freestyle: no mix lead — seed owns v1 evidence class.
+    """
+    story = compose_creative_directive("story", "calm", "default", variant_seed=2)
+    assert "TITLE LEAD FACET (owned by this mix)" in story
+    assert "variant 1 follows TITLE LEAD FACET above" in story
+    assert "Variants 2–5 rotate" in story
+    # Must not tell the model to foreground a competing seed class on variant 1.
+    assert "variant 1 foregrounds a" not in story
+
+    free = compose_creative_directive("freestyle", "hype", "teacher", variant_seed=2)
+    assert "TITLE LEAD FACET (freestyle)" in free
+    assert "variant 1 foregrounds a" in free
+    assert "variant 1 follows TITLE LEAD FACET above" not in free
+
+
 def test_combination_index_is_unique_and_bounded():
     seen = set()
     for s, t, v in product(CAPTION_STYLES, CAPTION_TONES, CAPTION_VOICES):
@@ -131,6 +148,18 @@ def test_interaction_contract_normalizes_unknown_inputs():
     assert "STORY structure" in text
     assert "AUTHENTIC intensity" in text
     assert "spoken as DEFAULT" in text
+
+
+def test_freestyle_hype_teacher_bans_stock_motorsport_openers():
+    """Combo that kept emitting 'Start your engines' under persona+voice mixes."""
+    text = interaction_contract("freestyle", "hype", "teacher")
+    assert "FREESTYLE structure" in text
+    assert "HYPE intensity" in text
+    assert "spoken as TEACHER" in text
+    assert "Start your engines" in text
+    brief = compose_creative_directive("freestyle", "hype", "teacher")
+    assert "Start your engines" in brief
+    assert "combination 329/" in brief or "FREESTYLE × HYPE × TEACHER" in brief
 
 
 def test_m8_directive_block_uses_composer_and_seed():

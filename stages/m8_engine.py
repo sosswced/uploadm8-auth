@@ -41,7 +41,12 @@ from core.caption_creative import (
     tone_directive as _m8_tone_directive,
     voice_directive as _m8_voice_directive,
 )
-from core.helpers import strip_stray_hashtag_json_blob
+from core.helpers import clip_at_word_boundary, strip_stray_hashtag_json_blob
+from core.prose_cliche_patterns import (
+    is_sole_motorsport_opener,
+    prompt_motorsport_ban_line,
+    ranking_cliche_patterns,
+)
 from core.publish_text_sanitize import is_degenerate_publish_text
 from core.vision_labels import (
     is_generic_vision_label,
@@ -274,44 +279,9 @@ def _sanitize_evidence_matrix(raw: Any, expected_max: int) -> Optional[Dict[str,
         return None
     return {"cells": clean, "format": "tiktok_micro", "version": M8_ENGINE_VERSION}
 
-# Generic / “AI slop” phrases to penalize in variants (light-touch; expand over time).
-# Expanded after seeing real-world model output like "Cruise under vast skies!
-# Endless horizons await." which contains zero scene-graph evidence.
-_GENERIC_PATTERNS = [
-    r"\bjoin me\b",
-    r"\blet's dive\b",
-    r"\bunlock(ed)?\b",
-    r"\byou won't believe\b",
-    r"\bsecret\b",
-    r"\bcontent creator\b",
-    r"\bas an ai\b",
-    r"\bembrace the chaos\b",
-    r"\bhidden gem\b",
-    r"\bexciting moments?\b",
-    r"\bunbelievable moments?\b",
-    r"\bwatch the road transform\b",
-    r"\bin this (?:raw )?authentic moment\b",
-    r"\bchannel(?:ing)? (?:my|your) emotions?\b",
-    r"\bvast skies\b",
-    r"\bendless horizons?\b",
-    r"\bopen road\b",
-    r"\b(?:adventure|journey) awaits?\b",
-    r"\bbreath(?:e|taking) (?:in )?(?:the )?freedom\b",
-    r"\bcruise (?:under|through|along)\b",
-    r"\bbuckle up\b",
-    r"\bridin'? dirty\b",
-    r"\bvibes? only\b",
-    r"\bgood vibes\b",
-    r"\bscenic (?:vibes?|drive|views?)\b",
-    r"\b(?:travel|highway|cloud) (?:vibes?|watching)\b",
-    r"\bnature(?:'s)? (?:beauty|symphony)\b",
-    r"\b(?:explore|discover) more\b",
-    r"\bhigh[- ]energy,?\s+first[- ]person\s+dashcam\b",
-    r"\bthe video is a\s+(?:high[- ]energy|tense|exciting)\b",
-    r"\bfrom inside a moving vehicle\b",
-    r"\bcapturing a tense and confrontational journey\b",
-    r"\bdashcam recording from inside\b",
-]
+# Generic / “AI slop” phrases to penalize in variants.
+# Source of truth: core.prose_cliche_patterns (shared with hydration + backtest).
+_GENERIC_PATTERNS = [p.pattern for p in ranking_cliche_patterns()]
 
 
 def _build_hydration_timeline_brief(scene_graph: Dict[str, Any]) -> str:
@@ -1124,11 +1094,13 @@ def _build_m8_prompt(
         }
         style_hint = style_defs.get(hashtag_style, style_defs["mixed"])
         hashtag_rule = (
-            f"Include exactly {hashtag_count} hashtags per variant as JSON array of words "
+            f"Include UP TO {hashtag_count} hashtags per variant as JSON array of words "
             f"WITHOUT '#'. Style: {hashtag_style} — {style_hint}. "
+            "Fewer is better than inventing — only tags evidenced by the scene graph "
+            "(music, place, road, vehicle, landmarks, durable logos, transcript entities). "
             "Each tag must be ONE short search term (1–2 words), never a clause or run-on sentence "
             "(not 'latenightdrivethroughlasvegas', not 'Driving through Las Vegas'). "
-            "City and state are SEPARATE tags. "
+            "City and state are SEPARATE tags. Never glue route+place (not 'sr20ironcounty'). "
             "Each tag must be a concrete niche/topic/search term (artist fragment, hobby, vehicle, place type). "
             "When scene_graph.geo.gazetteer_place, geo.protected_area_name, or geo.near_protected_land are set, "
             "include at least one discovery tag tied to that real place or protected-land context (no false claims). "
@@ -1533,6 +1505,7 @@ ANTI-GENERIC RULES:
 - Do not claim the creator wrote/performed an original song if transcript_role is third_party_lyrics or music is identified as a known track unless Scene Graph explicitly says otherwise.
 - Do not write in first person as the recording artist (no "I channel", "my vocals", "my track") when lyrics are third-party unless the visuals show a clear performance.
 - Prefer concrete nouns from geo/OCR/telemetry/brands/landmarks over abstract hype.
+- {prompt_motorsport_ban_line()}
 - Obey the HARD-BAN REGISTRY above for weak taxonomy / colors / vague categories (stated once — do not reintroduce those tokens).
 - When scene_graph.vision.recognition_summary or recognition_flat is present, cite specific entity proper nouns only.
 - Hashtags must read like real community search terms (see hashtag Style rule above).
@@ -1644,10 +1617,9 @@ def _trim_m8_prompt_preserving_creative(prompt: str, limit: int) -> str:
 def _penalize_generic(text: str) -> float:
     if not text:
         return 0.0
-    t = text.lower()
     pen = 0.0
-    for pat in _GENERIC_PATTERNS:
-        if re.search(pat, t, re.I):
+    for pat in ranking_cliche_patterns():
+        if pat.search(text):
             pen += 8.0
     return pen
 
@@ -1899,6 +1871,28 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
                 if name and not is_generic_vision_label(str(name), min_specific_len=3):
                     _push(str(name))
 
+    # 6c. Environment for prose (YAMNet + specific plants) — caption/title first.
+    # Cap 2 so geo/music still lead; never dump coarse outdoors/tree taxonomy.
+    ae = scene_graph.get("audio_environment") or {}
+    if isinstance(ae, dict):
+        top_sound = str(ae.get("top_sound_class") or "").strip()
+        if top_sound and not is_generic_vision_label(top_sound, min_specific_len=3):
+            _push(top_sound.replace("_", " "))
+        for ev in (ae.get("yamnet_events") or [])[:3]:
+            label = ""
+            if isinstance(ev, dict):
+                label = str(ev.get("label") or ev.get("class") or ev.get("name") or "")
+            else:
+                label = str(ev or "")
+            label = label.replace("_", " ").strip()
+            if label and not is_generic_vision_label(label, min_specific_len=3):
+                _push(label)
+                break
+    if isinstance(rec_flat, dict):
+        for name in (rec_flat.get("plants") or [])[:2]:
+            if name and not is_generic_vision_label(str(name), min_specific_len=3):
+                _push(str(name))
+
     # 7. OSD driver name (HUD)
     if osd.get("driver_name"):
         _push(str(osd.get("driver_name")))
@@ -2027,8 +2021,8 @@ def _hydrate_title_with_anchor(title: str, scene_graph: Dict[str, Any]) -> str:
     if not anchor:
         return title
     if title and not _missing_primary_hydration(title, scene_graph):
-        return title[:100]
-    return anchor[:100]
+        return clip_at_word_boundary(title, 100)
+    return clip_at_word_boundary(anchor, 100)
 
 
 def _attribution_penalty(caption: str, title: str, scene_graph: Dict[str, Any]) -> float:
@@ -2178,6 +2172,11 @@ def _quality_gate_penalty(
     except Exception:
         if re.match(r"(?i)^\s*anchored\s+in\b", (caption or "").strip()):
             penalty += 40.0
+    # Sole motorsport openers under persona prefs — hard reject (not just −8 generic).
+    if persona_required and (
+        is_sole_motorsport_opener(title) or is_sole_motorsport_opener(caption)
+    ):
+        penalty += 40.0
     if platform in ("youtube", "tiktok", "instagram", "facebook") and len((title or "").strip()) < 12:
         # All platforms now require titles; empty/short titles are weak.
         penalty += 6.0 if platform == "youtube" else 4.0
@@ -2762,7 +2761,10 @@ def merge_matrix_cells_into_ranked(
             cell_voice = str(cell.get("caption_voice") or voice_ui or "").lower()
             title = ""
             if pl_l in ("youtube", "instagram", "facebook"):
-                title = (_platform_title_from_caption(pl_l, cap) or "")[:100]
+                title = clip_at_word_boundary(
+                    _platform_title_from_caption(pl_l, cap) or "",
+                    100,
+                )
             variant = {
                 "variant_index": f"matrix_{i}",
                 "title": title or None,
@@ -2951,23 +2953,23 @@ def build_voice_fallback_selection(
     # Voice-shaped titles — never ship bare "N MPH through Place" when persona is set.
     title = ""
     if mph and place:
-        title = f"{mph} — {lead} through {place}"[:100]
+        title = clip_at_word_boundary(f"{mph} — {lead} through {place}", 100)
     elif mph and scene_prose:
-        title = f"{mph} — {scene_prose}"[:100]
+        title = clip_at_word_boundary(f"{mph} — {scene_prose}", 100)
     elif scene_prose and music_bit:
-        title = f"{lead}: {scene_prose} — with {music_bit}"[:100]
+        title = clip_at_word_boundary(f"{lead}: {scene_prose} — with {music_bit}", 100)
     elif scene_prose:
-        title = f"{lead}: {scene_prose}"[:100]
+        title = clip_at_word_boundary(f"{lead}: {scene_prose}", 100)
     elif place:
-        title = f"{lead} near {place}"[:100]
+        title = clip_at_word_boundary(f"{lead} near {place}", 100)
     elif mph:
-        title = f"{mph} — {lead}"[:100]
+        title = clip_at_word_boundary(f"{mph} — {lead}", 100)
     else:
-        title = (caption.split(".")[0] or lead)[:100]
+        title = clip_at_word_boundary(caption.split(".")[0] or lead, 100)
     # Prefer lifting the caption hook when it already carries voice + evidence.
     from_cap = _platform_title_from_caption("youtube", caption)
     if from_cap and len(from_cap) >= max(20, len(title) - 10):
-        title = from_cap[:100]
+        title = clip_at_word_boundary(from_cap, 100)
 
     plats = [str(p).lower() for p in (platforms or scene_graph.get("platforms") or ["tiktok"])]
     if not plats:
@@ -3058,12 +3060,37 @@ def _speed_peak_mph(scene_graph: Dict[str, Any]) -> Optional[float]:
 def _scene_prose_hook(scene_graph: Dict[str, Any]) -> str:
     """First publishable sentence from VU / fusion — feeds non-dashcam title voice."""
     vu = scene_graph.get("video_understanding") or {}
+    ae = scene_graph.get("audio_environment") or {}
+    env_bit = ""
+    if isinstance(ae, dict):
+        top = str(ae.get("top_sound_class") or "").replace("_", " ").strip()
+        if top and len(top) >= 3 and top.lower() not in ("music", "speech", "silence"):
+            env_bit = top
+    vision = scene_graph.get("vision") or {}
+    rec = vision.get("recognition_flat") if isinstance(vision, dict) else {}
+    plant_bit = ""
+    if isinstance(rec, dict):
+        for name in (rec.get("plants") or [])[:1]:
+            n = str(name or "").strip()
+            if n and len(n) >= 3:
+                plant_bit = n
+                break
+    geo = scene_graph.get("geo") or {}
+    route_bit = str(geo.get("road") or "").strip()
+
     candidates = [
         str(vu.get("title_suggestion") or "").strip(),
         str(vu.get("scene") or "").strip(),
         str(scene_graph.get("fusion_narrative") or "").strip(),
         str(scene_graph.get("hydration_story") or "").strip(),
     ]
+    # Prefer a short env/route lead when VU is empty so titles stay evidence-deep.
+    if env_bit and route_bit:
+        candidates.insert(0, f"{env_bit} along {route_bit}")
+    elif env_bit:
+        candidates.insert(0, f"{env_bit} in the scene")
+    elif plant_bit and route_bit:
+        candidates.insert(0, f"{plant_bit} near {route_bit}")
     for raw in candidates:
         if not raw or len(raw) < 12:
             continue
@@ -3320,14 +3347,10 @@ def _deterministic_evidence_title(
     if plat == "youtube":
         if len(core) < 20 and bucket and bucket not in core:
             core = f"{core} — {bucket} Run"
-        if len(core) > 90:
-            core = core[:87].rstrip(" ,-—·") + "..."
-        return core[:100]
+        return clip_at_word_boundary(core, 100)
     if plat in ("instagram", "facebook"):
-        if len(core) > 70:
-            core = core[:67].rstrip(" ,-—·") + "..."
-        return core[:70]
-    return core[:80]
+        return clip_at_word_boundary(core, 70)
+    return clip_at_word_boundary(core, 80)
 
 
 def _platform_title_from_caption(platform: str, caption: str) -> Optional[str]:
@@ -3352,25 +3375,13 @@ def _platform_title_from_caption(platform: str, caption: str) -> Optional[str]:
         if re.match(r"(?i)^\s*anchored\s+in\b", first):
             return None
     if p == "youtube":
-        if len(first) > 90:
-            first = first[:90].rstrip(" .,!?:;") + "..."
-        return first
+        return clip_at_word_boundary(first, 100)
     if p == "tiktok":
-        if len(first) > 80:
-            first = first[:80].rstrip(" .,!?:;")
-            if len(first) > 77:
-                first = first[:77].rstrip() + "..."
-        return first
+        return clip_at_word_boundary(first, 80)
     if p in ("instagram", "facebook"):
-        if len(first) > 70:
-            first = first[:70].rstrip(" .,!?:;")
-            if len(first) > 67:
-                first = first[:67].rstrip() + "..."
-        return first
+        return clip_at_word_boundary(first, 70)
     # Unknown platform — still return a clipped hook so titles are never null.
-    if len(first) > 80:
-        first = first[:80].rstrip(" .,!?:;")
-    return first
+    return clip_at_word_boundary(first, 80)
 
 
 def _ensure_platform_completeness(
@@ -3614,7 +3625,7 @@ def apply_selection_to_context(
         policy_hashtag_count = max(0, min(policy_hashtag_count, hashtag_count or policy_hashtag_count))
         t = w.get("title")
         if t is not None and str(t).strip():
-            ctx.m8_platform_titles[pl] = str(t).strip()[:120]
+            ctx.m8_platform_titles[pl] = clip_at_word_boundary(str(t).strip(), 120)
         c = w.get("caption")
         if c is not None and str(c).strip():
             ctx.m8_platform_captions[pl] = strip_stray_hashtag_json_blob(str(c).strip())[:2200]
@@ -3622,26 +3633,14 @@ def apply_selection_to_context(
         if generate_hashtags and raw_tags:
             ac = getattr(ctx, "audio_context", None) or {}
             extras = list(ac.get("suggested_keywords") or [])[:16]
-            # Retrieval-like constrained pool: category seeds + audio keywords + existing tags.
-            retrieval_pool = list(base_tags or []) + list(always_tags or []) + extras
-            retrieval_slugs = {
-                str(x).strip().lstrip("#").lower().replace(" ", "")
-                for x in retrieval_pool
+            picked_raw = [
+                str(x).strip()
+                for x in (raw_tags if isinstance(raw_tags, list) else [])
                 if str(x).strip()
-            }
-            picked_raw = [str(x).strip() for x in (raw_tags if isinstance(raw_tags, list) else []) if str(x).strip()]
-            constrained_raw: List[str] = []
-            unknown_added = 0
-            for tg in picked_raw:
-                slug = tg.lstrip("#").lower().replace(" ", "")
-                if slug in retrieval_slugs:
-                    constrained_raw.append(tg)
-                    continue
-                if unknown_added < 1:
-                    constrained_raw.append(tg)
-                    unknown_added += 1
+            ]
+            # Keep all non-meta model tags; junk/blocked gates run in _finalise.
             cleaned = strip_meta_hashtags(
-                constrained_raw,
+                picked_raw,
                 policy_hashtag_count or hashtag_count,
                 category=category,
                 extra_seeds=extras,
@@ -3671,7 +3670,7 @@ def apply_selection_to_context(
             ctx.m8_platform_captions[pl] = strip_stray_hashtag_json_blob(fallback_caption)[:2200]
         if fallback_title and pl not in ctx.m8_platform_titles:
             # Titles for ALL platforms (including TikTok) — never leave empty.
-            ctx.m8_platform_titles[pl] = fallback_title[:120]
+            ctx.m8_platform_titles[pl] = clip_at_word_boundary(fallback_title, 120)
         if fallback_tags and pl not in ctx.m8_platform_hashtags:
             ctx.m8_platform_hashtags[pl] = list(fallback_tags[: max(1, hashtag_count)])
 
@@ -3725,7 +3724,7 @@ def apply_selection_to_context(
                 if rebuilt and rebuilt.lower() != str(title_lo).lower():
                     ok_t, _ = _validate_title(rebuilt, scene_for_variance, platform=pl_lo)
                     if ok_t:
-                        ctx.m8_platform_titles[pl_lo] = rebuilt[:120]
+                        ctx.m8_platform_titles[pl_lo] = clip_at_word_boundary(rebuilt, 120)
                         used_clusters.append(next_cluster)
 
     # Legacy single fields — pick defaults for UI / non-platform consumers
@@ -4118,6 +4117,13 @@ async def run_m8_caption_engine(
             str(pl): (block.get("winner_source") or ((block.get("winner") or {}).get("winner_source")))
             for pl, block in ((ranked.get("platforms") or {}).items())
             if isinstance(block, dict)
+        },
+        # Resolved Style×Tone×Voice for this run (prefs / strategy), plus per-platform
+        # winner_source (main | matrix | voice_fallback) for matrix-vs-prefs debugging.
+        "resolved_creative_mix": {
+            "caption_style": str(caption_style or ""),
+            "caption_tone": str(caption_tone or ""),
+            "caption_voice": str(caption_voice or ""),
         },
         "grounding_pass2": bool((ranked.get("grounding_pass2") or {}).get("enabled")),
         "grounding_pass2_report": ranked.get("grounding_pass2") or {},

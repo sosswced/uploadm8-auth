@@ -116,13 +116,14 @@ def test_pikzels_prompt_no_text_for_dump_or_meta_headline():
         category="general",
         platform="instagram",
     )
-    assert "STRICT NO-TEXT MODE" in prompt
+    assert "CREATIVE COMPOSITION MODE" in prompt or "STRICT NO-TEXT" in prompt
     assert "HYDRATION STORY" not in prompt
     assert "IMG_5135" not in prompt
     assert "Story:" not in prompt
 
 
 def test_pikzels_prompt_keeps_real_headline_and_story():
+    """Non-speed headlines become creative composition fuel, not painted banners."""
     prompt = _build_pikzels_v2_prompt(
         {
             "selected_headline": "CAMP NOU TUNNEL",
@@ -131,9 +132,10 @@ def test_pikzels_prompt_keeps_real_headline_and_story():
         category="sports",
         platform="instagram",
     )
-    assert "CAMP NOU TUNNEL" in prompt
-    assert "STRICT NO-TEXT MODE" not in prompt
-    assert "Story:" in prompt
+    assert "CREATIVE COMPOSITION MODE" in prompt or "STRICT NO-TEXT" in prompt
+    assert 'reading "CAMP NOU TUNNEL"' not in prompt
+    assert "Story" in prompt
+    assert "Camp Nou" in prompt
     assert is_unusable_thumbnail_headline("IMG_5135.MOV")
 
 
@@ -245,6 +247,6 @@ def test_filename_never_eligible_for_thumbnail_or_pikzels():
         category="general",
         platform="instagram",
     )
-    assert "STRICT NO-TEXT MODE" in prompt
+    assert "CREATIVE COMPOSITION MODE" in prompt or "STRICT NO-TEXT" in prompt
     assert "IMG 5135" not in prompt
     assert "IMG_5135" not in prompt

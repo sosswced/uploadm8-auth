@@ -405,36 +405,50 @@ def _build_pikzels_v2_prompt(
         # Digits alone are not enough — IMG 5135 has digits but is forbidden.
         if is_media_dump_filename(h):
             return False
-        if any(ch.isdigit() for ch in h) and not is_filename_like_thumbnail_text(h):
-            # Only treat digits as concrete when the rest is not a dump stem.
-            body = re.sub(r"[^a-z0-9]+", "", h.lower())
-            if re.match(r"^(?:img|vid|dscn?|pxl|dji|mvi|mov)\d+$", body):
-                return False
-            return True
-        # at least one capitalised proper-noun-ish token of 4+ chars (not all-caps stop word)
-        for tok in h.split():
-            t = tok.strip(" ,.;:!?-_")
-            if len(t) >= 4 and t[:1].isupper() and not t.isupper():
-                return True
-            if len(t) >= 6:
-                return True
-        return False
+        paint_policy = str(brief.get("_uploadm8_paint_policy") or "").strip().lower()
+        if paint_policy in {"none", "no_text", "no-text"}:
+            return False
+        # Composition-first: only pack-gated speed (MPH) hooks may paint.
+        try:
+            from core.publish_pack import is_paintable_pack_headline
+            from core.thumbnail_text import is_location_banner_headline
 
-    if _headline_is_concrete(headline):
+            if is_location_banner_headline(h):
+                return False
+            pack_hint = {
+                "subject": str(brief.get("pack_subject") or brief.get("subject") or ""),
+                "hook_line": str(brief.get("hook_line") or ""),
+                "paint_policy": paint_policy or "none",
+                "hook_class": str(brief.get("_uploadm8_hook_class") or brief.get("hook_class") or ""),
+                "hashtag_seeds": brief.get("hashtag_seeds") or [],
+            }
+            if brief.get("_uploadm8_pack_subject"):
+                pack_hint["subject"] = str(brief.get("_uploadm8_pack_subject") or "")
+            if brief.get("_uploadm8_hook_line"):
+                pack_hint["hook_line"] = str(brief.get("_uploadm8_hook_line") or "")
+            if brief.get("_uploadm8_paint_policy"):
+                pack_hint["paint_policy"] = str(brief.get("_uploadm8_paint_policy") or "none")
+            return bool(is_paintable_pack_headline(h, pack_hint))
+        except Exception:
+            # Fail closed: never paint place/logo banners if pack gate unavailable.
+            return bool(re.search(r"\b\d{1,3}\s*mph\b", h, re.IGNORECASE))
+
+    painting = _headline_is_concrete(headline)
+    if painting:
         parts.append(
-            f'Render exactly one short headline reading "{headline[:30]}" in large bold '
-            "display typography in the lower third of the image. Render NO OTHER text, "
-            "letters, words, numbers, captions, banners, watermarks, signatures, "
-            "labels, or written content anywhere else on the image."
+            f'Render exactly one short speed hook reading "{headline[:30]}" in large bold '
+            "display typography in the lower third. NO OTHER text, banners, LOCATION labels, "
+            "or business names anywhere else on the image."
         )
     else:
+        # Keep this preamble compact — Pikzels caps prompts ~1000 chars; fidelity + hydration
+        # cues must survive fit_pikzels_prompt_to_budget.
         parts.append(
-            "STRICT NO-TEXT MODE: render absolutely NO text, letters, words, "
-            "numbers, captions, headlines, banners, watermarks, signatures, "
-            "labels, or any written content anywhere on the image. Do not add "
-            "phrases like \"UNBELIEVABLE MOMENTS\", \"EVENT MOMENTS\", \"MUST "
-            "WATCH\", \"WATCH THIS\", \"EPIC MOMENT\", or any similar clickbait "
-            "wording. Pure photographic composition only — no typography of any kind."
+            "CREATIVE COMPOSITION MODE: AI-heavy, fun, energetic, authentic thumbnail of THIS "
+            "frame — realistic and accurate; do not invent people/places/brands. Hydration cues "
+            "are mood/energy only. STRICT NO-TEXT: no letters, captions, LOCATION banners, "
+            "business OCR, filenames, or clickbait (UNBELIEVABLE MOMENTS, EVENT MOMENTS, "
+            "MUST WATCH, WATCH THIS, EPIC MOMENT)."
         )
 
     if dashcam_pov:
@@ -466,7 +480,14 @@ def _build_pikzels_v2_prompt(
             except (TypeError, ValueError):
                 pass
         if geo_parts:
-            prioritized.append("Geo: " + "; ".join(geo_parts)[:200])
+            if painting:
+                prioritized.append("Geo: " + "; ".join(geo_parts)[:200])
+            else:
+                # Scene vibe only — never invite LOCATION … typography.
+                prioritized.append(
+                    "Scene vibe (composition only, do NOT render as text): "
+                    + "; ".join(geo_parts)[:160]
+                )
 
         osd = ev.get("osd") if isinstance(ev.get("osd"), dict) else {}
         osd_parts: List[str] = []
@@ -476,19 +497,28 @@ def _build_pikzels_v2_prompt(
                 osd_parts.append(f"spd {float(msm):.0f}mph")
             except (TypeError, ValueError):
                 osd_parts.append(f"spd {msm}mph")
-        dn = str(osd.get("driver_name") or "").strip()
-        if dn:
-            osd_parts.append(f"drv {dn[:40]}")
-        fss = str(osd.get("first_seen") or "").strip()
-        if fss:
-            osd_parts.append(f"rec {fss[:32]}")
+        # Driver names invite short OCR-style stamps (e.g. TENENTE) — only when painting MPH.
+        if painting:
+            dn = str(osd.get("driver_name") or "").strip()
+            if dn:
+                osd_parts.append(f"drv {dn[:40]}")
+            fss = str(osd.get("first_seen") or "").strip()
+            if fss:
+                osd_parts.append(f"rec {fss[:32]}")
         if osd_parts:
             prioritized.append("OSD: " + "; ".join(osd_parts)[:160])
 
         mus = ev.get("music") if isinstance(ev.get("music"), dict) else {}
         ma, mt = str(mus.get("artist") or "").strip(), str(mus.get("title") or "").strip()
         if ma or mt:
-            prioritized.append("Music: " + " — ".join(p for p in (ma, mt) if p)[:140])
+            music_line = " — ".join(p for p in (ma, mt) if p)[:140]
+            if painting:
+                prioritized.append("Music: " + music_line)
+            else:
+                prioritized.append(
+                    "Audio energy (composition only, do NOT render song/artist as text): "
+                    + music_line
+                )
 
         # Skip raw speech/lyrics in image prompts — often trip Pikzels content 400s
         # and do not help dashcam composition (music artist/title above is enough).
@@ -499,8 +529,10 @@ def _build_pikzels_v2_prompt(
             prioritized.append(
                 "Vis: " + ", ".join(str(x) for x in vlabels[:8])[:160]
             )
+        # OCR/logo lines invite business plaster (MSC, Jordan Kuwait Bank) — never in
+        # composition-first prompts; only when we are already painting a speed hook.
         voc = str(vis.get("ocr") or "").strip()[:100]
-        if voc:
+        if voc and painting:
             prioritized.append(f"OCR: {voc}")
 
         tri = ev.get("trill") if isinstance(ev.get("trill"), dict) else {}
@@ -520,11 +552,23 @@ def _build_pikzels_v2_prompt(
 
         cfs = str(hp.get("fusion_summary") or "").strip()
         if cfs:
-            prioritized.append("Fusion: " + cfs[:280])
+            if painting:
+                prioritized.append("Fusion: " + cfs[:280])
+            else:
+                prioritized.append(
+                    "Fusion vibe (composition only, do NOT render brands/names as text): "
+                    + cfs[:200]
+                )
 
         hstory = str(hp.get("hydration_story") or "").strip()
         if hstory and not is_empty_hydration_story_fallback(hstory):
-            prioritized.append("Story: " + hstory[:220])
+            if painting:
+                prioritized.append("Story: " + hstory[:220])
+            else:
+                prioritized.append(
+                    "Story vibe (composition only, do NOT render as text): "
+                    + hstory[:180]
+                )
 
         anch = str(hp.get("anchor_phrase") or "").strip()
         if anch:
@@ -537,17 +581,29 @@ def _build_pikzels_v2_prompt(
             )
 
     fusion = str(brief.get("fusion_summary") or "").strip()
-    if fusion and not any(p.startswith("Fusion:") for p in prioritized):
-        prioritized.append(f"Fusion: {fusion[:280]}")
+    if fusion and not any(p.startswith("Fusion") for p in prioritized):
+        if painting:
+            prioritized.append(f"Fusion: {fusion[:280]}")
+        else:
+            prioritized.append(
+                "Fusion vibe (composition only, do NOT render brands/names as text): "
+                + fusion[:200]
+            )
 
     hydration_story_slice = str(brief.get("hydration_story") or "").strip()
     if (
         hydration_story_slice
         and not is_empty_hydration_story_fallback(hydration_story_slice)
         and len(fusion) < 120
-        and not any(p.startswith("Story:") for p in prioritized)
+        and not any(p.startswith("Story") for p in prioritized)
     ):
-        prioritized.append(f"Story: {hydration_story_slice[:220]}")
+        if painting:
+            prioritized.append(f"Story: {hydration_story_slice[:220]}")
+        else:
+            prioritized.append(
+                "Story vibe (composition only, do NOT render as text): "
+                + hydration_story_slice[:180]
+            )
 
     text_brief = str(brief.get("pikzels_text_brief") or brief.get("engine_text_brief") or "").strip()
     if text_brief:
@@ -576,8 +632,16 @@ def _build_pikzels_v2_prompt(
         prioritized.append(notes)
 
     geo_context = str(brief.get("geo_context") or "").strip()
-    if geo_context and not any(p.startswith("Geo:") for p in prioritized):
-        prioritized.append(f"Geo: {geo_context[:200]}")
+    if geo_context and not any(
+        p.startswith("Geo:") or p.startswith("Scene vibe") for p in prioritized
+    ):
+        if painting:
+            prioritized.append(f"Geo: {geo_context[:200]}")
+        else:
+            prioritized.append(
+                "Scene vibe (composition only, do NOT render as text): "
+                + geo_context[:160]
+            )
 
     osd_context = str(brief.get("osd_context") or "").strip()
     if osd_context and not any(p.startswith("OSD:") for p in prioritized):
@@ -588,8 +652,16 @@ def _build_pikzels_v2_prompt(
         prioritized.append(f"Trill: {trill_context[:120]}")
 
     music_context = str(brief.get("music_context") or "").strip()
-    if music_context and not any(p.startswith("Music:") for p in prioritized):
-        prioritized.append(f"Music: {music_context[:140]}")
+    if music_context and not any(
+        p.startswith("Music:") or p.startswith("Audio energy") for p in prioritized
+    ):
+        if painting:
+            prioritized.append(f"Music: {music_context[:140]}")
+        else:
+            prioritized.append(
+                "Audio energy (composition only, do NOT render song/artist as text): "
+                + music_context[:140]
+            )
 
     # speech_context intentionally omitted from image prompts (content-filter / lyric noise).
 
@@ -598,7 +670,8 @@ def _build_pikzels_v2_prompt(
         prioritized.append(f"Tags: {signal_hashtags[:120]}")
 
     styling: List[str] = []
-    if not dashcam_pov:
+    # Badge/direction props invite extra on-image words — only when painting MPH.
+    if not dashcam_pov and painting:
         badge_text = str(brief.get("badge_text") or "").strip()
         badge_style = str(brief.get("badge_style") or "").strip().lower()
         if badge_text:
@@ -647,7 +720,7 @@ def _build_pikzels_v2_prompt(
         tail.append("Natural cinematic grade on existing scene only; no new subjects")
     else:
         tail.append("Ground on supplied frame; match visible content")
-        tail.append("YT thumb style: hi contrast, sharp subj, dramatic light")
+        tail.append("YT thumb style: hi contrast, sharp subj, dramatic light — composition not caption banners")
 
     ordered = parts + prioritized + styling + tail
     prompt = ". ".join(p for p in ordered if p)
@@ -663,7 +736,8 @@ def _build_pikzels_v2_prompt(
                     "platform": (platform or "").strip().lower(),
                     "category": (category or "").strip().lower(),
                     "headline_preview": str(headline or "")[:80],
-                    "headline_concrete": bool(_headline_is_concrete(headline)),
+                    "headline_concrete": bool(painting),
+                    "prompt_mode": "speed_paint" if painting else "creative_composition",
                     "fusion_chars": len(fusion),
                     "hydration_story_chars": len(hydration_story_slice),
                     "prompt_len": len(prompt),
@@ -673,7 +747,10 @@ def _build_pikzels_v2_prompt(
             )
         except Exception:
             pass
-    return prompt or "MrBeast-style high-contrast YouTube thumbnail with bold text and dramatic subject"
+    return (
+        prompt
+        or "High-contrast cinematic thumbnail grounded on the supplied frame; no on-image text"
+    )
 
 
 # ── Response decoding ───────────────────────────────────────────────────────
@@ -1082,10 +1159,9 @@ async def render_thumbnail_with_studio_renderer(
 
     # Public OpenAPI for /v2/thumbnail/image does not include persona_strength and sets
     # additionalProperties: false — sending it caused 4xx rejects whenever persona mode was on.
+    style_hint = ""
     if isinstance(options, dict) and options:
         style_hint = str(options.get("style_hint") or "").strip()
-        if style_hint:
-            payload["prompt"] = f"{payload['prompt']}. Visual style: {style_hint[:180]}".strip()[:_PIKZELS_IMAGE_PROMPT_MAX]
 
     if persona_uuid_set and isinstance(options, dict) and options:
         ps = options.get("persona_strength")
@@ -1113,6 +1189,15 @@ async def render_thumbnail_with_studio_renderer(
         payload["prompt"] = clamp_pikzels_image_prompt(
             _PERSONA_STYLE_TEXT_GUARD + str(payload.get("prompt") or "")
         )
+
+    # Append visual style last and reserve budget so truncation does not drop it.
+    if style_hint:
+        suffix = f". Visual style: {style_hint[:180]}"
+        base = str(payload.get("prompt") or "")
+        room = max(200, _PIKZELS_IMAGE_PROMPT_MAX - len(suffix))
+        if len(base) > room:
+            base = base[:room].rsplit(" ", 1)[0].rstrip(" .;,")
+        payload["prompt"] = f"{base}{suffix}".strip()[:_PIKZELS_IMAGE_PROMPT_MAX]
 
     pre_post_len = len(str(payload.get("prompt") or ""))
     payload["prompt"] = clamp_pikzels_image_prompt(str(payload.get("prompt") or ""))

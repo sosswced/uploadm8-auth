@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -81,22 +82,51 @@ def build_openai_edit_prompt(
         "Transform this real video frame into a scroll-stopping social media cover.",
         "Keep the ACTUAL scene and composition — enhance color grading, contrast,",
         "lighting drama, and clarity like a professional thumbnail designer.",
+        "AI-heavy styling that stays realistic and accurate to the footage.",
     ]
     if subject:
         lines.append(f"The footage shows: {subject}.")
     if facts:
         lines.append("Emphasize what is genuinely there: " + "; ".join(facts) + ".")
-    if headline:
+
+    # Composition-first: only earned MPH may become on-image typography.
+    paint_headline = ""
+    paint_policy = str(brief.get("_uploadm8_paint_policy") or "").strip().lower()
+    try:
+        from core.publish_pack import is_paintable_pack_headline
+        from core.thumbnail_text import is_unusable_thumbnail_headline
+
+        if headline and not is_unusable_thumbnail_headline(headline):
+            pack_hint = {
+                "subject": str(brief.get("_uploadm8_pack_subject") or brief.get("subject") or subject),
+                "hook_line": str(brief.get("_uploadm8_hook_line") or brief.get("hook_line") or ""),
+                "paint_policy": paint_policy or "none",
+                "hook_class": str(brief.get("_uploadm8_hook_class") or "speed"),
+                "hashtag_seeds": brief.get("hashtag_seeds") or [],
+            }
+            if is_paintable_pack_headline(headline, pack_hint):
+                paint_headline = headline
+    except Exception:
+        if re.search(r"\b\d{1,3}\s*mph\b", headline or "", re.IGNORECASE) and paint_policy == "hook_only":
+            paint_headline = headline
+
+    if paint_headline:
         lines.append(
-            f'Add the headline text "{headline}" in bold, high-contrast sans-serif '
-            "lettering with a subtle dark outline, positioned so it never covers "
-            "the main subject."
+            f'Add only the short speed hook "{paint_headline}" in bold, high-contrast '
+            "sans-serif lettering with a subtle dark outline, positioned so it never "
+            "covers the main subject. No other text."
+        )
+    else:
+        lines.append(
+            "Do NOT add any on-image text, captions, LOCATION banners, business names, "
+            "filenames, or clickbait labels — pure photographic composition."
         )
     if color_mood:
         lines.append(f"Color mood: {color_mood.replace('_', ' ')}.")
     dni = [str(d) for d in (ident.get("do_not_invent") or [])[:4]]
-    dni.append("do not add people, faces, watermarks, logos, or extra text beyond the headline")
+    dni.append("do not add people, faces, watermarks, logos, or extra text beyond an earned speed hook")
     dni.append("do not invent objects or scenery that are not in the frame")
+    dni.append("do not paint city names, LOCATION labels, or business OCR")
     lines.append("STRICT RULES: " + "; ".join(dni) + ".")
     return " ".join(lines)
 

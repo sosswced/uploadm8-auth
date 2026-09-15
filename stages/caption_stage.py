@@ -45,6 +45,7 @@ from typing import List, Optional, Dict, Any
 
 from core.helpers import (
     coerce_hashtag_list,
+    clip_at_word_boundary,
     normalize_hashtag_bodies,
     sanitize_hashtag_body,
     strip_stray_hashtag_json_blob,
@@ -510,6 +511,40 @@ def _build_category_context_block(category: str, location: Optional[str] = None)
     )
 
 
+def _build_publish_pack_context_block(ctx: JobContext) -> str:
+    """Inject publish_pack_v1 so caption/hashtags share the same subject/hook as the cover."""
+    try:
+        from core.publish_pack import get_publish_pack
+
+        pack = get_publish_pack(ctx)
+    except Exception:
+        pack = {}
+    if not isinstance(pack, dict) or not (pack.get("subject") or pack.get("hook_line")):
+        return ""
+    lines = ["━━ PUBLISH PACK (canonical story — title/caption/hashtags MUST align) ━━"]
+    if pack.get("subject"):
+        lines.append(f"  SUBJECT: {str(pack.get('subject'))[:140]}")
+    if pack.get("hook_line"):
+        lines.append(f"  HOOK LINE: {str(pack.get('hook_line'))[:80]}")
+    if pack.get("caption_spine"):
+        lines.append(f"  CAPTION SPINE: {str(pack.get('caption_spine'))[:200]}")
+    seeds = pack.get("hashtag_seeds") or []
+    if seeds:
+        lines.append(f"  HASHTAG SEEDS: {', '.join(str(s) for s in seeds[:12])}")
+    lines.append(
+        "  ROLES: TITLE = rarest concrete hook (place+music OR place+route), max 100 chars; "
+        "CAPTION = grounded prose from SUBJECT + CAPTION SPINE + env (no hashtag dump); "
+        "HASHTAGS = only seeds above plus geo/music/route entities — never Vision taxonomy "
+        "(sedan/familycar/chill/outdoors/tree)."
+    )
+    lines.append(
+        "  Do NOT invent brand/logo names that are not in SUBJECT or SEEDS "
+        "(ignore roadside false logos). Lead with SUBJECT + HOOK."
+    )
+    lines.append("━━ END PUBLISH PACK ━━")
+    return "\n".join(lines)
+
+
 # ============================================================
 # Frame Collection
 # ============================================================
@@ -766,9 +801,10 @@ def _build_narrative_prompt(
         }.get(hashtag_style, "mix viral and niche tags")
         tasks.append(
             f"{ti}. hashtags_by_platform: JSON object mapping each target platform to an array of "
-            f"up to {hashtag_count} SHORT search terms WITHOUT the # symbol ({style_hint}). "
+            f"UP TO {hashtag_count} SHORT search terms WITHOUT the # symbol ({style_hint}). "
+            f"Fewer is better than inventing — only tags evidenced by the frames/transcript/geo/music. "
             f"Each array item is 1–2 words (dashcam, lasvegas, makeuptutorial) — NEVER a sentence "
-            f"or prepositional phrase. City and state are separate tags. "
+            f"or prepositional phrase. City and state are separate tags. Never glue route+place. "
             f"NEVER return single letters or word fragments.\n"
             f"   Target platforms: {sel_label}\n"
             '   Also set top-level "hashtags" to the same array as hashtags_by_platform["tiktok"] '
@@ -885,8 +921,11 @@ def _build_narrative_prompt(
             + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-    # ── Category context block ────────────────────────────────────────────────
+    # ── Category + publish pack context ───────────────────────────────────────
     category_block = _build_category_context_block(category, ctx.location_name)
+    pack_block = _build_publish_pack_context_block(ctx)
+    if pack_block:
+        category_block = f"{pack_block}\n\n{category_block}"
 
     raw_tx = getattr(ctx, "ai_transcript", None)
     transcript_block = ""
@@ -1126,10 +1165,12 @@ Rules:
 - Hook in the first 3 words for short-form platforms
 - Do not use emojis, emoticons, or decorative Unicode symbols in the title or caption
 - HASHTAGS: each array item is ONE short search term (1–2 words, no spaces), e.g. "dashcam", "lasvegas", "makeuptutorial".
+  Prefer evidence entities only: geo, named roads, OCR routes (181south), music artist/short title, rare env (snowfall).
   NEVER write a clause, sentence, or prepositional phrase as a hashtag
   (not "latenightdrivethroughlasvegas", not "Driving through Las Vegas").
   City and state are SEPARATE tags. Put each term in its own array slot.
   NEVER return single characters or word fragments
+  NEVER mint vehicle-body or mood taxonomy tags (sedan, familycar, chill, outdoors, tree, plant)
 - NEVER put hashtags, JSON arrays, escaped quotes, or "#word" tokens inside "caption" —
   all tags go ONLY in the "hashtags" array as plain words (no # prefix)
 - AUDIO + SPEECH: When SPOKEN CONTENT or AUDIO blocks above exist, the caption MUST reflect
@@ -1137,7 +1178,8 @@ Rules:
   When MUSIC RECOGNITION lists artist/title/genre, weave 1–2 factual references into the caption and
   include 1–3 niche hashtag tokens derived from that metadata (no false ownership if rights note appears).
   When ENVIRONMENTAL AUDIO / AUDIO EVENTS exist, add concrete ambient cues (crowd, engine, rain, studio, etc.)
-  in prose and hashtags where they improve specificity — never generic filler unrelated to those signals.
+  in caption/title prose only — do not mint coarse environment hashtags (#outdoors, #tree, #plant).
+  Rare specific env tags (e.g. snowfall) are handled by the evidence enforcer, not invented here.
 - Be SPECIFIC to what is actually visible — generic content gets buried
 - If Trill data provided: caption MUST reference at least one real data point
 
@@ -1239,7 +1281,7 @@ async def _call_openai(
                 return result
 
             if parsed.get("title"):
-                result["title"] = str(parsed["title"])[:100]
+                result["title"] = clip_at_word_boundary(str(parsed["title"]).strip(), 100)
             if parsed.get("caption"):
                 result["caption"] = str(parsed["caption"])[:500]
 
@@ -1250,7 +1292,7 @@ async def _call_openai(
                 for k, v in tbp.items():
                     kk = str(k).strip().lower()
                     if kk in _plat_ok and v is not None and str(v).strip():
-                        result["titles_by_platform"][kk] = str(v).strip()[:120]
+                        result["titles_by_platform"][kk] = clip_at_word_boundary(str(v).strip(), 100)
 
             cbp = parsed.get("captions_by_platform")
             if isinstance(cbp, dict):
@@ -1568,16 +1610,22 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         hashtag_style = "mixed"
 
     # "Number of AI Hashtags" — prefer ai_hashtag_count; fall back to max_hashtags for legacy rows.
+    # Request = min(ai count, max total). Publish/pad ceiling remains maxHashtags.
     try:
-        raw_n = us.get("aiHashtagCount")
-        if raw_n is None:
-            raw_n = us.get("ai_hashtag_count")
-        if raw_n is None or (isinstance(raw_n, str) and not str(raw_n).strip()):
-            raw_n = us.get("maxHashtags") or us.get("max_hashtags")
-        pref_max = int(raw_n or 5)
-    except (TypeError, ValueError):
-        pref_max = 5
-    pref_max = max(1, min(pref_max, 50))
+        from core.hashtag_prefs import resolve_ai_hashtag_request
+
+        pref_max = resolve_ai_hashtag_request(us)
+    except Exception:
+        try:
+            raw_n = us.get("aiHashtagCount")
+            if raw_n is None:
+                raw_n = us.get("ai_hashtag_count")
+            if raw_n is None or (isinstance(raw_n, str) and not str(raw_n).strip()):
+                raw_n = us.get("maxHashtags") or us.get("max_hashtags")
+            pref_max = int(raw_n or 15)
+        except (TypeError, ValueError):
+            pref_max = 15
+        pref_max = max(1, min(pref_max, 50))
     hashtag_count = pref_max if generate_hashtags else 0
 
     model = resolve_openai_caption_model(us)
@@ -1895,11 +1943,26 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 )
 
             if result.get("title") and generate_title:
-                ctx.ai_title = str(result["title"]).strip()[:120]
+                ctx.ai_title = clip_at_word_boundary(str(result["title"]).strip(), 100)
             elif generate_title and titles_bp.get("youtube"):
-                ctx.ai_title = str(titles_bp["youtube"]).strip()[:120]
+                ctx.ai_title = clip_at_word_boundary(str(titles_bp["youtube"]).strip(), 100)
             elif generate_title and titles_bp:
-                ctx.ai_title = str(next(iter(titles_bp.values()))).strip()[:120]
+                ctx.ai_title = clip_at_word_boundary(str(next(iter(titles_bp.values()))).strip(), 100)
+
+            # Soft prefer pack hook/subject when LLM title is generic / off-spine.
+            if generate_title and ctx.ai_title:
+                try:
+                    from core.publish_pack import (
+                        get_publish_pack,
+                        prefer_pack_title_if_generic,
+                    )
+
+                    pack = get_publish_pack(ctx)
+                    preferred = prefer_pack_title_if_generic(ctx.ai_title, pack)
+                    if preferred:
+                        ctx.ai_title = clip_at_word_boundary(preferred, 100)
+                except Exception:
+                    pass
 
             if result.get("caption") and generate_caption:
                 ctx.ai_caption = strip_stray_hashtag_json_blob(str(result["caption"]).strip())[:500]

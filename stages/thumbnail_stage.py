@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,6 +47,7 @@ from core.thumbnail_text import (
     is_filename_like_thumbnail_text,
     is_generic_thumbnail_headline,
     is_hydration_meta_headline,
+    is_location_banner_headline,
     is_media_dump_filename,
     is_unusable_thumbnail_headline,
 )
@@ -379,6 +381,13 @@ def _hero_fact_headlines(ctx: JobContext, category: str) -> List[str]:
         list(identity.get("hero_facts") or []),
         domain_tag=domain_tag or cat,
     )
+    # P4: optional soft class boost from pack meta (AV_READ_SOFT_BIAS default off).
+    try:
+        from services.av_read_soft_bias import apply_soft_hero_rank
+
+        ranked_facts = apply_soft_hero_rank(ranked_facts, ctx)
+    except Exception:
+        pass
 
     out: List[str] = []
     for fact in ranked_facts:
@@ -397,16 +406,28 @@ def _hero_fact_headlines(ctx: JobContext, category: str) -> List[str]:
 
 
 def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
-    """Truthful headline from ranked hero facts, never generic hype.
+    """Truthful headline from publish pack / ranked hero facts, never generic hype.
 
-    Identity hero facts lead; legacy evidence probes (vision, OCR, music,
-    title) back them up; CATEGORY_HEADLINE_FALLBACKS is the demoted last
-    resort for uploads with no usable evidence at all.
+    Prefer ``publish_pack_v1.hook_line`` when present. Logos / OCR / web marks
+    only win when they agree with identity subject — never alone on dashcam POV
+    (Jordan Kuwait Bank class bleed).
 
-    Camera-roll dump names (IMG_5135.MOV) and internal hydration meta labels
-    ("HYDRATION STORY …") are never eligible — those bled onto published
-    Instagram/YouTube covers when analysis was weak.
+    Camera-roll dump names and hydration meta labels are never eligible.
     """
+    from core.publish_pack import (
+        get_publish_pack,
+        headline_agrees_with_pack,
+        is_paintable_pack_headline,
+    )
+
+    pack = get_publish_pack(ctx)
+    if pack.get("hook_line"):
+        hook = clean_thumbnail_headline(pack.get("hook_line"), max_words=5)
+        if hook and not is_unusable_thumbnail_headline(hook):
+            return hook
+    if str(pack.get("paint_policy") or "").lower() in {"none", "no_text", "no-text"}:
+        return CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
+
     driving_ev = False
     try:
         from core.driving_evidence import has_driving_evidence
@@ -414,13 +435,31 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
         driving_ev = bool(has_driving_evidence(ctx))
     except Exception:
         driving_ev = False
-    if not driving_ev:
+    dashcam_pov = _dashcam_pov_content(ctx, category) or (
+        driving_ev and (category or "").strip().lower() in {"automotive", "dashcam", "general", ""}
+    )
+
+    def _accept(cleaned: str, *, fact_class: str = "") -> bool:
+        if not cleaned or is_unusable_thumbnail_headline(cleaned):
+            return False
+        if pack:
+            return is_paintable_pack_headline(cleaned, pack, fact_class=fact_class)
+        if fact_class in {"logo", "on_screen_text"}:
+            return False
+        if dashcam_pov and fact_class in {"logo", "on_screen_text", "web"}:
+            return False
+        return True
+
+    # Visual marks: never first on driving/dashcam; otherwise subject-agreed only.
+    if not dashcam_pov and not driving_ev:
         try:
             from core.visual_marks import collect_visual_marks
 
             for mark in collect_visual_marks(ctx)[:6]:
+                src = str(mark.get("source") or "")
+                fact_class = "logo" if "logo" in src else ("on_screen_text" if src == "ocr" else "entity")
                 cleaned = clean_thumbnail_headline(str(mark.get("text") or ""), max_words=4)
-                if cleaned and not is_unusable_thumbnail_headline(cleaned):
+                if _accept(cleaned, fact_class=fact_class):
                     return cleaned
         except Exception:
             pass
@@ -429,41 +468,60 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
 
             sport_line = sports_title_phrase(infer_sports_identity(ctx))
             cleaned = clean_thumbnail_headline(sport_line, max_words=5) if sport_line else ""
-            if cleaned and not is_unusable_thumbnail_headline(cleaned):
+            if _accept(cleaned, fact_class="entity"):
                 return cleaned
         except Exception:
             pass
 
     hero = _hero_fact_headlines(ctx, category)
-    if hero:
-        return hero[0]
+    for candidate in hero:
+        # Infer class from identity when possible
+        fact_class = ""
+        try:
+            from core.content_identity import get_content_identity
 
-    vc = ctx.vision_context or {}
-    if isinstance(vc, dict):
-        concrete = _first_list_value(vc, "landmark_names", "logo_names", "labels", "label_names", "objects")
-        if concrete:
-            cleaned = clean_thumbnail_headline(concrete, max_words=4)
-            if cleaned and not is_unusable_thumbnail_headline(cleaned):
-                return cleaned
-        ocr = str(vc.get("ocr_text") or "").strip()
-        if ocr:
-            cleaned = clean_thumbnail_headline(ocr, max_words=4)
-            if cleaned and not is_unusable_thumbnail_headline(cleaned):
-                return cleaned
+            for fact in get_content_identity(ctx).get("hero_facts") or []:
+                if not isinstance(fact, dict):
+                    continue
+                if clean_thumbnail_headline(fact.get("text"), max_words=5) == candidate:
+                    fact_class = str(fact.get("class") or "")
+                    break
+        except Exception:
+            fact_class = ""
+        if _accept(candidate, fact_class=fact_class):
+            return candidate
 
+    # Speed / place / music before vision logos/OCR
     ac = ctx.audio_context or {}
     if isinstance(ac, dict):
         music = ac.get("music_title") or ac.get("track_title") or ac.get("title")
         artist = ac.get("music_artist") or ac.get("artist")
         if music or artist:
             cleaned = clean_thumbnail_headline(" ".join(str(x) for x in (artist, music) if x), max_words=4)
-            if cleaned and not is_unusable_thumbnail_headline(cleaned):
+            if _accept(cleaned, fact_class="music"):
+                return cleaned
+
+    vc = ctx.vision_context or {}
+    if isinstance(vc, dict) and not dashcam_pov:
+        concrete = _first_list_value(vc, "landmark_names", "labels", "label_names", "objects")
+        if concrete:
+            cleaned = clean_thumbnail_headline(concrete, max_words=4)
+            if _accept(cleaned, fact_class="landmark"):
+                return cleaned
+        # Logos / OCR only when they agree with pack subject
+        for logo in list(vc.get("logo_names") or vc.get("logos") or [])[:4]:
+            cleaned = clean_thumbnail_headline(logo, max_words=4)
+            if _accept(cleaned, fact_class="logo"):
+                return cleaned
+        ocr = str(vc.get("ocr_text") or "").strip()
+        if ocr:
+            cleaned = clean_thumbnail_headline(ocr, max_words=4)
+            if _accept(cleaned, fact_class="on_screen_text"):
                 return cleaned
 
     for source in (ctx.get_effective_title(), ctx.get_effective_caption()):
         if not source:
             continue
-        # Never use ctx.filename here — filenames are never paintable cover text.
         if is_media_dump_filename(source) or is_filename_like_thumbnail_text(
             source, filename=str(getattr(ctx, "filename", "") or "")
         ):
@@ -476,7 +534,8 @@ def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
         if cleaned and not is_unusable_thumbnail_headline(
             cleaned, filename=str(getattr(ctx, "filename", "") or "")
         ):
-            return cleaned
+            if not pack or headline_agrees_with_pack(cleaned, pack) or _accept(cleaned, fact_class="entity"):
+                return cleaned
 
     return CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
 
@@ -507,6 +566,19 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
         if v and not str(out.get(dst) or "").strip():
             out[dst] = v
 
+    from core.publish_pack import (
+        get_publish_pack,
+        is_paintable_pack_headline,
+    )
+
+    pack = get_publish_pack(ctx)
+    paint_policy = str(pack.get("paint_policy") or "").strip().lower()
+    # Composition-first default: never imply hook_only when pack omitted policy.
+    out["_uploadm8_paint_policy"] = paint_policy or "none"
+    out["_uploadm8_hook_class"] = str(pack.get("hook_class") or "")[:32]
+    if pack.get("hook_line"):
+        out["selected_headline"] = pack.get("hook_line")
+
     fallback = _concrete_thumbnail_headline(ctx, category)
     fname = str(getattr(ctx, "filename", "") or "")
     selected = clean_thumbnail_headline(
@@ -514,6 +586,22 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
     )
     if is_unusable_thumbnail_headline(selected, filename=fname):
         selected = fallback
+    # Reject logo/OCR/LOCATION banners for strategy selected_headline; keep speed/place
+    # evidence strings even when paint_policy=none (composition-first — paint is gated later).
+    if selected and (
+        is_location_banner_headline(selected)
+        or (
+            pack
+            and str(pack.get("hook_class") or "") in {"logo", "on_screen_text"}
+            and not is_paintable_pack_headline(selected, pack)
+        )
+    ):
+        if pack.get("hook_line"):
+            selected = clean_thumbnail_headline(pack.get("hook_line"), max_words=5, filename=fname) or selected
+        if is_location_banner_headline(selected) or is_unusable_thumbnail_headline(selected, filename=fname):
+            selected = fallback or CATEGORY_HEADLINE_FALLBACKS.get(
+                category, CATEGORY_HEADLINE_FALLBACKS["general"]
+            )
     # Category fallbacks are intentional last resorts for the brief, but must
     # never be painted by Pikzels — leave them as selected for strategy only;
     # pikzels_api treats them as non-concrete (no on-image text).
@@ -522,6 +610,17 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
     ):
         selected = CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
     out["selected_headline"] = selected
+    if pack:
+        out["_uploadm8_pack_subject"] = str(pack.get("subject") or "")[:140]
+        out["_uploadm8_hook_line"] = str(pack.get("hook_line") or "")[:80]
+        out["pack_subject"] = out["_uploadm8_pack_subject"]
+        out["hook_line"] = out["_uploadm8_hook_line"]
+        out["hashtag_seeds"] = list(pack.get("hashtag_seeds") or [])[:12]
+        vb = pack.get("visual_brief") if isinstance(pack.get("visual_brief"), dict) else {}
+        out["visual_brief"] = vb
+        # Composition-first: text-bias strategy notes must not override no-text.
+        if paint_policy in {"none", "no_text", "no-text"} or str(vb.get("text") or "") == "none":
+            out["directional_element"] = "none"
 
     options: List[str] = []
     raw_options = out.get("headline_options") or []
@@ -533,6 +632,7 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
                 cleaned
                 and not is_unusable_thumbnail_headline(cleaned, filename=fname)
                 and cleaned not in options
+                and is_paintable_pack_headline(cleaned, pack or None)
             ):
                 options.append(cleaned)
     # Identity hero facts join the rotation so platforms can lead with
@@ -551,7 +651,21 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
             continue
         if is_generic_thumbnail_headline(cleaned):
             continue
+        if is_location_banner_headline(cleaned):
+            continue
+        if is_evidence_empty_fallback_headline(cleaned):
+            options.append(cleaned)
+            continue
+        # Composition-first: allow non-paint evidence in options for strategy rotation;
+        # Pikzels still gates paint via paint_policy + MPH-only.
+        if pack and str(pack.get("hook_class") or "") in {"logo", "on_screen_text"}:
+            if not is_paintable_pack_headline(cleaned, pack):
+                continue
         options.append(cleaned)
+    if paint_policy in {"none", "no_text", "no-text"}:
+        # Keep evidence options for strategy; do not collapse to a single category stub
+        # that erases unique hydration. Paint remains gated by paint_policy.
+        pass
     out["headline_options"] = options[:3]
 
     badge = clean_thumbnail_headline(
@@ -596,6 +710,13 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
             out["color_mood"] = "red_black"
     if not isinstance(out.get("props"), list):
         out["props"] = []
+
+    # Strategy "bottom text bias" must not override no-text paint policy.
+    if paint_policy in {"none", "no_text", "no-text"}:
+        out["notes"] = (
+            str(out.get("notes") or "")
+            + " paint_policy=none — composition only, no on-image headline."
+        ).strip()
 
     plan = _default_platform_plan()
     raw_plan = out.get("platform_plan")
@@ -687,7 +808,30 @@ def _render_template_thumbnail(
     )
     if is_unusable_thumbnail_headline(headline):
         headline = ""
+    paint_policy = str(brief.get("_uploadm8_paint_policy") or "").strip().lower()
+    if paint_policy in {"none", "no_text", "no-text"} or is_evidence_empty_fallback_headline(headline):
+        headline = ""
+    # Composition-first: PIL must not reintroduce place/business banners.
+    if headline:
+        try:
+            from core.publish_pack import is_paintable_pack_headline
+
+            pack_hint = {
+                "subject": str(brief.get("_uploadm8_pack_subject") or brief.get("subject") or ""),
+                "hook_line": str(brief.get("_uploadm8_hook_line") or brief.get("hook_line") or ""),
+                "paint_policy": paint_policy or "none",
+                "hook_class": str(brief.get("_uploadm8_hook_class") or brief.get("hook_class") or ""),
+                "hashtag_seeds": brief.get("hashtag_seeds") or [],
+            }
+            if not is_paintable_pack_headline(headline, pack_hint):
+                headline = ""
+        except Exception:
+            if not re.search(r"(?i)\b\d{1,3}\s*mph\b", headline):
+                headline = ""
     badge_text = (brief.get("badge_text") or "").upper()[:12]
+    # Skip word badges when not painting — they become another plastered label.
+    if paint_policy in {"none", "no_text", "no-text"} or not headline:
+        badge_text = ""
 
     # Badge colors — user platform color wins when configured
     badge_style = brief.get("badge_style", "red")

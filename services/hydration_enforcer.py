@@ -49,14 +49,17 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from core.helpers import (
     expand_geo_runon_hashtag,
+    extract_highway_route_tokens,
+    music_track_hashtag_bodies,
     normalize_hashtag_bodies,
     sanitize_hashtag_body,
     split_hashtag_source_phrases,
 )
+from core.prose_cliche_patterns import hydration_cliche_patterns as _hydration_cliche_patterns
 from core.publish_text_sanitize import (
     collapse_repeated_words,
     is_degenerate_publish_text,
@@ -70,6 +73,7 @@ from core.vision_labels import (
     is_invented_person_hashtag,
     is_junk_hashtag_body,
     primary_road_display,
+    rare_env_hashtag_bodies,
     road_hashtag_tokens,
     is_redundant_vision_label,
     is_vague_taxonomy_copy,
@@ -85,74 +89,8 @@ logger = logging.getLogger("uploadm8-worker")
 # ---------------------------------------------------------------------------
 
 # Phrases that are pure boilerplate. Any caption matching one of these without
-# referencing actual evidence is rewritten.
-_GENERIC_CAPTION_PATTERNS: List[re.Pattern[str]] = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        # Original travel / dashcam clichés
-        r"\bcruise (?:under|through|along)\b",
-        r"\bvast skies\b",
-        r"\bendless (?:horizons?|road|roads|highway|highways|sky|skies)(?:\b|\s+(?:ahead|await|beckons?))",
-        r"\b(?:adventure|journey|destiny|moment|magic) (?:awaits?|unfolds?|begins?|calls?|beckons?)\b",
-        r"\bopen road(?:\s+(?:odyssey|calls?|beckons?|symphony|dreams?|magic))?\b",
-        r"\b(?:open|endless) road\b",
-        r"\bopen road\s+(?:odyssey|symphony|dreams?|magic|calls?|adventures?)\b",
-        r"\bscenic (?:vibes?|drive|views?|stop|route|roads?|beauty)\b",
-        r"\b(?:travel|highway|cloud) (?:vibes?|watching|symphony|dreams?)\b",
-        r"\bhighway (?:symphony|dreams?|magic|melody|odyssey|tales?|stories)\b",
-        r"\b(?:colorful|vibrant|stunning|breathtaking) blooms?\b",
-        r"\bblooms? (?:stun|meet|burst|dance)\b",
-        r"\bblooming (?:roads?|highways?|paths?)\b",
-        r"\b(?:purple|red|yellow|pink) blooms?\s+(?:stun|meet|burst|dance)\b",
-        r"\bdesert sands?\b",
-        r"\bgood vibes\b",
-        r"\bbreath(?:e|taking) (?:in )?(?:the )?freedom\b",
-        r"\b(?:explore|discover) more\b",
-        r"\bnature(?:'s)? (?:beauty|symphony|call|magic|wonders?)\b",
-        r"\bbuckle up\b",
-        r"\bjoin me\b",
-        r"\blet's dive\b",
-        r"\byou won't believe\b",
-        r"\bexciting moments?\b",
-        r"\bunbelievable moments?\b",
-        r"\bridin'? dirty\b",
-        r"\bvibes? only\b",
-        r"\bembrace the chaos\b",
-        r"\bhidden gem\b",
-        # New AI-cliché catches based on observed M8 output
-        r"\b(?:watch|witness) (?:the road|the world|the sky|nature|magic) (?:transform|unfold|change)\b",
-        r"\b(?:watch|witness) (?:serenity|magic|nature|beauty) (?:meet|meets) (?:motion|sky|road|nature)\b",
-        r"\bserenity meet(?:s)? motion\b",
-        r"\b(?:road|highway|drive|journey) ahead\.?\s*$",
-        r"\b(?:where|when) (?:the )?road meets (?:the )?(?:sky|horizon|sunset|dreams?)\b",
-        r"\b(?:tranquil|peaceful|serene) (?:drive|journey|road|moments?)\b",
-        r"\b(?:road|highway) (?:tales?|stories|chronicles|poetry)\b",
-        r"\b(?:every )?mile (?:tells a story|matters|counts)\b",
-        r"\bjourney captured\b",
-        r"\b(?:scenic|epic|legendary) (?:moments?|adventures?|stops?)\b",
-        r"\b(?:unforgettable|magical|legendary) (?:journey|drive|ride|moments?)\b",
-        r"\bon the open road\b",
-        r"\b(?:roads?|highways?) less travel(?:l)?ed\b",
-        r"\bwhere the road takes (?:me|us|you)\b",
-        # Observed M8 filler that ignores timeline/hydration
-        r"\bhigh[- ]energy,?\s+first[- ]person\s+dashcam\b",
-        r"\bthe video is a\s+(?:high[- ]energy|tense|exciting)\b",
-        r"\bfrom inside a moving vehicle\b",
-        r"\bcapturing a tense and confrontational journey\b",
-        r"\bdashcam recording from inside\b",
-        # Extremely short titles that are pure mood (no proper noun, no number)
-        r"^(?:road|drive|journey|adventure|highway|moment|vibes?|cruise|escape)\.?$",
-        # Pure Vision taxonomy / color category titles (no place, speed, brand)
-        r"^(?:nature|horizon|scenery|landscape|outdoors?|transport|mode of transport|"
-        r"vehicle|car|highway|road|sky|clouds?|trees?|water|travel|lifestyle|"
-        r"automotive|beautiful|aesthetic|vibes?)\.?$",
-        r"^(?:blue|green|red|yellow|orange|purple|pink|black|white|gray|grey)\s+"
-        r"(?:sky|skies|trees?|horizon|nature|scenery|road|car|vibes?)\.?$",
-        r"\bmode of transport\b",
-        r"\bnature (?:views?|vibes?|scenes?|shots?|beauty)\b",
-        r"\b(?:blue|green|golden) (?:skies|horizons?)\b",
-    )
-]
+# referencing actual evidence is rewritten. Source: core.prose_cliche_patterns.
+_GENERIC_CAPTION_PATTERNS: List[re.Pattern[str]] = list(_hydration_cliche_patterns())
 
 # Hashtags we should treat as "generic seed" placeholders. If we have
 # evidence-driven tags, these get demoted/replaced.
@@ -181,8 +119,6 @@ _CATEGORY_SEED_TAGS = {
     "morningroutine", "selfcare", "wellnesstok", "authenticlife",
     # platform-meta (already blocked elsewhere; mirror for safety)
     "viral", "fyp", "foryoupage", "trending", "mustwatch",
-    # leaked QA / placeholder tags
-    "tester", "qwe",
 }
 
 # Words that indicate the caption is a real evidence-grounded sentence.
@@ -411,15 +347,6 @@ _US_STATE_ABBR: Dict[str, str] = {
     "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
 }
 
-_HIGHWAY_PATTERNS = (
-    re.compile(r"\b(I[-\s]?\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(US[-\s]?\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(SR[-\s]?\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(HWY[-\s]?\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(ROUTE[-\s]?\d{1,3})\b", re.IGNORECASE),
-)
-
-
 def _state_abbr(state: Optional[str], country: Optional[str]) -> Optional[str]:
     if state:
         key = state.strip().lower()
@@ -508,7 +435,9 @@ def scrub_machine_publish_dump(text: str) -> str:
         r"(?i)(?:^|[.!?]\s+)objects\s*:.*$",
     ):
         t = re.sub(pat, "", t).strip()
-    t = t.rstrip(" .,—–-|")
+    # Strip dump leftovers / pipes — keep sentence-final .!? so real captions
+    # are not mutated when hydration elects to leave copy untouched.
+    t = t.rstrip(" ,—–-|")
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -779,11 +708,10 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         pool.expressive_faces = bool(vc.get("expressive"))
         ocr = (vc.get("ocr_text") or "").strip()
         if ocr:
-            for pat in _HIGHWAY_PATTERNS:
-                for m in pat.findall(ocr):
-                    s = re.sub(r"[\s\-]+", "", str(m)).upper()
-                    if s and s not in pool.vision_highways:
-                        pool.vision_highways.append(s)
+            for tok in extract_highway_route_tokens(ocr, limit=4):
+                s = str(tok or "").strip()
+                if s and s not in pool.vision_highways:
+                    pool.vision_highways.append(s)
             pool.vision_ocr_tokens = _extract_transcript_nouns(ocr, limit=8)
 
     # Welcome to / Entering signs (Vision OCR + VI on_screen_text)
@@ -1530,10 +1458,11 @@ def _title_has_publishable_voice(title: str, pool: EvidencePool) -> bool:
         )
     )
     if checklist or _is_generic_caption(t) or _is_machine_label_dump(t):
-        return False
+        if not (_title_survives_cliche_substring(t) and not _is_machine_label_dump(t)):
+            return False
     if _title_has_grounded_voice(t, pool):
         return True
-    return _title_cites_scene_evidence(t, pool)
+    return _title_cites_scene_evidence(t, pool) or _title_survives_cliche_substring(t)
 
 
 def _title_is_salvageable_voice(title: str, pool: EvidencePool) -> bool:
@@ -1723,8 +1652,18 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
     t = scrub_machine_publish_dump(title or "").strip()
     if not t:
         return True
+    # Wrong MPH claims must stay thin so scrub/rebuild can run — before cliché /
+    # length survival (a ≥28-char title like "Cruising Logandale at 46 MPH" must
+    # not keep a mismatched peak).
+    if re.search(r"\b\d{2,3}\s*mph\b", t, re.I) and not _title_mentions_trusted_speed(
+        t, pool
+    ):
+        return True
     # Grounded / publishable voice wins over the compact speed·place·music template.
     if _title_has_grounded_voice(t, pool) or _title_has_publishable_voice(t, pool):
+        return False
+    # Editorial headlines that merely contain a travel cliché substring are not thin.
+    if _title_survives_cliche_substring(t):
         return False
     has_speed = bool(pool.max_speed_mph and pool.max_speed_mph >= 5)
     has_music = bool(pool.music_artist or pool.music_title)
@@ -1793,7 +1732,7 @@ def _title_is_timeline_thin(title: str, pool: EvidencePool) -> bool:
 _HASHTAG_MAX_LEN = HASHTAG_BODY_MAX_LEN
 # VI logo false positives (billboards / radio watermarks) need a high bar.
 _VI_LOGO_MIN_CONF = 0.90
-_VI_LOGO_MIN_DURATION_S = 1.0
+_VI_LOGO_MIN_DURATION_S = 1.5
 _FALSE_LOGO_RE = re.compile(
     r"(?i)\b(?:radio|broadcast|fm\b|am\b|podcast|tv\b|network)\b|\bradio$"
 )
@@ -1816,6 +1755,13 @@ _AMBIENT_LOGO_SLUGS = frozenset(
         "cosco",
         "msc",
         "hapaglloyd",
+        "uhaul",
+        "uhaulinternational",
+        "jordankuwaitbank",
+        "kuwaitbank",
+        "realunited",
+        "klankosova",
+        "klankoso",
         "walmart",
         "costco",
         "target",
@@ -1925,10 +1871,15 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     out: List[str] = []
     seen: set = set()
 
-    def _push(raw: Any) -> bool:
+    def _push(raw: Any, *, geo_split: bool = True) -> bool:
         added = False
         for phrase in split_hashtag_source_phrases(str(raw or "")):
-            for body in expand_geo_runon_hashtag(phrase, max_len=_HASHTAG_MAX_LEN):
+            pieces = (
+                expand_geo_runon_hashtag(phrase, max_len=_HASHTAG_MAX_LEN)
+                if geo_split
+                else [sanitize_hashtag_body(phrase, max_len=_HASHTAG_MAX_LEN)]
+            )
+            for body in pieces:
                 body = sanitize_hashtag_body(body, max_len=_HASHTAG_MAX_LEN)
                 if not body or body in seen:
                     continue
@@ -1950,15 +1901,34 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         _push(beach)
     for mon in list(getattr(pool, "place_monuments", None) or [])[:2]:
         _push(mon)
-    for team in list(getattr(pool, "sports_teams", None) or [])[:2]:
-        _push(team)
-    for stad in list(getattr(pool, "place_stadiums", None) or [])[:2]:
-        _push(stad)
+    ambient = tuple(pool.ambient_profiles or ())
+    # Weak OCR / web mush (Sea-M) must not become discovery tags on dashcam clips.
+    _skip_weak_sports = bool(
+        ambient and any(p in ("automotive", "dashcam") for p in ambient)
+    )
+    if not _skip_weak_sports:
+        for team in list(getattr(pool, "sports_teams", None) or [])[:2]:
+            if isinstance(team, dict):
+                team = team.get("description") or team.get("name") or ""
+            t = str(team or "").strip()
+            if not t or t.startswith("{") or len(t) < 4:
+                continue
+            if re.search(r"(?i)^sea[\s\-]?m$", t) or t.lower() in ("sea", "stadium"):
+                continue
+            _push(t)
+        for stad in list(getattr(pool, "place_stadiums", None) or [])[:2]:
+            _push(stad)
 
-    if pool.music_artist:
-        _push(pool.music_artist)
-    if pool.music_title:
-        _push(pool.music_title)
+    # Music: artist always; short track slugs only (no smashed long titles).
+    if pool.music_artist or pool.music_title:
+        for body in music_track_hashtag_bodies(
+            pool.music_artist,
+            pool.music_title,
+            getattr(pool, "music_genre", None),
+        ):
+            if body and body not in seen and not is_junk_hashtag_body(body):
+                seen.add(body)
+                out.append(body)
 
     if getattr(pool, "vehicle_make", None):
         _push(pool.vehicle_make)
@@ -1972,16 +1942,7 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
         for tok in _road_hashtag_tokens(hwy):
             _push(tok)
 
-    # Route + place composites only when BOTH sides stay short (i5tumwater).
-    place_seed = pool.gazetteer_place or pool.city
-    place_body = sanitize_hashtag_body(str(place_seed or ""), max_len=_HASHTAG_MAX_LEN)
-    for road_body in road_tokens:
-        if not place_body or len(road_body) > 10 or len(place_body) > 12:
-            continue
-        if len(road_body) + len(place_body) > _HASHTAG_MAX_LEN:
-            continue
-        _push(f"{road_body}{place_body}")
-        _push(f"{place_body}{road_body}")
+    # One entity → one tag. Never glue route+place (sr20ironcounty / i5tumwater).
 
     if pool.gazetteer_place:
         _push(pool.gazetteer_place)
@@ -2037,16 +1998,8 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
             if s:
                 logo_slugs_taken.add(s)
 
-    if pool.trill_bucket:
-        bucket_tags = {
-            "gloryBoy": ["GloryBoyTour", "TrillScore100", "SendIt"],
-            "euphoric": ["Euphoric", "TrillScore", "SpeedDemon"],
-            "sendIt":   ["SendIt", "TrillScore", "Spirited"],
-            "spirited": ["SpiritedDrive", "TrillScore"],
-            "chill":    ["TrillScore", "CruiseControl"],
-        }.get(pool.trill_bucket, [])
-        for t in bucket_tags[:3]:
-            _push(t)
+    # Trill bucket is caption-weave only — do not mint lifestyle discovery tags
+    # (CruiseControl / chill / TrillScore) from the energy score.
 
     if pool.max_speed_mph >= 130:
         for t in ("TripleDigits", "TopSpeed"):
@@ -2088,7 +2041,6 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     # Vision / VI segment labels: only when no stronger geo/brand signals.
     strong_signals = evidence_pool_has_strong_hashtag_signals(pool)
-    ambient = tuple(pool.ambient_profiles or ())
     if not strong_signals:
         for lbl in filter_vision_labels_for_hashtags(
             pool.vision_labels,
@@ -2114,6 +2066,17 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
                     and not is_redundant_vision_label(desc, ambient_profiles=ambient or None)
                 ):
                     _push(desc)
+
+    # 0–2 rare environment tags (snowfall, cherryblossoms, …) — never reopen
+    # the full Vision flood under strong geo+music.
+    plants = list((pool.recognition_entities or {}).get("plants") or [])[:6]
+    for body in rare_env_hashtag_bodies(
+        pool.yamnet_top,
+        pool.vision_labels,
+        plants,
+        limit=2,
+    ):
+        _push(body)
 
     if len(out) > max_extra:
         out = out[:max_extra]
@@ -2195,6 +2158,30 @@ def _is_generic_caption(caption: str) -> bool:
     c = caption.strip()
     if len(c) >= 80 and re.search(r"\b\d{2,3}\s*mph\b", c, re.I):
         return False
+    return True
+
+
+def _title_survives_cliche_substring(title: str) -> bool:
+    """Long / subtitle headlines that merely contain 'open road' etc. stay.
+
+    Aligns with ``_hydrate_title`` keep heuristic — caption cliché patterns must
+    not wipe editorial titles that happen to include a travel phrase.
+    """
+    t = scrub_machine_publish_dump(title or "").strip()
+    if not t:
+        return False
+    if not (len(t) >= 28 or (":" in t and len(t) >= 18)):
+        return False
+    if " · " in t:
+        return False
+    try:
+        from services.m8_grounding_pass import is_formula_stub_caption
+
+        if is_formula_stub_caption(t):
+            return False
+    except Exception:
+        if re.match(r"(?i)^\s*anchored\s+in\b", t):
+            return False
     return True
 
 
@@ -2303,16 +2290,27 @@ def _merge_hashtag_lists(*lists: Iterable[str], cap: Optional[int] = None) -> Li
 
 
 def _purge_seed_tags_when_evidence(
-    tags: List[str], evidence_tags: List[str]
+    tags: List[str],
+    evidence_tags: List[str],
+    *,
+    protect: Optional[Set[str]] = None,
 ) -> List[str]:
-    """Drop category-seed tags ONLY when we have evidence-driven tags to replace them."""
+    """Drop category-seed tags ONLY when we have evidence-driven tags to replace them.
+
+    ``protect`` (Always hashtags) is never purged — user intent wins.
+    """
     if not evidence_tags:
         return tags
+    protect_set = {sanitize_hashtag_body(str(p)).lower() for p in (protect or set()) if p}
+    protect_set.discard("")
     evidence_lower = {t.lower() for t in evidence_tags}
     out: List[str] = []
     for raw in tags or []:
         body = sanitize_hashtag_body(str(raw))
         if not body:
+            continue
+        if body.lower() in protect_set:
+            out.append(body)
             continue
         if body.lower() in evidence_lower:
             out.append(body)
@@ -2407,11 +2405,18 @@ def _fallback_anchor_from_ctx(ctx: JobContext, category: Optional[str] = None) -
     return out
 
 
-def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
+def _scrub_leaked_junk_hashtags(
+    tags: Iterable[str],
+    *,
+    protect: Optional[Set[str]] = None,
+) -> List[str]:
     """Remove QA placeholders, HUD OCR mashups, and taxonomy filler tags.
 
     Also expands geo run-ons (``lasvegasnv`` → ``lasvegas``, ``nevada``) and
     multi-artist pipes before the junk gate.
+
+    ``protect`` (Always hashtags) is never scrubbed — user intent wins even when
+    the body matches historic QA placeholders like ``tester`` / ``qwe``.
 
     Returns kept tags. Dropped non-builtin weak tokens are recorded on the
     module-level learn buffer for the pipeline to persist into the dynamic
@@ -2420,6 +2425,8 @@ def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
     from services.generic_hard_ban import builtin_ban_slugs, normalize_ban_slug
 
     banned = frozenset({"tester", "qwe", "asdf", "foobar", "lorem", "ipsum"})
+    protect_set = {sanitize_hashtag_body(str(p)).lower() for p in (protect or set()) if p}
+    protect_set.discard("")
     builtin = builtin_ban_slugs()
     out: List[str] = []
     learned_hits: List[str] = []
@@ -2428,7 +2435,18 @@ def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
         for body in normalize_hashtag_bodies([str(raw)], max_len=_HASHTAG_MAX_LEN):
             if not body or body in seen:
                 continue
+            if body.lower() in protect_set:
+                seen.add(body)
+                out.append(body)
+                continue
             if body.lower() in banned:
+                continue
+            # Digit crumbs / HUD speed mash (5, 6, 56mph as "plate")
+            if body.isdigit() and len(body) <= 2:
+                continue
+            if re.fullmatch(r"\d{2,3}mph", body, flags=re.I):
+                continue
+            if body in ("seam", "sea") or re.fullmatch(r"sea[\-]?m", body, flags=re.I):
                 continue
             if is_junk_hashtag_body(body):
                 slug = normalize_ban_slug(body)
@@ -2535,6 +2553,7 @@ def enforce_hydration(
         "rewrote_title": False,
         "persona_required": persona_required,
         "receipt_rejected": False,
+        "generic_rejected": False,
         "purged_seed_tags": 0,
         "added_evidence_tags": 0,
         "anchor": anchor,
@@ -2623,6 +2642,12 @@ def enforce_hydration(
     m8_titles = getattr(ctx, "m8_platform_titles", None) or {}
     m8_hashtags = getattr(ctx, "m8_platform_hashtags", None) or {}
 
+    def _mark_receipt_wipe() -> None:
+        report["receipt_rejected"] = True
+
+    def _mark_generic_wipe() -> None:
+        report["generic_rejected"] = True
+
     def _maybe_rewrite_caption(cap_str: str) -> Optional[str]:
         """Return new caption when a rewrite is warranted, else None.
 
@@ -2640,7 +2665,7 @@ def enforce_hydration(
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
             if persona_required:
                 voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
-                report["receipt_rejected"] = True
+                _mark_generic_wipe()
                 return voice_cap or scrubbed or None
             if anchor:
                 return _hydrate_caption("", anchor)
@@ -2653,7 +2678,7 @@ def enforce_hydration(
         working = scrubbed
         if persona_required and is_formula_stub_caption(working):
             voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
-            report["receipt_rejected"] = True
+            _mark_receipt_wipe()
             return voice_cap if voice_cap else None
         if not anchor:
             return working if working != raw.strip() else None
@@ -2666,7 +2691,7 @@ def enforce_hydration(
                 return working if working != raw.strip() else None
             if persona_required:
                 voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
-                report["receipt_rejected"] = True
+                _mark_generic_wipe()
                 return voice_cap if voice_cap and voice_cap != raw.strip() else None
             new = _hydrate_caption(working, anchor)
             return new if new and new != raw.strip() else (
@@ -2678,7 +2703,7 @@ def enforce_hydration(
             return working if working != raw.strip() else None
         if persona_required:
             voice_cap = _voice_shaped_caption_from_pool(pool, ctx)
-            report["receipt_rejected"] = True
+            _mark_generic_wipe()  # thin / non-grounded or stock cliché under persona
             return voice_cap if voice_cap and voice_cap != raw.strip() else None
         new = _hydrate_caption(working, anchor)
         return new if new and new != raw.strip() else (
@@ -2706,7 +2731,7 @@ def enforce_hydration(
         if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
             if persona_required:
                 voice_t = _voice_shaped_title_from_pool(pool, ctx)
-                report["receipt_rejected"] = True
+                _mark_generic_wipe()
                 return voice_t or title_anchor or scrubbed or None
             return title_anchor or scrubbed or None
         from core.speed_consensus import scrub_untrusted_speed_claims
@@ -2720,6 +2745,7 @@ def enforce_hydration(
             scrubbed = scrub_untrusted_speed_claims(scrubbed, 0.0) or scrubbed
         working = scrubbed
         if persona_required and (not working or is_formula_stub_caption(working)):
+            stub_hit = bool(working) and is_formula_stub_caption(working)
             for cand_cap in (
                 getattr(ctx, "ai_caption", None),
                 *((getattr(ctx, "m8_platform_captions", None) or {}).values()),
@@ -2740,10 +2766,16 @@ def enforce_hydration(
                         if not _title_mentions_trusted_speed(lifted, pool):
                             lifted = _inject_peak_mph_into_title(lifted, pool)
                     if lifted and not is_formula_stub_caption(lifted):
-                        report["receipt_rejected"] = True
+                        if stub_hit:
+                            _mark_receipt_wipe()
+                        else:
+                            _mark_generic_wipe()
                         return lifted
             voice_t = _voice_shaped_title_from_pool(pool, ctx)
-            report["receipt_rejected"] = True
+            if stub_hit:
+                _mark_receipt_wipe()
+            else:
+                _mark_generic_wipe()
             return voice_t if voice_t else None
         if not title_anchor:
             return working if working != raw.strip() else None
@@ -2812,7 +2844,7 @@ def enforce_hydration(
                 return working if working != raw.strip() else None
             if persona_required:
                 voice_t = _voice_shaped_title_from_pool(pool, ctx)
-                report["receipt_rejected"] = True
+                _mark_generic_wipe()
                 return voice_t if voice_t else None
             new = title_anchor[:100]
             return new if new and new != raw.strip() else (
@@ -2833,7 +2865,7 @@ def enforce_hydration(
                 return working if working != raw.strip() else None
             if persona_required:
                 voice_t = _voice_shaped_title_from_pool(pool, ctx)
-                report["receipt_rejected"] = True
+                _mark_generic_wipe()
                 return voice_t if voice_t else None
             new = _hydrate_title(working, title_anchor)
             return new if new and new != raw.strip() else (
@@ -2843,7 +2875,10 @@ def enforce_hydration(
             not working or is_formula_stub_caption(working) or _is_generic_caption(working)
         ):
             voice_t = _voice_shaped_title_from_pool(pool, ctx)
-            report["receipt_rejected"] = True
+            if working and is_formula_stub_caption(working):
+                _mark_receipt_wipe()
+            else:
+                _mark_generic_wipe()
             return voice_t if voice_t else None
         # Persona prefs: never ship the compact timeline as a hydrate result.
         if persona_required and is_formula_stub_caption(title_anchor):
@@ -2851,7 +2886,7 @@ def enforce_hydration(
         new = _hydrate_title(working, title_anchor)
         if new and persona_required and is_formula_stub_caption(new):
             voice_t = _voice_shaped_title_from_pool(pool, ctx)
-            report["receipt_rejected"] = True
+            _mark_receipt_wipe()
             return voice_t if voice_t else (working if working else new)
         return new if new and new != raw.strip() else (
             working if working != raw.strip() else None
@@ -2874,12 +2909,16 @@ def enforce_hydration(
                 report["rewrote_title"] = True
 
     # ── Per-platform M8 hashtags: replace seed-only with evidence ────────
+    from core.hashtag_prefs import (
+        always_hashtag_bodies,
+        pin_always_hashtags,
+        resolve_hashtag_ceiling,
+    )
+
     us_htag = getattr(ctx, "user_settings", None) or {}
-    try:
-        _max_htags = int(us_htag.get("maxHashtags") or us_htag.get("max_hashtags") or 15)
-    except (TypeError, ValueError):
-        _max_htags = 15
-    _max_htags = max(1, min(30, _max_htags))
+    _max_htags = resolve_hashtag_ceiling(us_htag)
+    _always_tags = always_hashtag_bodies(us_htag)
+    _protect = set(_always_tags)
 
     discovery_tags: List[str] = []
     try:
@@ -2893,11 +2932,18 @@ def enforce_hydration(
     def _fill_hashtags(existing: List[str]) -> List[str]:
         seed_only, _seed_n, _total_n = _hashtags_are_seed_only(existing)
         filler = evidence_tags or discovery_tags
-        purged = _purge_seed_tags_when_evidence(existing, filler)
-        merged = _merge_hashtag_lists(evidence_tags, discovery_tags, purged, cap=_max_htags)
+        purged = _purge_seed_tags_when_evidence(
+            existing, filler, protect=_protect
+        )
+        # Always first, then evidence, then remaining — never pad with seeds.
+        merged = _merge_hashtag_lists(
+            _always_tags, evidence_tags, discovery_tags, purged, cap=_max_htags
+        )
         if seed_only and filler and merged == existing:
-            merged = _merge_hashtag_lists(evidence_tags, discovery_tags, existing, cap=_max_htags)
-        return merged
+            merged = _merge_hashtag_lists(
+                _always_tags, evidence_tags, discovery_tags, existing, cap=_max_htags
+            )
+        return pin_always_hashtags(merged, _always_tags, cap=_max_htags)
 
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
@@ -2921,7 +2967,7 @@ def enforce_hydration(
         ctx.ai_title = new
         report["rewrote_title"] = True
 
-    if evidence_tags or discovery_tags:
+    if evidence_tags or discovery_tags or _always_tags:
         existing = list(getattr(ctx, "ai_hashtags", None) or [])
         merged = _fill_hashtags(existing)
         if merged != existing:
@@ -2929,18 +2975,30 @@ def enforce_hydration(
             report["added_evidence_tags"] += max(0, len(merged) - len(existing))
         ctx.ai_hashtags = merged
 
-    ctx.ai_hashtags = _merge_hashtag_lists(
-        _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or [])),
-        evidence_tags,
-        discovery_tags,
+    ctx.ai_hashtags = pin_always_hashtags(
+        _merge_hashtag_lists(
+            _scrub_leaked_junk_hashtags(
+                list(getattr(ctx, "ai_hashtags", None) or []), protect=_protect
+            ),
+            evidence_tags,
+            discovery_tags,
+            cap=_max_htags,
+        ),
+        _always_tags,
         cap=_max_htags,
     )
     if isinstance(m8_hashtags, dict):
         for pl, raw_list in list(m8_hashtags.items()):
-            m8_hashtags[pl] = _merge_hashtag_lists(
-                _scrub_leaked_junk_hashtags(list(raw_list or [])),
-                evidence_tags,
-                discovery_tags,
+            m8_hashtags[pl] = pin_always_hashtags(
+                _merge_hashtag_lists(
+                    _scrub_leaked_junk_hashtags(
+                        list(raw_list or []), protect=_protect
+                    ),
+                    evidence_tags,
+                    discovery_tags,
+                    cap=_max_htags,
+                ),
+                _always_tags,
                 cap=_max_htags,
             )
 
@@ -2954,19 +3012,31 @@ def enforce_hydration(
             if fl_report.get("woven_classes"):
                 report["rewrote_caption"] = True
             # Re-scrub after pad (ledger slugs are already sanitized), then
-            # refill discovery tags so soccer clips still hit maxHashtags.
-            ctx.ai_hashtags = _merge_hashtag_lists(
-                _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or [])),
-                evidence_tags,
-                discovery_tags,
+            # refill discovery tags — Always pinned again after scrub.
+            ctx.ai_hashtags = pin_always_hashtags(
+                _merge_hashtag_lists(
+                    _scrub_leaked_junk_hashtags(
+                        list(getattr(ctx, "ai_hashtags", None) or []), protect=_protect
+                    ),
+                    evidence_tags,
+                    discovery_tags,
+                    cap=_max_htags,
+                ),
+                _always_tags,
                 cap=_max_htags,
             )
             if isinstance(m8_hashtags, dict):
                 for pl, raw_list in list(m8_hashtags.items()):
-                    m8_hashtags[pl] = _merge_hashtag_lists(
-                        _scrub_leaked_junk_hashtags(list(raw_list or [])),
-                        evidence_tags,
-                        discovery_tags,
+                    m8_hashtags[pl] = pin_always_hashtags(
+                        _merge_hashtag_lists(
+                            _scrub_leaked_junk_hashtags(
+                                list(raw_list or []), protect=_protect
+                            ),
+                            evidence_tags,
+                            discovery_tags,
+                            cap=_max_htags,
+                        ),
+                        _always_tags,
                         cap=_max_htags,
                     )
     except Exception as fl_exc:
@@ -2981,6 +3051,8 @@ def enforce_hydration(
     report["title_after"] = title_final[:120]
     if report.get("receipt_rejected"):
         report["wipe_reason"] = "receipt_rejected"
+    elif report.get("generic_rejected"):
+        report["wipe_reason"] = "generic_rejected"
     elif report.get("rewrote_title"):
         before = str(report.get("title_before") or "")
         after = str(report.get("title_after") or "")
@@ -2996,6 +3068,10 @@ def enforce_hydration(
 
                 if _stub_chk(before) and not _stub_chk(after):
                     report["wipe_reason"] = "receipt_rejected"
+                    report["receipt_rejected"] = True
+                elif _is_generic_caption(before) and not _is_generic_caption(after):
+                    report["wipe_reason"] = "generic_rejected"
+                    report["generic_rejected"] = True
                 elif _title_has_publishable_voice(after, pool):
                     report["wipe_reason"] = "keep_publishable"
                 else:
@@ -3046,6 +3122,7 @@ def enforce_hydration(
             "rewrote_title": report["rewrote_title"],
             "persona_required": report.get("persona_required", False),
             "receipt_rejected": report.get("receipt_rejected", False),
+            "generic_rejected": report.get("generic_rejected", False),
             "title_before": report.get("title_before"),
             "title_after": report.get("title_after"),
             "wipe_reason": report.get("wipe_reason"),

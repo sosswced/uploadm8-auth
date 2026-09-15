@@ -22,6 +22,7 @@ from core.audit import log_admin_audit
 from core.deps import require_admin, require_master_admin
 from services.pikzels_v2 import resolve_public_api_key
 from services.admin_kpi_finance import build_cost_tracker_payload, build_provider_costs_payload
+from services.admin_kpi_window import AdminKpiWindowError, resolve_admin_kpi_window
 from services.growth_intelligence import (
     build_ai_truth_metrics,
     build_marketing_intel_bundle,
@@ -128,14 +129,39 @@ def _default_intel(range_key: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_window_or_400(range: str | None = None, start: str | None = None, end: str | None = None):
+    try:
+        return resolve_admin_kpi_window(range_key=range, start=start, end=end, strict_range=True)
+    except AdminKpiWindowError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @marketing_router.get("/intel")
-async def marketing_intel(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def marketing_intel(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, meta = _resolve_window_or_400(range=range, start=start, end=end)
     try:
         async with core.state.db_pool.acquire() as conn:
-            return await build_marketing_intel_bundle(conn, range)
+            bundle = await build_marketing_intel_bundle(
+                conn,
+                meta.get("range_key") or range or "30d",
+                since=since,
+                until=until,
+            )
+            if isinstance(bundle, dict):
+                bundle.update(meta)
+                bundle["window_start_utc"] = since.isoformat()
+                bundle["window_end_exclusive_utc"] = until.isoformat()
+            return bundle
     except Exception as e:
         logger.warning("marketing_intel fallback: %s", e)
-        return _default_intel(range)
+        out = _default_intel(range)
+        out.update(meta)
+        return out
 
 
 @marketing_router.get("/accounts")
@@ -1848,41 +1874,78 @@ async def platform_kpi_rollups_refresh(days: int = Query(7, ge=1, le=90), user: 
 
 
 @admin_compat_router.get("/kpi/cost-tracker")
-async def kpi_cost_tracker(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def kpi_cost_tracker(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, meta = _resolve_window_or_400(range=range, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
-        return await build_cost_tracker_payload(conn, range_key=range)
+        out = await build_cost_tracker_payload(
+            conn,
+            range_key=meta.get("range_key") or range,
+            since=since,
+            until=until,
+        )
+        out.update(meta)
+        return out
 
 
 @admin_compat_router.get("/kpi/provider-costs")
-async def kpi_provider_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def kpi_provider_costs(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, meta = _resolve_window_or_400(range=range, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
-        return await build_provider_costs_payload(conn, range_key=range)
+        out = await build_provider_costs_payload(
+            conn,
+            range_key=meta.get("range_key") or range,
+            since=since,
+            until=until,
+        )
+        out.update(meta)
+        return out
 
 
 @admin_compat_router.get("/kpi/pikzels-v2-usage")
-async def kpi_pikzels_v2_usage(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    since, until = parse_range_since_until(range)
+async def kpi_pikzels_v2_usage(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, meta = _resolve_window_or_400(range=range, start=start, end=end)
     try:
         async with core.state.db_pool.acquire() as conn:
             data = await fetch_pikzels_studio_usage(conn, since, until)
-        return {"range": range, **data}
+        return {"range": meta.get("range_key") or range, **meta, **data}
     except Exception as e:
         logger.warning("pikzels-v2-usage: %s", e)
-        return {"range": range, "total_calls": 0, "by_operation": []}
+        return {"range": meta.get("range_key") or range, **meta, "total_calls": 0, "by_operation": []}
 
 
 @admin_compat_router.get("/kpi/pikzels-template-render")
-async def kpi_pikzels_template_render(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def kpi_pikzels_template_render(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
     """Share of completed uploads that used PIL template thumbs while PIKZELS_API_KEY is set."""
-    since, until = parse_range_since_until(range)
+    since, until, meta = _resolve_window_or_400(range=range, start=start, end=end)
     try:
         async with core.state.db_pool.acquire() as conn:
             data = await fetch_pikzels_template_render_kpi(conn, since, until)
-        return {"range": range, **data}
+        return {"range": meta.get("range_key") or range, **meta, **data}
     except Exception as e:
         logger.warning("pikzels-template-render kpi: %s", e)
         return {
-            "range": range,
+            "range": meta.get("range_key") or range,
+            **meta,
             "pikzels_api_key_configured": bool((resolve_public_api_key() or "").strip()),
             "total_completed_uploads": 0,
             "template_render_count": 0,

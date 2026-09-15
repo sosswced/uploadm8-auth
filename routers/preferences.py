@@ -5,13 +5,14 @@ Handles color preferences and content/upload preferences (hashtags, captions,
 thumbnails, Trill settings, etc.).
 """
 
+import asyncio
 import json
 import logging
 import os
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 import core.state
-from core.deps import get_current_user, get_current_user_readonly
+from core.deps import get_current_user, get_current_user_readonly, get_current_user_readonly_no_wallet
 from core.helpers import (
     _now_utc,
     _safe_json,
@@ -23,7 +24,7 @@ from core.helpers import (
 from core.sql_allowlist import USER_COLOR_PREFERENCES_UPDATE_COLUMNS, assert_set_fragments_columns
 from core.models import ColorPreferencesUpdate, UserPreferencesUpdate
 from services.user_preferences_persist import save_user_content_preferences
-from services.workspace import require_can_edit_settings
+from services.workspace import require_can_edit_settings, resolve_billing_user_id
 from services.thumbnail_personas_list import list_thumbnail_studio_personas
 from stages.entitlements import get_entitlements_for_tier
 from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
@@ -39,39 +40,57 @@ router = APIRouter(tags=["preferences"])
 # datetime/UUID types. Workers do not need them in the job payload snapshot.
 _UPLOAD_PREF_STRIP_KEYS = UPLOAD_PREF_STRIP_KEYS
 
+_DEFAULT_PLATFORM_COLORS = {
+    "tiktok_color": "#000000",
+    "youtube_color": "#FF0000",
+    "instagram_color": "#E4405F",
+    "facebook_color": "#1877F2",
+    "accent_color": "#3B82F6",
+}
+
 
 # ============================================================
 # User Color Preferences
 # ============================================================
 @router.get("/api/colors")
-async def get_color_preferences(user: dict = Depends(get_current_user)):
-    """Get user's custom color preferences for platforms"""
-    async with core.state.db_pool.acquire() as conn:
-        prefs = await conn.fetchrow("""
-            SELECT
-                tiktok_color, youtube_color, instagram_color,
-                facebook_color, accent_color
-            FROM user_color_preferences
-            WHERE user_id = $1
-        """, user["id"])
+async def get_color_preferences(user: dict = Depends(get_current_user_readonly_no_wallet)):
+    """Get user's custom color preferences for platforms.
 
-        if not prefs:
-            # Return defaults
+    Fail-soft under pool pressure: return defaults within a short budget so
+    Settings/Queue boot never waits on a saturated DB for chip colors.
+    """
+    uid = resolve_billing_user_id(user)
+
+    async def _load():
+        async with core.state.db_pool.acquire() as conn:
+            prefs = await conn.fetchrow(
+                """
+                SELECT
+                    tiktok_color, youtube_color, instagram_color,
+                    facebook_color, accent_color
+                FROM user_color_preferences
+                WHERE user_id = $1
+                """,
+                uid,
+            )
+            if not prefs:
+                return dict(_DEFAULT_PLATFORM_COLORS)
             return {
-                "tiktok_color": "#000000",
-                "youtube_color": "#FF0000",
-                "instagram_color": "#E4405F",
-                "facebook_color": "#1877F2",
-                "accent_color": "#3B82F6"
+                "tiktok_color": prefs["tiktok_color"],
+                "youtube_color": prefs["youtube_color"],
+                "instagram_color": prefs["instagram_color"],
+                "facebook_color": prefs["facebook_color"],
+                "accent_color": prefs["accent_color"],
             }
 
-    return {
-        "tiktok_color": prefs["tiktok_color"],
-        "youtube_color": prefs["youtube_color"],
-        "instagram_color": prefs["instagram_color"],
-        "facebook_color": prefs["facebook_color"],
-        "accent_color": prefs["accent_color"]
-    }
+    try:
+        return await asyncio.wait_for(_load(), timeout=2.5)
+    except asyncio.TimeoutError:
+        logger.warning("GET /api/colors timed out (uid=%s) — returning defaults", uid)
+        return dict(_DEFAULT_PLATFORM_COLORS)
+    except Exception as e:
+        logger.warning("GET /api/colors failed (%s) — returning defaults", e)
+        return dict(_DEFAULT_PLATFORM_COLORS)
 
 @router.put("/api/colors")
 async def update_color_preferences(
@@ -80,11 +99,12 @@ async def update_color_preferences(
 ):
     """Update user's custom color preferences"""
     require_can_edit_settings(user)
+    uid = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
         # Check if preferences exist
         exists = await conn.fetchval(
             "SELECT 1 FROM user_color_preferences WHERE user_id = $1",
-            user["id"]
+            uid
         )
 
         if not exists:
@@ -92,12 +112,12 @@ async def update_color_preferences(
             await conn.execute("""
                 INSERT INTO user_color_preferences (user_id)
                 VALUES ($1)
-            """, user["id"])
+            """, uid)
 
         # Build update query
         _COLOR_COLS = USER_COLOR_PREFERENCES_UPDATE_COLUMNS
         updates = []
-        params = [user["id"]]
+        params = [uid]
         param_count = 1
 
         if colors.tiktok_color is not None:
@@ -252,6 +272,7 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("audio_transcription", "audioTranscription"),
         ("ai_service_telemetry", "aiServiceTelemetry"),
         ("ai_service_dashcam_osd", "aiServiceDashcamOSD"),
+        ("ai_service_recognition_training", "aiServiceRecognitionTraining"),
         ("ai_service_audio_signals", "aiServiceAudioSignals"),
         ("ai_service_music_detection", "aiServiceMusicDetection"),
         ("ai_service_audio_summary", "aiServiceAudioSummary"),
@@ -314,6 +335,7 @@ def _overlay_upload_ai_audio_studio_prefs(result: dict, up: dict) -> None:
         ("audioTranscription", "audio_transcription"),
         ("aiServiceTelemetry", "ai_service_telemetry"),
         ("aiServiceDashcamOSD", "ai_service_dashcam_osd"),
+        ("aiServiceRecognitionTraining", "ai_service_recognition_training"),
         ("aiServiceAudioSignals", "ai_service_audio_signals"),
         ("aiServiceMusicDetection", "ai_service_music_detection"),
         ("aiServiceAudioSummary", "ai_service_audio_summary"),
@@ -511,7 +533,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         "thumbnail_interval": prefs.get("thumbnailInterval", 5),
         "default_privacy": prefs.get("defaultPrivacy", "public"),
         "ai_hashtags_enabled": prefs.get("aiHashtagsEnabled", False),
-        "ai_hashtag_count": prefs.get("aiHashtagCount", 5),
+        "ai_hashtag_count": prefs.get("aiHashtagCount", 15),
         "ai_hashtag_style": prefs.get("aiHashtagStyle", "mixed"),
         "hashtag_position": prefs.get("hashtagPosition", "end"),
         "max_hashtags": prefs.get("maxHashtags", 30),
@@ -549,20 +571,21 @@ async def get_user_preferences(
 ):
     """GET user content preferences - used by settings page AND upload workflow"""
     try:
+        uid = resolve_billing_user_id(user)
         async with core.state.db_pool.acquire() as conn:
             try:
                 prefs = await conn.fetchrow(
                     "SELECT * FROM user_preferences WHERE user_id = $1",
-                    user["id"]
+                    uid
                 )
             except Exception:
                 prefs = None  # fall through to INSERT-on-demand
 
             if not prefs:
-                await conn.execute("INSERT INTO user_preferences (user_id) VALUES ($1)", user["id"])
+                await conn.execute("INSERT INTO user_preferences (user_id) VALUES ($1)", uid)
                 prefs = await conn.fetchrow(
                     "SELECT * FROM user_preferences WHERE user_id = $1",
-                    user["id"]
+                    uid
                 )
 
             d = dict(prefs) if prefs else {}
@@ -596,7 +619,7 @@ async def get_user_preferences(
                 "aiHashtagsEnabled": (
                     None if d.get("ai_hashtags_enabled") is None else bool(d.get("ai_hashtags_enabled"))
                 ),
-                "aiHashtagCount": str(d.get("ai_hashtag_count", 5)),
+                "aiHashtagCount": str(d.get("ai_hashtag_count", 15)),
                 "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
                 "hashtagPosition": d.get("hashtag_position", "end"),
                 "maxHashtags": str(d.get("max_hashtags", 15)),
@@ -636,6 +659,7 @@ async def get_user_preferences(
                     None if d.get("ai_service_telemetry") is None else bool(d.get("ai_service_telemetry"))
                 ),
                 "aiServiceDashcamOSD": bool(d.get("ai_service_dashcam_osd", False)),
+                "aiServiceRecognitionTraining": bool(d.get("ai_service_recognition_training", False)),
                 "defaultVehicleMakeId": d.get("default_vehicle_make_id"),
                 "defaultVehicleModelId": d.get("default_vehicle_model_id"),
                 "default_vehicle_make_id": d.get("default_vehicle_make_id"),
@@ -672,7 +696,7 @@ async def get_user_preferences(
             # Overlay users.preferences -- source of truth for hashtags + caption (PUT /api/me/preferences)
             users_prefs = None
             try:
-                users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
+                users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", uid)
             except Exception as col_err:
                 logger.debug("users.preferences SELECT failed: %s", col_err)
             up = _parse_users_preferences(users_prefs) if users_prefs else {}
@@ -694,7 +718,7 @@ async def get_user_preferences(
                 if up.get("maxHashtags") is not None or up.get("max_hashtags") is not None:
                     out["maxHashtags"] = str(up.get("maxHashtags") or up.get("max_hashtags") or 15)
                 if up.get("aiHashtagCount") is not None or up.get("ai_hashtag_count") is not None:
-                    out["aiHashtagCount"] = str(up.get("aiHashtagCount") or up.get("ai_hashtag_count") or 5)
+                    out["aiHashtagCount"] = str(up.get("aiHashtagCount") or up.get("ai_hashtag_count") or 15)
                 out["captionStyle"] = up.get("captionStyle") or up.get("caption_style") or "story"
                 out["captionTone"] = up.get("captionTone") or up.get("caption_tone") or "authentic"
                 out["captionVoice"] = up.get("captionVoice") or up.get("caption_voice") or "default"
@@ -730,7 +754,7 @@ async def get_user_preferences(
                 out.setdefault("thumbnail_render_pipeline", "auto")
             tier_row = await conn.fetchrow(
                 "SELECT subscription_tier, role, subscription_status FROM users WHERE id = $1",
-                user["id"],
+                uid,
             )
             tier_slug = str((tier_row or {}).get("subscription_tier") or "free")
             role_slug = str((tier_row or {}).get("role") or "user")
@@ -758,7 +782,7 @@ async def get_user_preferences(
             out["prefConfiguratorMeta"] = configurator_meta_for_tier(tier_slug)
             if include_personas:
                 try:
-                    plist = await list_thumbnail_studio_personas(conn, user["id"])
+                    plist = await list_thumbnail_studio_personas(conn, uid)
                     out["thumbnail_personas"] = out["thumbnailPersonas"] = plist
                 except Exception:
                     out["thumbnail_personas"] = out["thumbnailPersonas"] = []
@@ -770,7 +794,7 @@ async def get_user_preferences(
         # Return defaults so settings page loads; avoid 500 when DB schema mismatch or migration not run
         return apply_upload_baseline_defaults({
             "autoCaptions": None, "autoThumbnails": None, "thumbnailInterval": "5",
-            "defaultPrivacy": "public", "aiHashtagsEnabled": None, "aiHashtagCount": "5",
+            "defaultPrivacy": "public", "aiHashtagsEnabled": None, "aiHashtagCount": "15",
             "aiHashtagStyle": "mixed", "hashtagPosition": "end", "maxHashtags": "15",
             "alwaysHashtags": [], "blockedHashtags": [],
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
@@ -783,6 +807,7 @@ async def get_user_preferences(
             "thumbnailSelectionMode": "sharpness", "thumbnail_selection_mode": "sharpness",
             "thumbnailRenderPipeline": "none", "thumbnail_render_pipeline": "none",
             "aiServiceDashcamOSD": False, "ai_service_dashcam_osd": False,
+            "aiServiceRecognitionTraining": False, "ai_service_recognition_training": False,
             "defaultVehicleMakeId": None, "defaultVehicleModelId": None,
             "default_vehicle_make_id": None, "default_vehicle_model_id": None,
             "thumbnail_personas": [], "thumbnailPersonas": [],
@@ -826,7 +851,7 @@ async def preview_upload_preference_change(
     try:
         async with core.state.db_pool.acquire() as conn:
             tier_row = await conn.fetchrow(
-                "SELECT subscription_tier FROM users WHERE id = $1", user["id"]
+                "SELECT subscription_tier FROM users WHERE id = $1", resolve_billing_user_id(user)
             )
             if tier_row and tier_row.get("subscription_tier"):
                 tier_slug = str(tier_row["subscription_tier"])
@@ -863,11 +888,12 @@ async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
     from services.visual_entity_memory import fetch_channel_catalog_detail
 
     category = "general"
+    uid = resolve_billing_user_id(user)
     try:
         async with core.state.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT preferences FROM users WHERE id = $1::uuid",
-                user["id"],
+                uid,
             )
             if row:
                 from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
@@ -881,7 +907,7 @@ async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
 
     catalog = await fetch_channel_catalog_detail(
         core.state.db_pool,
-        user_id=str(user["id"]),
+        user_id=uid,
         category=category,
         limit_per_bucket=14,
     )

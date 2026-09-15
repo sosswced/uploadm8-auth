@@ -158,6 +158,16 @@ def main() -> None:
         default=(os.environ.get("UM8_HF_CONTENT_MODEL_REPO") or "").strip(),
         help="Hub model repo for content-success eval results. Default: UM8_HF_CONTENT_MODEL_REPO",
     )
+    p.add_argument(
+        "--av-dataset-repo",
+        default=(os.environ.get("UM8_HF_AV_DATASET_REPO") or "").strip(),
+        help="Hub dataset repo for AV-read training packs. Default: UM8_HF_AV_DATASET_REPO",
+    )
+    p.add_argument(
+        "--av-model-repo",
+        default=(os.environ.get("UM8_HF_AV_MODEL_REPO") or "").strip(),
+        help="Hub model repo for AV-read distill (shadow until promote). Default: UM8_HF_AV_MODEL_REPO",
+    )
     p.add_argument("--private", action="store_true", help="Create private repos.")
     p.add_argument(
         "--sync-trackio",
@@ -176,10 +186,13 @@ def main() -> None:
         and not args.model_repo
         and not args.content_dataset_repo
         and not args.content_model_repo
+        and not args.av_dataset_repo
+        and not args.av_model_repo
     ):
         _die(
             "Provide --dataset-repo, --trackio-space, --model-repo, --content-dataset-repo, "
-            "and/or --content-model-repo, or set the matching UM8_HF_* env vars."
+            "--content-model-repo, --av-dataset-repo, and/or --av-model-repo, "
+            "or set the matching UM8_HF_* env vars."
         )
 
     from huggingface_hub import HfApi
@@ -276,6 +289,42 @@ Evaluation metrics follow [Hugging Face eval results](https://huggingface.co/doc
             commit_message="UploadM8 ML engine: content model card scaffold",
         )
         print(f"[ok] content model repo: https://huggingface.co/{args.content_model_repo}")
+
+    if args.av_dataset_repo:
+        api.create_repo(
+            args.av_dataset_repo, repo_type="dataset", private=args.private, exist_ok=True
+        )
+        print(f"[ok] AV dataset repo: https://huggingface.co/datasets/{args.av_dataset_repo}")
+
+    if args.av_model_repo:
+        ensure_model_repo(args.av_model_repo, private=args.private)
+        av_readme = f"""---
+license: mit
+tags:
+- uploadm8
+- av-read
+- sense-align
+- tabular
+datasets:
+- {args.av_dataset_repo or 'your-org/uploadm8-av-read-v1'}
+---
+
+# UploadM8 AV-read Distill (shadow)
+
+Teacher-labeled sense+align student from opt-in AV training packs.
+Default publish policy: ``trained_not_published`` until floors + ``UM8_AV_READ_HUB_PROMOTE``.
+Identity + M8 grounding remain the judge — this model must not bypass them.
+
+Local artifact: ``data/ml/av_read_distill_model.joblib``.
+"""
+        api.upload_file(
+            path_or_fileobj=av_readme.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=args.av_model_repo,
+            repo_type="model",
+            commit_message="UploadM8 ML engine: AV-read model card scaffold",
+        )
+        print(f"[ok] AV model repo: https://huggingface.co/{args.av_model_repo}")
 
     if args.trackio_space:
         api.create_repo(

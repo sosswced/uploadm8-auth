@@ -25,7 +25,7 @@ class UserPreferencesUpdate(BaseModel):
     default_privacy: Literal["public", "private", "unlisted"] = Field("public", alias="defaultPrivacy")
 
     ai_hashtags_enabled: bool = Field(False, alias="aiHashtagsEnabled")
-    ai_hashtag_count: int = Field(5, ge=1, le=30, alias="aiHashtagCount")
+    ai_hashtag_count: int = Field(15, ge=1, le=30, alias="aiHashtagCount")
     ai_hashtag_style: Literal["lowercase", "capitalized", "camelcase", "mixed"] = Field("mixed", alias="aiHashtagStyle")
     hashtag_position: Literal["start", "end", "caption", "comment"] = Field("end", alias="hashtagPosition")
 
@@ -64,6 +64,7 @@ class UserPreferencesUpdate(BaseModel):
     ai_service_speech_to_text: bool = Field(False, alias="aiServiceSpeechToText")
     ai_service_video_analyzer: bool = Field(False, alias="aiServiceVideoAnalyzer")
     ai_service_scene_understanding: bool = Field(False, alias="aiServiceSceneUnderstanding")
+    ai_service_recognition_training: bool = Field(False, alias="aiServiceRecognitionTraining")
     thumbnail_studio_enabled: bool = Field(False, alias="thumbnailStudioEnabled")
     thumbnail_studio_engine_enabled: bool = Field(False, alias="thumbnailStudioEngineEnabled")
     thumbnail_persona_enabled: bool = Field(False, alias="thumbnailPersonaEnabled")
@@ -92,6 +93,8 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    # Meta-like: true → ~30d stay signed in; false → short café/shared-machine session (~1d).
+    remember: bool = True
 
 class RefreshRequest(BaseModel):
     """Optional when the browser sends the HttpOnly refresh cookie (see POST /api/auth/refresh)."""
@@ -315,6 +318,10 @@ class UploadUpdate(BaseModel):
     caption: Optional[str] = None
     hashtags: Optional[List[str]] = None
     scheduled_time: Optional[datetime] = None
+    schedule_mode: Optional[str] = Field(
+        None,
+        description="immediate | scheduled | smart — use immediate for Publish Now",
+    )
     smart_schedule: Optional[Dict[str, str]] = Field(None, description="Platform -> ISO datetime string")
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
     vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")

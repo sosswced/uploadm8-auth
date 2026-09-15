@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import asyncpg
 import httpx
@@ -265,20 +265,23 @@ async def verify_youtube(video_id: str, token_data: dict) -> str:
         return "unknown"
 
 
-async def verify_meta_media(platform: str, media_id: str, token_data: dict) -> str:
+async def verify_meta_media(
+    platform: str, media_id: str, token_data: dict
+) -> Tuple[str, Optional[str]]:
     """
     Confirm Instagram media / Facebook Page video exists via Graph GET.
 
-    Returns: 'confirmed', 'rejected', 'pending', or 'unknown'.
+    Returns: (status, platform_url) where status is
+    'confirmed', 'rejected', 'pending', or 'unknown'.
     """
     access_token = (token_data or {}).get("access_token")
     mid = str(media_id or "").strip()
     if not access_token or not mid:
-        return "unknown"
+        return "unknown", None
 
     from services.meta_oauth import META_GRAPH_API_VERSION
 
-    fields = "id,permalink" if platform == "instagram" else "id,status,permalink_url"
+    fields = "id,permalink,shortcode" if platform == "instagram" else "id,status,permalink_url"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -286,24 +289,29 @@ async def verify_meta_media(platform: str, media_id: str, token_data: dict) -> s
                 params={"fields": fields, "access_token": access_token},
             )
             if resp.status_code in (401, 403):
-                return "pending"
+                return "pending", None
             if resp.status_code == 404:
-                return "rejected"
+                return "rejected", None
             if resp.status_code != 200:
-                return "unknown"
+                return "unknown", None
             data = resp.json() if resp.content else {}
             if not isinstance(data, dict) or not data.get("id"):
-                return "unknown"
+                return "unknown", None
+            url = str(data.get("permalink") or data.get("permalink_url") or "").strip() or None
+            if not url and platform == "instagram":
+                sc = str(data.get("shortcode") or "").strip()
+                if sc:
+                    url = f"https://www.instagram.com/reel/{sc}/"
             # Facebook video processing status when present
             st = str(data.get("status") or "").strip().lower()
             if st in ("error", "failed", "deleted"):
-                return "rejected"
+                return "rejected", url
             if st in ("processing", "uploading", "encoding"):
-                return "pending"
-            return "confirmed"
+                return "pending", url
+            return "confirmed", url
     except Exception as e:
         logger.debug("Meta verify failed (%s): %s", platform, e)
-        return "unknown"
+        return "unknown", None
 
 
 async def verify_single_attempt(
@@ -359,13 +367,16 @@ async def verify_single_attempt(
     # Platform-specific verification
     raw_status = "unknown"
     tiktok_video_id: Optional[str] = None
+    meta_platform_url: Optional[str] = None
 
     if plat == "tiktok" and publish_id:
         raw_status, tiktok_video_id = await verify_tiktok(publish_id, token_data)
     elif plat == "youtube" and platform_post_id:
         raw_status = await verify_youtube(platform_post_id, token_data)
     elif plat in ("instagram", "facebook") and platform_post_id:
-        raw_status = await verify_meta_media(plat, str(platform_post_id), token_data)
+        raw_status, meta_platform_url = await verify_meta_media(
+            plat, str(platform_post_id), token_data
+        )
         # If Graph cannot confirm yet but we have an accept-time id, keep pending
         # briefly; after soft failures still accept-on-id so UI does not stick.
         if raw_status in ("unknown",) and platform_post_id:
@@ -404,7 +415,11 @@ async def verify_single_attempt(
             db_pool,
             attempt_id,
             verify_status,
-            platform_url=tiktok_post_url if plat == "tiktok" and tiktok_video_id else None,
+            platform_url=(
+                tiktok_post_url
+                if plat == "tiktok" and tiktok_video_id
+                else (meta_platform_url if plat in ("instagram", "facebook") else None)
+            ),
             platform_post_id=(
                 str(tiktok_video_id).strip()
                 if plat == "tiktok" and tiktok_video_id
@@ -479,6 +494,60 @@ async def verify_single_attempt(
                                 )
             except Exception as e:
                 logger.warning(f"Could not save TikTok video_id to platform_results: {e}")
+
+    if (
+        plat in ("instagram", "facebook")
+        and verify_status == "confirmed"
+        and meta_platform_url
+        and platform_post_id
+    ):
+        upload_id = str(attempt.get("upload_id", ""))
+        if upload_id:
+            try:
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT platform_results FROM uploads WHERE id = $1", upload_id
+                    )
+                    if row:
+                        pr = row["platform_results"]
+                        pr_list = pr
+                        for _ in range(4):
+                            if isinstance(pr_list, str):
+                                try:
+                                    pr_list = json.loads(pr_list)
+                                except Exception:
+                                    pr_list = []
+                                    break
+                            else:
+                                break
+                        if isinstance(pr_list, list):
+                            mid = str(platform_post_id).strip()
+                            updated = False
+                            for item in pr_list:
+                                if not isinstance(item, dict):
+                                    continue
+                                if str(item.get("platform") or "").lower() != plat:
+                                    continue
+                                cur = str(
+                                    item.get("platform_video_id")
+                                    or item.get("video_id")
+                                    or item.get("media_id")
+                                    or ""
+                                ).strip()
+                                if cur and cur != mid:
+                                    continue
+                                item["platform_url"] = meta_platform_url
+                                item["url"] = meta_platform_url
+                                item["verify_status"] = "confirmed"
+                                updated = True
+                            if updated:
+                                await conn.execute(
+                                    "UPDATE uploads SET platform_results = $1::jsonb, updated_at = NOW() WHERE id = $2",
+                                    db_stage._jsonb_bind(pr_list),
+                                    upload_id,
+                                )
+            except Exception as e:
+                logger.warning("Could not save Meta permalink to platform_results: %s", e)
 
     if (
         db_pool

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from core.content_attribution import (
+    packaging_identity_key,
     parse_content_attribution_key,
     preferences_patch_from_parsed_attribution,
 )
@@ -107,7 +108,7 @@ def _aggregate_factor_performance_from_rows(
             a["ci"] = max(a["ci"], ci)
 
     out: Dict[str, Any] = {
-        "lookback_days": int(max(30, min(int(lookback_days or 120), 730))),
+        "lookback_days": int(max(7, min(int(lookback_days or 120), 730))),
         "platform": platform,
         "total_samples": total_samples,
     }
@@ -153,7 +154,7 @@ async def fetch_factor_performance(
     platform: str = "all",
 ) -> Dict[str, Any]:
     """Sample-weighted engagement per individual caption factor value."""
-    lookback = max(30, min(int(lookback_days or 120), 730))
+    lookback = max(7, min(int(lookback_days or 120), 730))
     plat = (platform or "all").lower().strip()
     rows = await conn.fetch(
         """
@@ -249,7 +250,7 @@ async def fetch_meta_setups_by_platform(
     min_samples_per_value: int = 3,
 ) -> Dict[str, Any]:
     """Synthesized caption meta setup per platform (style + tone + voice winners)."""
-    lookback = max(30, min(int(lookback_days or 120), 730))
+    lookback = max(7, min(int(lookback_days or 120), 730))
     min_platform_total_samples = max(4, min(int(min_platform_total_samples or 8), 500))
     plat_rows = await conn.fetch(
         """
@@ -290,7 +291,90 @@ async def fetch_meta_setups_by_platform(
     return {"lookback_days": lookback, "platforms": platforms}
 
 
+def _coalesce_ranked_strategies(rows: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Merge fragmented strategy_keys that share the same user-facing packaging.
+
+    Historical keys often forked on identity tags, CTR scores, or M8 effective
+    remaps while displaying identical style/tone/voice summaries — coalescing
+    lets Surprise-mix diversity surface as distinct packaging rows.
+    """
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for r in rows or []:
+        sk = str(r["strategy_key"] or "")
+        if not _is_user_recommendable_strategy_key(sk):
+            continue
+        parsed = parse_content_attribution_key(sk)
+        identity = packaging_identity_key(sk)
+        if not identity:
+            continue
+        samples = int(r["samples"] or 0)
+        eng = _finite(r["weighted_mean_engagement"])
+        views = _finite(r["weighted_mean_views"])
+        ci = _finite(r["max_ci95_high"])
+        b = buckets.get(identity)
+        if b is None:
+            buckets[identity] = {
+                "strategy_key": sk,
+                "samples": samples,
+                "eng_weight": eng * samples,
+                "view_weight": views * samples,
+                "ci95_high_pct": ci,
+                "summary": _human_strategy_summary(sk),
+                "parsed": parsed,
+                "packaging_identity": identity,
+                "fragment_keys": 1,
+                "_rep_samples": samples,
+            }
+            continue
+        b["samples"] += samples
+        b["eng_weight"] += eng * samples
+        b["view_weight"] += views * samples
+        b["ci95_high_pct"] = max(b["ci95_high_pct"], ci)
+        b["fragment_keys"] += 1
+        # Prefer the fragment with the most samples as the representative key.
+        if samples > int(b.get("_rep_samples") or 0):
+            b["strategy_key"] = sk
+            b["parsed"] = parsed
+            b["summary"] = _human_strategy_summary(sk)
+            b["_rep_samples"] = samples
+
+    out: List[Dict[str, Any]] = []
+    for b in buckets.values():
+        samples = int(b["samples"] or 0)
+        if samples < 3:
+            continue
+        b.pop("_rep_samples", None)
+        out.append(
+            {
+                "strategy_key": b["strategy_key"],
+                "samples": samples,
+                "weighted_mean_engagement_pct": round(
+                    (b["eng_weight"] / samples) if samples > 0 else 0.0, 4
+                ),
+                "ci95_high_pct": round(b["ci95_high_pct"], 4),
+                "weighted_mean_views": round(
+                    (b["view_weight"] / samples) if samples > 0 else 0.0, 1
+                ),
+                "summary": b["summary"],
+                "parsed": b["parsed"],
+                "packaging_identity": b["packaging_identity"],
+                "fragment_keys": int(b["fragment_keys"]),
+            }
+        )
+    out.sort(
+        key=lambda x: (
+            -x["weighted_mean_engagement_pct"],
+            -x["samples"],
+            x.get("summary") or "",
+        )
+    )
+    return out[:20]
+
+
 async def fetch_ranked_strategies(conn, user_id: uuid.UUID, lookback_days: int = 120) -> List[Dict[str, Any]]:
+    # Pull a wider raw set so coalescing by packaging identity can merge fragments
+    # that individually sat under the old per-key sample floor.
     rows = await conn.fetch(
         """
         SELECT strategy_key,
@@ -306,31 +390,14 @@ async def fetch_ranked_strategies(conn, user_id: uuid.UUID, lookback_days: int =
            AND strategy_key LIKE 'v1|%'
            AND platform = 'all'
          GROUP BY strategy_key
-        HAVING SUM(samples) >= 3
+        HAVING SUM(samples) >= 1
          ORDER BY weighted_mean_engagement DESC NULLS LAST
-         LIMIT 20
+         LIMIT 80
         """,
         user_id,
-        max(30, min(int(lookback_days or 120), 730)),
+        max(7, min(int(lookback_days or 120), 730)),
     )
-    out: List[Dict[str, Any]] = []
-    for r in rows or []:
-        sk = str(r["strategy_key"] or "")
-        if not _is_user_recommendable_strategy_key(sk):
-            continue
-        parsed = parse_content_attribution_key(sk)
-        out.append(
-            {
-                "strategy_key": sk,
-                "samples": int(r["samples"] or 0),
-                "weighted_mean_engagement_pct": _finite(r["weighted_mean_engagement"]),
-                "ci95_high_pct": _finite(r["max_ci95_high"]),
-                "weighted_mean_views": _finite(r["weighted_mean_views"]),
-                "summary": _human_strategy_summary(sk),
-                "parsed": parsed,
-            }
-        )
-    return out
+    return _coalesce_ranked_strategies(list(rows or []))
 
 
 async def fetch_engagement_anomaly(conn, user_id: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -462,7 +529,7 @@ async def fetch_hashtag_traction(
     Per-hashtag aggregates: how often each tag appears on completed uploads and
     mean engagement rate (likes+comments+shares)/views when views > 0.
     """
-    lookback_days = max(14, min(int(lookback_days or 120), 730))
+    lookback_days = max(7, min(int(lookback_days or 120), 730))
     min_uploads_per_tag = max(2, min(int(min_uploads_per_tag or 2), 20))
     # Cap rows for /api/me/coach (UPLOADM8-5S) — hashtag aggregation does not need
     # unbounded history; newest first uses idx_uploads_user_status_created_completed.
@@ -561,13 +628,19 @@ async def fetch_hashtag_traction(
     }
 
 
-async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
+async def build_user_content_insights(
+    conn,
+    user_id,
+    lookback_days: int = 120,
+) -> Dict[str, Any]:
+    lookback = max(7, min(int(lookback_days or 120), 730))
     try:
         uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
     except (ValueError, TypeError):
         return {
             "ok": False,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "lookback_days": lookback,
             "ranked_strategies": [],
             "factor_performance": {},
             "meta_setup": None,
@@ -580,7 +653,7 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
 
     ranked: List[Dict[str, Any]] = []
     try:
-        ranked = await fetch_ranked_strategies(conn, uid, 120)
+        ranked = await fetch_ranked_strategies(conn, uid, lookback)
     except Exception as e:
         logger.warning("fetch_ranked_strategies: %s", e)
 
@@ -592,13 +665,13 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
 
     hashtag_traction: Optional[Dict[str, Any]] = None
     try:
-        hashtag_traction = await fetch_hashtag_traction(conn, uid, lookback_days=120)
+        hashtag_traction = await fetch_hashtag_traction(conn, uid, lookback_days=lookback)
     except Exception as e:
         logger.warning("fetch_hashtag_traction: %s", e)
 
     factor_performance: Dict[str, Any] = {}
     try:
-        factor_performance = await fetch_factor_performance(conn, uid, lookback_days=120)
+        factor_performance = await fetch_factor_performance(conn, uid, lookback_days=lookback)
     except Exception as e:
         logger.warning("fetch_factor_performance: %s", e)
 
@@ -610,7 +683,7 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
 
     meta_setup_by_platform: Dict[str, Any] = {"lookback_days": 0, "platforms": {}}
     try:
-        meta_setup_by_platform = await fetch_meta_setups_by_platform(conn, uid, lookback_days=120)
+        meta_setup_by_platform = await fetch_meta_setups_by_platform(conn, uid, lookback_days=lookback)
     except Exception as e:
         logger.warning("fetch_meta_setups_by_platform: %s", e)
 
@@ -623,7 +696,7 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
             "source": "exact_combo",
             "summary": top["summary"],
             "confidence_note": (
-                f"Based on {top['samples']} scored day-buckets in the last ~120 days "
+                f"Based on {top['samples']} scored day-buckets in the last ~{lookback} days "
                 f"(mean engagement ~{top['weighted_mean_engagement_pct']:.2f}% vs views)."
             ),
             "preferences_patch": preferences_patch_from_parsed_attribution(top.get("parsed") or {}),
@@ -744,9 +817,42 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
             "suggested_hashtags_for_traction": suggested_hashtags,
         }
 
+    # P5: style/persona recommend-only. Never fake pack_present — only claim pack×
+    # when the user has pack meta in recent insights path (not inferred from style ranks).
+    av_style_persona = {
+        "status": "recommend_only",
+        "requires_confirm": True,
+        "silent_write": False,
+        "items": [],
+    }
+    try:
+        from services.av_read_soft_bias import style_persona_recommend_from_flags
+
+        top_style = None
+        style_node = (factor_performance or {}).get("caption_style") or {}
+        ranked_styles = style_node.get("ranked") or []
+        if ranked_styles:
+            top_style = ranked_styles[0].get("value")
+        top_persona = None
+        if recommended and isinstance(recommended.get("preferences_patch"), dict):
+            top_persona = recommended["preferences_patch"].get("thumbnailDefaultPersonaId")
+        # pack_present stays 0 here: insights do not scan R2 packs; avoid false "pack×" claims.
+        av_style_persona = style_persona_recommend_from_flags(
+            {"pack_present": 0, "pack_needs_deep_teacher": 0},
+            top_caption_style=str(top_style) if top_style else None,
+            top_persona_id=str(top_persona) if top_persona else None,
+        )
+        if av_style_persona.get("items"):
+            narrative_parts.append(
+                "Style/persona tips are recommend-only — confirm in Apply optimized settings before any pref write."
+            )
+    except Exception as e:
+        logger.debug("av style/persona recommend skipped: %s", e)
+
     return {
         "ok": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "lookback_days": lookback,
         "ranked_strategies": ranked,
         "factor_performance": factor_performance,
         "meta_setup": meta_setup_synth,
@@ -754,6 +860,7 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
         "hashtag_traction": hashtag_traction,
         "anomaly": anomaly,
         "recommended": recommended,
+        "av_style_persona_recommend": av_style_persona,
         "narrative": " ".join(n for n in narrative_parts if n).strip(),
     }
 
@@ -806,7 +913,13 @@ def merge_preferences_patch_for_apply(
     patch = recommended.get("preferences_patch") if isinstance(recommended, dict) else None
     if not patch:
         raise ValueError("No recommendation available to apply")
-    return dict(patch)
+    out = dict(patch)
+    # P5 risk: never inject AV recommend-only persona/style outside confirm apply path.
+    # Callers must already have confirm=true; still drop empty persona to avoid surprise writes.
+    pid = out.get("thumbnailDefaultPersonaId")
+    if pid is not None and str(pid).strip() == "":
+        out.pop("thumbnailDefaultPersonaId", None)
+    return out
 
 
 PREF_FIELD_LABELS: Dict[str, str] = {

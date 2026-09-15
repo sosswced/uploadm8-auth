@@ -11,19 +11,33 @@ from typing import Any, Dict, Optional
 async def funnel_conversion_summary(
     pool,
     *,
-    lookback_days: int = 30,
+    lookback_days: Optional[int] = None,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """presign_ok → r2_complete → worker_started → terminal success rate."""
-    since = datetime.now(timezone.utc) - timedelta(days=max(1, int(lookback_days)))
+    """presign_ok → r2_complete → worker_started → terminal success rate.
+
+    Prefer absolute ``since``/``until`` (half-open). ``lookback_days`` remains for
+    callers that only pass a day count (trailing from now).
+    """
+    if since is not None and until is not None:
+        win_since = since
+        win_until = until
+    else:
+        days = max(1, int(lookback_days or 30))
+        win_until = datetime.now(timezone.utc)
+        win_since = win_until - timedelta(days=days)
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT event, COUNT(DISTINCT upload_id)::bigint AS uploads
             FROM upload_funnel_events
-            WHERE ts >= $1
+            WHERE ts >= $1 AND ts < $2
             GROUP BY event
             """,
-            since,
+            win_since,
+            win_until,
         )
         terminals = await conn.fetchrow(
             """
@@ -36,9 +50,10 @@ async def funnel_conversion_summary(
                 WHERE event LIKE 'terminal_%'
               )::bigint AS terminal_any
             FROM upload_funnel_events
-            WHERE ts >= $1
+            WHERE ts >= $1 AND ts < $2
             """,
-            since,
+            win_since,
+            win_until,
         )
     counts = {str(r["event"]): int(r["uploads"] or 0) for r in rows}
     presign = counts.get("presign_ok", 0)
@@ -46,8 +61,11 @@ async def funnel_conversion_summary(
     started = counts.get("worker_started", 0)
     term_ok = int((terminals or {}).get("terminal_ok") or 0)
     term_any = int((terminals or {}).get("terminal_any") or 0)
+    span_days = max(1, int(round((win_until - win_since).total_seconds() / 86400.0)))
     return {
-        "lookback_days": lookback_days,
+        "lookback_days": span_days,
+        "window_start_utc": win_since.isoformat(),
+        "window_end_exclusive_utc": win_until.isoformat(),
         "presign_ok": presign,
         "r2_complete": complete,
         "worker_started": started,

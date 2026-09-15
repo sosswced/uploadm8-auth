@@ -182,10 +182,14 @@ def pick_destination(
     Auto-resolve a destination when possible.
 
     Returns (destination_or_None, reason) where reason is:
-      'none' | 'auto_single' | 'auto_reconnect' | 'need_pick'
+      'none' | 'auto_single' | 'auto_reconnect' | 'need_pick' | 'reconnect_mismatch'
+
+    Reconnect with an expected provider id must fail closed when that destination
+    is missing from the current Facebook session (cookie spill / wrong login).
+    Never fall through to a picker of a different user's Pages.
     """
     if not destinations:
-        return None, "none"
+        return None, "reconnect_mismatch" if str(expected_provider_id or "").strip() else "none"
     want = str(expected_provider_id or "").strip()
     if want:
         for d in destinations:
@@ -195,10 +199,17 @@ def pick_destination(
                 return d, "auto_reconnect"
             if str(d.get("ig_user_id") or "") == want:
                 return d, "auto_reconnect"
-        return None, "need_pick"
+        return None, "reconnect_mismatch"
     if len(destinations) == 1:
         return destinations[0], "auto_single"
     return None, "need_pick"
+
+
+RECONNECT_WRONG_ACCOUNT_MSG = (
+    "You signed into a different account than the one you are reconnecting. "
+    "Sign out of that platform in the browser (or use another profile), then "
+    "reconnect and choose the same account."
+)
 
 
 def meta_pick_html(
@@ -263,6 +274,44 @@ def meta_pick_html(
 """
 
 
+def meta_oauth_error_html(*, platform: str, post_target: str, error_msg: str) -> str:
+    """Popup HTML that posts oauth_error to the parent and closes."""
+    payload = {
+        "type": "oauth_error",
+        "platform": str(platform or ""),
+        "error": str(error_msg or "Unknown error")[:200],
+    }
+    payload_js = json.dumps(payload)
+    target_js = json.dumps(post_target)
+    safe_text = _esc(error_msg)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"/><title>Reconnect failed</title></head>
+<body style="font-family:system-ui,sans-serif;margin:0;min-height:100vh;background:#0a0a0f;color:#fff;
+             display:flex;align-items:center;justify-content:center;padding:24px;">
+  <div style="max-width:420px;text-align:center;">
+    <p style="font-weight:600;margin:0 0 8px;">Connection failed</p>
+    <p style="color:#9ca3af;font-size:0.9rem;margin:0 0 16px;">{safe_text}</p>
+    <p style="color:#6b7280;font-size:0.75rem;">This window will close automatically…</p>
+  </div>
+  <script>
+    (function () {{
+      var payload = {payload_js};
+      var target = {target_js};
+      try {{ payload.ts = Date.now(); }} catch (e) {{}}
+      try {{
+        if (window.opener && !window.opener.closed) {{
+          window.opener.postMessage(payload, target);
+        }}
+      }} catch (e) {{}}
+      try {{ window.close(); }} catch (e) {{}}
+    }})();
+  </script>
+</body>
+</html>
+"""
+
+
 async def resolve_or_pick_destination(
     *,
     platform: str,
@@ -283,6 +332,14 @@ async def resolve_or_pick_destination(
     chosen, reason = pick_destination(
         destinations, expected_provider_id=expected_provider_id
     )
+    if reason == "reconnect_mismatch":
+        return None, HTMLResponse(
+            meta_oauth_error_html(
+                platform=platform,
+                post_target=post_target,
+                error_msg=RECONNECT_WRONG_ACCOUNT_MSG,
+            )
+        )
     if reason == "need_pick":
         pick_token = await store_meta_pick_pending(
             {

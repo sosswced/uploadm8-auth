@@ -37,6 +37,9 @@ UPLOADS_METADATA_PATCH_COLUMNS: frozenset[str] = frozenset(
         "title",
         "caption",
         "hashtags",
+        "ai_generated_title",
+        "ai_generated_caption",
+        "ai_generated_hashtags",
         "scheduled_time",
         "schedule_metadata",
         "schedule_mode",
@@ -45,6 +48,7 @@ UPLOADS_METADATA_PATCH_COLUMNS: frozenset[str] = frozenset(
         "vehicle_model_id",
         "user_preferences",
         "platforms",
+        "output_artifacts",
     }
 )
 UPLOADS_COMPLETE_BODY_COLUMNS: frozenset[str] = frozenset(

@@ -48,6 +48,26 @@ def get_active_price_by_lookup(stripe_client, lookup_key: str):
     return prices.data[0]
 
 
+def topup_checkout_metadata(
+    user_id: str,
+    lookup_key: str,
+    product: Dict[str, Any],
+) -> Dict[str, str]:
+    """Checkout session metadata so webhooks can grant without guessing amounts."""
+    wallet = str(product.get("wallet") or "put")
+    meta = {
+        "user_id": str(user_id),
+        "lookup_key": str(lookup_key),
+        "wallet": wallet,
+        "amount": str(product.get("amount", 0)),
+        "kind": "topup",
+    }
+    if wallet == "bundle":
+        meta["put"] = str(int(product.get("put") or 0))
+        meta["aic"] = str(int(product.get("aic") or 0))
+    return meta
+
+
 def create_wallet_topup_checkout_session(
     stripe_client,
     customer_id: str,
@@ -67,13 +87,7 @@ def create_wallet_topup_checkout_session(
         mode="payment",
         success_url=success_url,
         cancel_url=cancel_url,
-        metadata={
-            "user_id": str(user_id),
-            "lookup_key": lookup_key,
-            "wallet": product["wallet"],
-            "amount": str(product.get("amount", 0)),
-            "kind": "topup",
-        },
+        metadata=topup_checkout_metadata(user_id, lookup_key, product),
     )
 
 
@@ -123,11 +137,5 @@ def create_billing_checkout_session(
         mode="payment",
         success_url=success_url,
         cancel_url=cancel_url,
-        metadata={
-            "user_id": str(user_id),
-            "wallet": product.get("wallet", "put"),
-            "amount": str(product.get("amount", 0)),
-            "kind": "topup",
-            "lookup_key": lookup_key,
-        },
+        metadata=topup_checkout_metadata(user_id, lookup_key, product),
     )

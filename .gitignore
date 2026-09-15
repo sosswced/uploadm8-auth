@@ -2,8 +2,17 @@
 .env
 .env.*
 !.env.example
+uploadm8-auth.env
+*.pem
+*.key
+*-credentials.json
+*service-account*.json
+gcp-key*.json
+credentials.json
 frontend/js/official-brand-secrets.local.js
 **/official-brand-secrets.local.js
+frontend/js/conversion-pixels.local.js
+**/conversion-pixels.local.js
 
 # Assisted brand social signup (OTP + screenshots + stop/go flags)
 scripts/agent/.brand_otp
@@ -47,3 +56,7 @@ build/
 Thumbs.db
 *.swp
 *.swo
+
+# Local 4K hero master (web serves compressed hero-demo.mp4)
+frontend/videos/hero-demo-4k.mp4
+frontend/videos/_preview/

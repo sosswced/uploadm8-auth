@@ -11,7 +11,7 @@ from fastapi.responses import RedirectResponse, Response
 import core.state
 from core.audit import log_system_event
 from core.config import R2_BUCKET_NAME
-from core.deps import get_current_user, get_current_user_readonly, get_verified_user_id
+from core.deps import get_current_user, get_current_user_readonly
 from core.models import UploadMassEditBody, UploadUpdate
 from core.r2 import (
     _normalize_r2_key,
@@ -31,6 +31,7 @@ from services.uploads_handlers import (
     repair_upload_thumbnails_batch,
     stream_upload_thumbnail_bytes,
 )
+from services.workspace import resolve_billing_user_id
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -98,7 +99,7 @@ async def get_uploads(
 @router.get("/queue-stats")
 async def get_uploads_queue_stats(user: dict = Depends(get_current_user)):
     """Queue summary counts for queue.html and dashboard.html."""
-    return await fetch_upload_queue_stats(core.state.db_pool, str(user["id"]))
+    return await fetch_upload_queue_stats(core.state.db_pool, resolve_billing_user_id(user))
 
 
 @router.get("/{upload_id}/thumbnail")
@@ -163,6 +164,7 @@ async def generate_thumbnail_for_upload(
     before publish (Instagram ``cover_url`` is create-time only — do this while scheduled).
     """
     async with core.state.db_pool.acquire() as conn:
+        bill_id = resolve_billing_user_id(user)
         row = await conn.fetchrow(
             """
             SELECT u.id, u.r2_key, u.processed_r2_key, u.thumbnail_r2_key, u.status, u.platforms,
@@ -176,7 +178,7 @@ async def generate_thumbnail_for_upload(
             WHERE u.id = $1 AND u.user_id = $2
             """,
             upload_id,
-            user["id"],
+            bill_id,
         )
     if not row:
         raise HTTPException(404, "Upload not found")
@@ -225,7 +227,7 @@ async def generate_thumbnail_for_upload(
         out = await regenerate_upload_thumbnail(
             db_pool=core.state.db_pool,
             upload_id=upload_id,
-            user_id=str(user["id"]),
+            user_id=resolve_billing_user_id(user),
             upload_row=upload_dict,
             user_row=user_dict,
             force=effective_force,
@@ -255,10 +257,11 @@ async def generate_thumbnail_for_upload(
 async def presign_thumbnail_upload(upload_id: str, user: dict = Depends(get_current_user)):
     """Get a presigned URL for uploading a custom thumbnail."""
     async with core.state.db_pool.acquire() as conn:
+        bill_id = resolve_billing_user_id(user)
         row = await conn.fetchrow(
             "SELECT id, status FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
-            user["id"],
+            bill_id,
         )
     if not row:
         raise HTTPException(404, "Upload not found")
@@ -266,26 +269,27 @@ async def presign_thumbnail_upload(upload_id: str, user: dict = Depends(get_curr
     if row["status"] not in editable:
         raise HTTPException(400, "Cannot change thumbnail after upload is processing or published")
 
-    thumb_r2_key = f"thumbnails/{user['id']}/{upload_id}/custom.jpg"
+    thumb_r2_key = f"thumbnails/{bill_id}/{upload_id}/custom.jpg"
     presigned_url = generate_presigned_upload_url(thumb_r2_key, "image/jpeg")
     return {"presigned_url": presigned_url, "r2_key": thumb_r2_key}
 
 
 @router.get("/{upload_id}")
-async def get_upload_details(upload_id: str, user_id: str = Depends(get_verified_user_id)):
-    """Upload detail for current user.
+async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user_readonly)):
+    """Upload detail for current user (workspace billing owner).
 
     Best-effort TikTok Step B on read so dashboard/queue Check and poll can
     stamp ``platform_video_id`` / watch URLs without waiting for the worker tick.
     """
+    uid = resolve_billing_user_id(user)
     if core.state.db_pool is not None:
         try:
             from stages.verify_stage import maybe_stamp_tiktok_confirmation
 
-            await maybe_stamp_tiktok_confirmation(core.state.db_pool, upload_id, user_id)
+            await maybe_stamp_tiktok_confirmation(core.state.db_pool, upload_id, uid)
         except Exception as e:
             logger.debug("tiktok confirmation stamp on detail read: %s", e)
-    return await fetch_upload_detail(core.state.db_pool, upload_id, user_id)
+    return await fetch_upload_detail(core.state.db_pool, upload_id, uid)
 
 
 @router.post("/{upload_id}/ask")
@@ -328,7 +332,7 @@ async def mass_edit_uploads_route(
 ):
     """Bulk-update title/caption/schedule/platforms/writing mix on pending uploads."""
     async with core.state.db_pool.acquire() as conn:
-        return await mass_edit_uploads(conn, user["id"], body)
+        return await mass_edit_uploads(conn, resolve_billing_user_id(user), body)
 
 
 @router.patch("/{upload_id}")
@@ -339,23 +343,39 @@ async def update_upload(
 ):
     """Update upload metadata: title, caption, schedule, platforms, writing mix."""
     async with core.state.db_pool.acquire() as conn:
-        applied = await update_upload_metadata(conn, upload_id, user["id"], update_data)
+        applied = await update_upload_metadata(conn, upload_id, resolve_billing_user_id(user), update_data)
     return {"status": "updated", "id": upload_id, "applied": applied}
 
 
 @router.delete("/{upload_id}")
 async def delete_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
+    bill_id = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT put_reserved, aic_reserved, status, title, platforms FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
-            user["id"],
+            bill_id,
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
-        if upload["status"] in ("pending", "queued"):
-            await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
-        await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
+        status = (upload["status"] or "").lower()
+        # Only pre-worker / already-terminal statuses may hard-delete (protects publish_attempts).
+        deletable = ("pending", "queued", "cancelled", "failed")
+        if status not in deletable:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "upload_not_deletable",
+                    "message": (
+                        f"Cannot delete an upload while status is '{status}'. "
+                        "Cancel first if the job is still running, then delete."
+                    ),
+                    "status": status,
+                },
+            )
+        if status in ("pending", "queued"):
+            await refund_tokens(conn, bill_id, upload["put_reserved"], upload["aic_reserved"], upload_id)
+        await conn.execute("DELETE FROM uploads WHERE id = $1 AND user_id = $2", upload_id, bill_id)
         await log_system_event(
             conn,
             user_id=str(user["id"]),

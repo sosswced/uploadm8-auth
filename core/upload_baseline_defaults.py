@@ -68,8 +68,8 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "defaultPrivacy": "public",
     "ai_hashtags_enabled": False,
     "aiHashtagsEnabled": False,
-    "ai_hashtag_count": 5,
-    "aiHashtagCount": "5",
+    "ai_hashtag_count": 15,
+    "aiHashtagCount": "15",
     "ai_hashtag_style": "mixed",
     "aiHashtagStyle": "mixed",
     "hashtag_position": "end",
@@ -155,6 +155,8 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "aiServiceFrameInspector": False,
     "ai_service_video_analyzer": False,
     "aiServiceVideoAnalyzer": False,
+    "ai_service_recognition_training": False,
+    "aiServiceRecognitionTraining": False,
 }
 
 # Free / entry + trialing: all AI/feature masters off when unset.
@@ -199,6 +201,8 @@ FREE_TIER_PROCESSING_DEFAULTS: Dict[str, Any] = {
     "aiServiceFrameInspector": False,
     "ai_service_video_analyzer": False,
     "aiServiceVideoAnalyzer": False,
+    "ai_service_recognition_training": False,
+    "aiServiceRecognitionTraining": False,
     "tiktok_burn_styled_cover": False,
     "tiktokBurnStyledCover": False,
     "trill_enabled": False,
@@ -241,6 +245,8 @@ PAID_UPLOAD_BASELINE: Dict[str, Any] = {
     "aiServiceFrameInspector": True,
     "ai_service_video_analyzer": True,
     "aiServiceVideoAnalyzer": True,
+    "ai_service_recognition_training": False,
+    "aiServiceRecognitionTraining": False,
 }
 
 # Admin / master_admin only — full stack on when prefs are sparse (ops / QA).
@@ -289,6 +295,8 @@ ADMIN_UPLOAD_BASELINE: Dict[str, Any] = {
     "aiServiceFrameInspector": True,
     "ai_service_video_analyzer": True,
     "aiServiceVideoAnalyzer": True,
+    "ai_service_recognition_training": False,
+    "aiServiceRecognitionTraining": False,
 }
 
 ADMIN_DEFAULT_ROLES: FrozenSet[str] = frozenset({"admin", "master_admin"})

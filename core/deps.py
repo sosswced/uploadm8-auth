@@ -41,7 +41,9 @@ def _resolve_user_id_from_session(authorization: Optional[str], cookies: dict) -
     return None, "invalid"
 
 
-async def _attach_workspace_context(conn, user: dict, request: Optional[Request]) -> dict:
+async def _attach_workspace_context(
+    conn, user: dict, request: Optional[Request], *, include_wallet: bool = True
+) -> dict:
     """Resolve workspace membership and owner billing wallet."""
     user_id = str(user["id"])
     ws_header = None
@@ -58,7 +60,7 @@ async def _attach_workspace_context(conn, user: dict, request: Optional[Request]
         ctx = None
 
     billing_id = billing_user_id(ctx, user_id)
-    wallet = await get_wallet(conn, billing_id)
+    wallet = await get_wallet(conn, billing_id) if include_wallet else None
     out = {**user, "wallet": wallet}
     if ctx:
         owner = ctx.owner_row
@@ -180,7 +182,9 @@ async def get_current_user_readonly_no_wallet(
                 },
             )
         user_dict = dict(user)
-        user_dict = await _attach_workspace_context(conn, user_dict, request)
+        user_dict = await _attach_workspace_context(
+            conn, user_dict, request, include_wallet=False
+        )
         return {**user_dict, "wallet": None}
 
 

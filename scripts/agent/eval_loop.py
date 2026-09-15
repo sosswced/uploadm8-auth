@@ -26,6 +26,17 @@ MODES: dict[str, list[str]] = {
     "router": ["router-lint"],
     "full": ["unit", "-q", "--tb=line", "--maxfail=10"],
     "grounding": ["grounding", "-q", "--tb=line", "--maxfail=5"],
+    "hero-fact": ["hero-fact", "-q", "--tb=line", "--maxfail=5"],
+}
+
+# Map eval mode name -> run_tests.py subcommand for suggested re-runs.
+MODE_RUNNER: dict[str, str] = {
+    "unit": "unit",
+    "frontend": "frontend-lint",
+    "router": "router-lint",
+    "full": "unit",
+    "grounding": "grounding",
+    "hero-fact": "hero-fact",
 }
 
 FAILURE_RES = [
@@ -38,8 +49,17 @@ FAILURE_RES = [
         re.MULTILINE,
     ),
 ]
+ROUTER_LINT_RE = re.compile(
+    r"^\s*-\s+(?P<file>routers[/\\][^\s:]+\.py):\s+(?P<detail>.+)$",
+    re.MULTILINE,
+)
 ERROR_RE = re.compile(
     r"^ERROR\s+(?P<file>tests[/\\][^\s:]+\.py)::(?P<nodeid>[^\s]+)",
+    re.MULTILINE,
+)
+# Collection-time ImportError / load failures (no ::nodeid).
+ERROR_COLLECT_RE = re.compile(
+    r"^ERROR\s+collecting\s+(?P<file>tests[/\\][^\s]+\.py)",
     re.MULTILINE,
 )
 SUMMARY_RE = re.compile(
@@ -76,6 +96,22 @@ def parse_failures(output: str) -> list[dict[str, str]]:
                 "file": match.group("file").replace("\\", "/"),
                 "nodeid": match.group("nodeid"),
             })
+    # router-lint emits "  - routers/foo.py: N lines exceeds cap M" (not pytest FAILED).
+    for match in ROUTER_LINT_RE.finditer(output):
+        rel = match.group("file").replace("\\", "/")
+        detail = match.group("detail").strip()
+        key = f"{rel}::{detail}"
+        if key in seen:
+            continue
+        seen.add(key)
+        failures.append({"file": rel, "nodeid": detail})
+    for match in ERROR_COLLECT_RE.finditer(output):
+        rel = match.group("file").replace("\\", "/")
+        key = f"{rel}::collection"
+        if key in seen:
+            continue
+        seen.add(key)
+        failures.append({"file": rel, "nodeid": "collection"})
     return failures
 
 
@@ -91,12 +127,15 @@ def parse_summary(output: str) -> dict[str, int] | None:
 
 
 def suggest_command(mode: str, failures: list[dict[str, str]]) -> str:
+    runner = MODE_RUNNER.get(mode, mode)
     if not failures:
-        return f"python run_tests.py {mode}"
+        return f"python run_tests.py {runner}"
     first = failures[0]["nodeid"].split("[")[0].split("::")[-1]
     if first.startswith("test_"):
-        return f"python run_tests.py {mode} -k {first}"
-    return f"python run_tests.py {mode}"
+        return f"python run_tests.py {runner} -k {first}"
+    if mode == "router":
+        return "python run_tests.py router-lint"
+    return f"python run_tests.py {runner}"
 
 
 def main() -> int:

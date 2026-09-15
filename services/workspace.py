@@ -412,29 +412,42 @@ async def accept_workspace_invite(conn, user: dict, raw_token: str) -> Dict[str,
     )
     if not owner:
         raise HTTPException(404, "Workspace not found")
-    await assert_seat_available(conn, dict(owner), inv["workspace_id"])
 
     uid = str(user["id"])
-    await conn.execute(
-        """
-        INSERT INTO workspace_members (workspace_id, user_id, role, status, invited_at, joined_at)
-        VALUES ($1::uuid, $2::uuid, $3, 'active', NOW(), NOW())
-        ON CONFLICT (workspace_id, user_id) DO UPDATE SET
-            role = EXCLUDED.role, status = 'active', joined_at = NOW()
-        """,
-        inv["workspace_id"],
-        uid,
-        inv["role"],
-    )
-    await conn.execute(
-        "UPDATE workspace_invites SET accepted_at = NOW() WHERE id = $1::uuid",
-        inv["id"],
-    )
-    await conn.execute(
-        "UPDATE users SET active_workspace_id = $1::uuid WHERE id = $2::uuid",
-        inv["workspace_id"],
-        uid,
-    )
+    async with conn.transaction():
+        # Serialize seat claims for this workspace
+        await conn.fetchval(
+            "SELECT id FROM workspaces WHERE id = $1::uuid FOR UPDATE",
+            inv["workspace_id"],
+        )
+        # Re-check invite acceptance under lock
+        still = await conn.fetchrow(
+            "SELECT accepted_at FROM workspace_invites WHERE id = $1::uuid FOR UPDATE",
+            inv["id"],
+        )
+        if still and still["accepted_at"]:
+            raise HTTPException(400, "Invite already accepted")
+        await assert_seat_available(conn, dict(owner), inv["workspace_id"])
+        await conn.execute(
+            """
+            INSERT INTO workspace_members (workspace_id, user_id, role, status, invited_at, joined_at)
+            VALUES ($1::uuid, $2::uuid, $3, 'active', NOW(), NOW())
+            ON CONFLICT (workspace_id, user_id) DO UPDATE SET
+                role = EXCLUDED.role, status = 'active', joined_at = NOW()
+            """,
+            inv["workspace_id"],
+            uid,
+            inv["role"],
+        )
+        await conn.execute(
+            "UPDATE workspace_invites SET accepted_at = NOW() WHERE id = $1::uuid",
+            inv["id"],
+        )
+        await conn.execute(
+            "UPDATE users SET active_workspace_id = $1::uuid WHERE id = $2::uuid",
+            inv["workspace_id"],
+            uid,
+        )
     return {"workspace_id": inv["workspace_id"], "role": inv["role"]}
 
 

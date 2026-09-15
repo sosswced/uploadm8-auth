@@ -866,10 +866,10 @@ async def fetch_recent_scores_batch(
 
 async def fetch_region_options(conn: Any, since: datetime) -> List[Dict]:
     state_sql = """NULLIF(TRIM(COALESCE(
-        NULLIF(btrim(u.trill_metadata#>>'{telemetry,gazetteer_state_usps}}'), ''),
-        NULLIF(btrim(u.trill_metadata#>>'{telemetry,location_state}}'), ''),
-        NULLIF(btrim(u.trill_metadata#>>'{state_usps}}'), ''),
-        NULLIF(btrim(u.trill_metadata#>>'{state}}'), '')
+        NULLIF(btrim(u.trill_metadata#>>'{telemetry,gazetteer_state_usps}'), ''),
+        NULLIF(btrim(u.trill_metadata#>>'{telemetry,location_state}'), ''),
+        NULLIF(btrim(u.trill_metadata#>>'{state_usps}'), ''),
+        NULLIF(btrim(u.trill_metadata#>>'{state}'), '')
     )), '')"""
     rows = await conn.fetch(
         f"""

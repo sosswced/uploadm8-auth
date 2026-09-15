@@ -255,3 +255,69 @@ def push_content_card_metrics(model_repo: str, report: Dict[str, Any]) -> None:
             "top_packaging": (rankings.get("top_packaging") or [])[:10],
         },
     )
+
+
+def push_av_eval_results(
+    model_repo: str,
+    *,
+    dataset_repo: str,
+    report: Dict[str, Any],
+) -> Optional[str]:
+    """Eval-results for the AV-read distill model bucket."""
+    return push_model_eval_results(
+        model_repo,
+        dataset_repo=dataset_repo,
+        report=report,
+        path_in_repo=".eval_results/uploadm8_av_read.yaml",
+        task_prefix="av_read",
+        commit_message="UploadM8 ML engine: av_read distill eval results",
+    )
+
+
+def push_av_card_metrics(model_repo: str, report: Dict[str, Any]) -> None:
+    """AV-read distill metrics snapshot on the model repo."""
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    push_model_card_metrics(
+        model_repo,
+        report,
+        path_in_repo="uploadm8_av_read_metrics.json",
+        metric_keys=(
+            "hero_class_macro_f1",
+            "hero_fact_f1_vs_teacher",
+            "deep_needs_f1",
+            "train_rows",
+            "test_rows",
+            "status",
+        ),
+        extra={
+            "metrics_nested": metrics,
+            "promote": report.get("promote"),
+            "floors": report.get("floors"),
+            "publish_status": report.get("publish_status"),
+        },
+    )
+
+
+def push_av_model_artifact(
+    model_repo: str,
+    *,
+    local_model_path: str,
+    path_in_repo: str = "av_read_distill_model.joblib",
+) -> str:
+    """Upload the trained joblib bundle to the AV model repo. Returns commit URL or path."""
+    from pathlib import Path
+
+    from huggingface_hub import HfApi
+
+    path = Path(local_model_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"AV model missing: {local_model_path}")
+    api = HfApi(token=_require_token())
+    info = api.upload_file(
+        path_or_fileobj=str(path),
+        path_in_repo=path_in_repo,
+        repo_id=model_repo,
+        repo_type="model",
+        commit_message="UploadM8 ML engine: av_read distill model.joblib",
+    )
+    return getattr(info, "commit_url", None) or path_in_repo

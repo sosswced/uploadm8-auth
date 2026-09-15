@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from core.config import CATALOG_PRICING_APPROVAL_BYPASS, CATALOG_PRICING_APPROVAL_REQUIRED
 import core.state
+from core.db_pool import acquire_db
 from core.deps import get_verified_user_id, require_master_admin_on_conn
 
 logger = logging.getLogger("uploadm8.admin_catalog")
@@ -343,7 +344,6 @@ async def create_catalog_product(
             json.dumps({"product_kind": kind, "display_name": display}),
             actor,
         )
-        await _reload_catalog_cache_from_conn(conn)
 
         sync_result = None
         if auto_sync:
@@ -361,6 +361,8 @@ async def create_catalog_product(
                     "synced": False,
                     "error": str(exc),
                 }
+        else:
+            await _reload_catalog_cache_from_conn(conn)
 
     return {
         "created": True,
@@ -435,8 +437,6 @@ async def update_catalog_product(
             actor,
         )
 
-        await _reload_catalog_cache_from_conn(conn)
-
         sync_result = None
         if auto_sync:
             try:
@@ -456,6 +456,8 @@ async def update_catalog_product(
                         "Use POST /sync to retry."
                     ),
                 }
+        else:
+            await _reload_catalog_cache_from_conn(conn)
 
         return {
             "saved": True,
@@ -548,7 +550,7 @@ async def list_pricing_requests(
     limit: int = Query(100, le=500),
     user_id: str = Depends(get_verified_user_id),
 ):
-    async with core.state.require_pool().acquire() as conn:
+    async with acquire_db(core.state.require_pool()) as conn:
         await require_master_admin_on_conn(conn, user_id)
         if status:
             rows = await conn.fetch(

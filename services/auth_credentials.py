@@ -17,6 +17,7 @@ from core.auth import (
     create_access_jwt,
     create_refresh_token,
     hash_password,
+    refresh_ttl_days,
     rotate_refresh_token,
     verify_password,
 )
@@ -119,11 +120,12 @@ async def register_user(
     return access, refresh
 
 
-async def login_user(conn, data: UserLogin) -> Tuple[str, str, bool]:
-    """Validate credentials; return (access_jwt, refresh_token, must_reset_password)."""
+async def login_user(conn, data: UserLogin) -> Tuple[str, str, bool, int]:
+    """Validate credentials; return (access_jwt, refresh_token, must_reset_password, refresh_days)."""
     user = await conn.fetchrow(
         """
-        SELECT id, password_hash, status, email_verified, must_reset_password
+        SELECT id, password_hash, status, email_verified, must_reset_password,
+               role, subscription_tier
         FROM users WHERE LOWER(email) = $1
         """,
         data.email.lower(),
@@ -142,15 +144,21 @@ async def login_user(conn, data: UserLogin) -> Tuple[str, str, bool]:
         )
 
     uid = str(user["id"])
+    remember = getattr(data, "remember", True) is not False
+    days = refresh_ttl_days(
+        remember=remember,
+        role=user.get("role"),
+        tier=user.get("subscription_tier"),
+    )
     access = create_access_jwt(uid)
-    refresh = await create_refresh_token(conn, uid)
-    return access, refresh, bool(user.get("must_reset_password"))
+    refresh = await create_refresh_token(conn, uid, days=days)
+    return access, refresh, bool(user.get("must_reset_password")), days
 
 
-async def refresh_session(conn, refresh_token: str) -> Tuple[str, str]:
-    """Rotate refresh; return (new_access_jwt, new_refresh_token)."""
-    access, new_refresh = await rotate_refresh_token(conn, refresh_token)
-    return access, new_refresh
+async def refresh_session(conn, refresh_token: str) -> Tuple[str, str, int]:
+    """Rotate refresh; return (new_access_jwt, new_refresh_token, refresh_cookie_max_age_sec)."""
+    access, new_refresh, refresh_max_age = await rotate_refresh_token(conn, refresh_token)
+    return access, new_refresh, refresh_max_age
 
 
 async def resolve_logout_user_id(

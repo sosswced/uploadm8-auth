@@ -83,6 +83,9 @@ async def fetch_activation_checklist(conn, user_id: str) -> Dict[str, Any]:
               AND (
                 LOWER(COALESCE(schedule_mode, '')) IN ('scheduled', 'smart')
                 OR scheduled_time IS NOT NULL
+                OR LOWER(COALESCE(status, '')) IN (
+                    'completed', 'succeeded', 'partial', 'published'
+                )
               )
             LIMIT 1
             """,

@@ -82,7 +82,7 @@ def _simplify_platform_metrics(cached: Optional[dict]) -> Dict[str, Any]:
             "status": data.get("status", "not_connected"),
             "uploads": int(data.get("uploads") or 0),
             "views": int(data.get("views") or 0),
-            "likes": int(data.get("likes") or 0),
+            "likes": max(int(data.get("likes") or 0), int(data.get("reactions") or 0)),
             "followers": data.get("followers") or data.get("subscriber_count"),
             "accounts_live": int(data.get("accounts_live") or data.get("accounts_polled") or 0),
         }
@@ -108,7 +108,7 @@ def _per_account_metrics(cached: Optional[dict]) -> Dict[str, Dict[str, Any]]:
                 "platform": plat,
                 "status": metrics.get("status") or acc.get("status") or "unknown",
                 "views": int(metrics.get("views") or 0),
-                "likes": int(metrics.get("likes") or 0),
+                "likes": max(int(metrics.get("likes") or 0), int(metrics.get("reactions") or 0)),
                 "followers": metrics.get("followers") or metrics.get("subscriber_count"),
             }
     return out

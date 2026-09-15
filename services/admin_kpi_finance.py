@@ -91,22 +91,18 @@ _RANGE_PRESETS_MINUTES = {
 
 
 def range_key_to_minutes(range_key: str | None, default_minutes: int = 30 * 24 * 60) -> int:
-    r = (range_key or "").strip()
-    if not r:
+    from services.admin_kpi_window import range_key_to_minutes as _shared
+
+    try:
+        return _shared(range_key, strict=False)
+    except Exception:
         return default_minutes
-    if r in _RANGE_PRESETS_MINUTES:
-        return _RANGE_PRESETS_MINUTES[r]
-    m = re.fullmatch(r"(\d{1,4})d", r)
-    if m:
-        days = max(1, min(int(m.group(1)), 3650))
-        return days * 24 * 60
-    return default_minutes
 
 
 def window_from_range_key(range_key: str | None) -> Tuple[datetime, datetime]:
-    until = datetime.now(timezone.utc)
-    mins = range_key_to_minutes(range_key)
-    return until - timedelta(minutes=mins), until
+    from services.admin_kpi_window import trailing_window
+
+    return trailing_window(range_key, strict=False)
 
 
 def _prorate_monthly_cost(monthly: float, since: datetime, until: datetime) -> float:
@@ -329,7 +325,12 @@ async def build_admin_costs_summary(
         since = since if since is not None else win_since
         until = until if until is not None else win_until
 
-    provider_payload = await build_provider_costs_payload(conn, range_key=range_key or "30d")
+    provider_payload = await build_provider_costs_payload(
+        conn,
+        range_key=range_key or "30d",
+        since=since,
+        until=until,
+    )
 
     openai_cost = max(
         float(provider_payload.get("openai_cost_window") or 0),
@@ -397,14 +398,22 @@ async def build_admin_costs_summary(
     }
 
 
-async def build_provider_costs_payload(conn, *, range_key: str | None) -> Dict[str, Any]:
-    cache_key = range_key or "30d"
+async def build_provider_costs_payload(
+    conn,
+    *,
+    range_key: str | None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> Dict[str, Any]:
+    if since is None or until is None:
+        since, until = window_from_range_key(range_key)
+    from services.admin_kpi_window import window_cache_key
+
+    cache_key = window_cache_key(since, until, prefix=range_key or "30d")
     now_mono = time.monotonic()
     cached = _provider_costs_cache.get(cache_key)
     if cached and (now_mono - cached[0]) < _PROVIDER_COSTS_CACHE_TTL_S:
         return dict(cached[1])
-
-    since, until = window_from_range_key(range_key)
     by_cat = await fetch_cost_categories_window(conn, since, until)
     buckets = _bucket_totals(by_cat)
     env_prorates = _monthly_env_prorates(since, until)
@@ -581,8 +590,15 @@ async def build_provider_costs_payload(conn, *, range_key: str | None) -> Dict[s
     return result
 
 
-async def build_cost_tracker_payload(conn, *, range_key: str | None) -> Dict[str, Any]:
-    since, until = window_from_range_key(range_key)
+async def build_cost_tracker_payload(
+    conn,
+    *,
+    range_key: str | None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> Dict[str, Any]:
+    if since is None or until is None:
+        since, until = window_from_range_key(range_key)
     uploads = await conn.fetchval(
         """
         SELECT COUNT(*)::int FROM uploads
@@ -599,6 +615,8 @@ async def build_cost_tracker_payload(conn, *, range_key: str | None) -> Dict[str
     total = round(uploads * per, 4)
     return {
         "range": range_key or "30d",
+        "window_start_utc": since.isoformat(),
+        "window_end_exclusive_utc": until.isoformat(),
         "estimated_total_window_usd": total,
         "estimated_total_per_upload_usd": per,
         "successful_uploads": uploads,

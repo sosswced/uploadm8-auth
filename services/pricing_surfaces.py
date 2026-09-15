@@ -135,11 +135,12 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
         "faq_put_aic": (
             f"Publishing credits (PUT) pay for goes-live work — base {base} per job, "
             f"plus {extra} per extra destination, +{pri} priority, +{thumb} per extra thumbnail. "
-            f"AI credits (AIC) pay for the AI services you enable (captions, Vision, optional "
-            f"Twelve Labs / Video Intelligence, audio helpers) and Thumbnail Studio / Pikzels. "
+            f"AI credits (AIC) pay for the AI services you enable (captions, Vision, Twelve Labs / "
+            f"Video Intelligence, audio helpers) and Thumbnail Studio / Pikzels. "
             f"Speech-to-text (Whisper) is included at no extra AIC when enabled. "
-            f"Defaults stay light (~{lo}–{hi} AIC per short); heavy analyzers are opt-in "
-            f"(~{flo}–{fhi} AIC full-smart). Studio recreate is about {rec} AIC per image. "
+            f"Paid active plans default speech + captions + Vision + TL + VI + Studio on "
+            f"(~{flo}–{fhi} AIC typical); free/trial stay opt-in (~{lo}–{hi} AIC light). "
+            f"Studio recreate is about {rec} AIC per image. "
             f"Balances only move when work runs. Subscription credits renew each cycle; "
             f"add-on packs never expire."
         ),
@@ -152,15 +153,15 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
             f"<strong>{base + 2 * extra} PUT</strong></em>"
         ),
         "settings_aic_blurb": (
-            f"Consumed by the AI services you enable (captions, thumbnails, Vision, optional "
-            f"Twelve Labs / Video Intelligence, audio helpers). Speech-to-text (Whisper) is "
-            f"included at no extra AIC. Each paid service has a weight; longer clips cost more "
-            f"for minute-metered tools. Defaults keep heavy analyzers off so a typical short "
-            f"stays near ~{lo}–{hi} AIC; turning everything on lands near ~{flo}–{fhi} AIC "
-            f"for a 60s clip.<br>"
-            f"<em>Example: captions + thumbnails + Vision (defaults) → about "
-            f"<strong>{lo}–{hi} AIC</strong>. Thumbnail Studio / Pikzels recreate is priced "
-            f"separately (~{rec} AIC per image, ~2.5× provider cost).</em>"
+            f"Consumed by the AI services you enable (captions, thumbnails, Vision, Twelve Labs / "
+            f"Video Intelligence, audio helpers). Speech-to-text (Whisper) is included at no extra "
+            f"AIC. Each paid service has a weight; longer clips cost more for minute-metered tools. "
+            f"<strong>Paid active:</strong> speech + captions + Vision + TL + VI + Studio start on "
+            f"(~{flo}–{fhi} AIC typical for a 60s clip). <strong>Free / trial:</strong> packages "
+            f"start off (~{lo}–{hi} AIC when you enable a light stack). Turn any switch off anytime, "
+            f"then Save All Preferences.<br>"
+            f"<em>Thumbnail Studio / Pikzels recreate is priced separately (~{rec} AIC per image, "
+            f"~2.5× provider cost).</em>"
         ),
         "guide_aic_desc": (
             f"Used for the AI services you enable — captions, hashtags, Vision, Twelve Labs / "
@@ -192,9 +193,9 @@ def _html_snippets(put: Dict[str, int], est: Dict[str, Any]) -> Dict[str, str]:
             f"<tr><td>Each extra thumbnail after the first</td><td><strong>+{thumb}</strong></td></tr>"
         ),
         "guide_aic_table_rows": (
-            f"<tr><td>Defaults (captions + thumbs + Vision)</td>"
+            f"<tr><td>Free / trial light stack (when enabled)</td>"
             f"<td><strong>~{est['aic_light_lo']}–{est['aic_light_hi']}</strong></td></tr>\n"
-            f"<tr><td>Full-smart 60s (all services on)</td>"
+            f"<tr><td>Paid active default (speech + captions + Vision + TL + VI)</td>"
             f"<td><strong>~{est['aic_full_lo']}–{est['aic_full_hi']}</strong></td></tr>\n"
             f"<tr><td>Thumbnail Studio / Pikzels recreate</td>"
             f"<td><strong>~{est['pikzels_recreate_aic']}</strong> per image</td></tr>"

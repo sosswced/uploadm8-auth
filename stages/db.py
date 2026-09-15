@@ -227,6 +227,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "sponsorWatermarkOptIn": "sponsor_watermark_opt_in",
                         "aiServiceTelemetry": "ai_service_telemetry",
                         "aiServiceDashcamOSD": "ai_service_dashcam_osd",
+                        "aiServiceRecognitionTraining": "ai_service_recognition_training",
                         "aiServiceAudioSignals": "ai_service_audio_signals",
                         "aiServiceMusicDetection": "ai_service_music_detection",
                         "aiServiceAudioSummary": "ai_service_audio_summary",
@@ -447,6 +448,7 @@ def _platform_results_payload(ctx: JobContext) -> Optional[list]:
             "account_avatar": getattr(r, "account_avatar", None),
             "platform_video_id": r.platform_video_id,
             "platform_url": r.platform_url,
+            "shortcode": getattr(r, "shortcode", None),
             "publish_id": r.publish_id,
             "error_code": r.error_code,
             "error_message": r.error_message,
@@ -1936,8 +1938,12 @@ async def update_publish_attempt_failed(
     error_message: str = "",
     http_status: Optional[int] = None,
     response_payload: Optional[dict] = None,
+    publish_id: Optional[str] = None,
 ):
-    """Mark a publish attempt as failed."""
+    """Mark a publish attempt as failed.
+
+    Optional ``publish_id`` preserves Instagram creation_id (etc.) for resume-on-retry.
+    """
     try:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -1948,6 +1954,7 @@ async def update_publish_attempt_failed(
                     error_message = $3,
                     http_status = $4,
                     response_payload = $5::jsonb,
+                    publish_id = COALESCE($6, publish_id),
                     updated_at = NOW()
                 WHERE id = $1
                 """,
@@ -1956,6 +1963,7 @@ async def update_publish_attempt_failed(
                 error_message,
                 http_status,
                 json.dumps(response_payload) if response_payload else None,
+                publish_id,
             )
     except Exception as e:
         logger.warning(f"update_publish_attempt_failed failed: {e}")

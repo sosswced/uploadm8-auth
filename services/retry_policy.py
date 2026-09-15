@@ -213,9 +213,10 @@ OVERDUE_READY_GRACE_MINUTES_DEFAULT = 5
 MAX_AUTO_RETRIES_DEFAULT = 3
 AUTO_RETRY_BACKOFF_MINUTES: Tuple[int, ...] = (2, 5, 15)
 
-# Extra failed codes safe for worker auto-retry (scheduled publish stalls).
+# Extra failed codes safe for worker auto-retry (transient queue / processing stalls).
+# Do NOT include STUCK_READY_TO_PUBLISH — that means publish already sat past the
+# safety window; auto-requeue loops Discord/Sentry every ~fail_minutes (UPLOADM8-BC).
 _AUTO_RETRY_EXTRA: Tuple[str, ...] = (
-    "STUCK_READY_TO_PUBLISH",
     "PUBLISH_SLOT_MISSING",
     "SCHEDULE_INCOMPLETE",
     "STALE_PROCESSING",

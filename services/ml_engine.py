@@ -423,6 +423,132 @@ def _step_push_eval(cfg: MLEngineConfig, report: Dict[str, Any]) -> Dict[str, An
     return out
 
 
+def _step_build_av_dataset(cfg: MLEngineConfig, lookback_days: Optional[int] = None) -> Dict[str, Any]:
+    lb = int(lookback_days or cfg.dataset_lookback_days)
+    needs_datasets = bool(cfg.av_dataset_repo)
+    cmd = [
+        *_script_cmd("scripts/build_av_training_dataset.py", needs_datasets=needs_datasets),
+        "--lookback-days",
+        str(lb),
+        "--limit",
+        str(cfg.dataset_limit),
+        "--output",
+        cfg.av_local_dataset_path,
+    ]
+    if cfg.av_dataset_repo:
+        cmd.extend(["--push-to", cfg.av_dataset_repo, "--split", "train"])
+    return _run_subprocess(cmd)
+
+
+def _step_train_av_distill(cfg: MLEngineConfig) -> Dict[str, Any]:
+    Path(cfg.av_local_report_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(cfg.av_local_model_path).parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        *_script_cmd("scripts/train_av_read_distill.py", needs_datasets=False),
+        "--input",
+        cfg.av_local_dataset_path,
+        "--report",
+        cfg.av_local_report_path,
+        "--model",
+        cfg.av_local_model_path,
+    ]
+    return _run_subprocess(cmd)
+
+
+async def _run_av_read_loop(c: MLEngineConfig, pool: Optional[asyncpg.Pool]) -> Dict[str, Any]:
+    """Shadow AV-read distill — publish only when floors + Hub promote flag allow."""
+    av: Dict[str, Any] = {"ok": False, "publish_status": "trained_not_published"}
+    try:
+        last_build = await _run_build_with_retries(
+            _step_build_av_dataset, c, c.dataset_lookback_days, label="av_read"
+        )
+        av["build_dataset"] = last_build
+        if not last_build.get("ok"):
+            av["error"] = "av dataset build failed"
+            return av
+        last_train = await asyncio.to_thread(_step_train_av_distill, c)
+        av["train_local"] = last_train
+        report = _read_report(c.av_local_report_path)
+        if not isinstance(report, dict):
+            report = {}
+
+        from services.av_read_promote import hub_promote_allowed, promote_floors_met
+
+        metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+        f1 = metrics.get("hero_class_macro_f1")
+        if f1 is None:
+            f1 = report.get("hero_fact_f1_vs_teacher")
+        cohort_n = int(report.get("train_rows") or 0)
+        # Grounding floor: require train report status ok (gold suite is separate CI gate).
+        grounding_ok = str(report.get("status") or "") == "ok"
+        floors = promote_floors_met(
+            hero_fact_f1=f1,
+            grounding_ok=grounding_ok,
+            cohort_n=cohort_n,
+        )
+        decision = hub_promote_allowed(floors)
+        report["promote"] = decision
+        report["floors"] = floors
+        if decision.get("promote"):
+            hub_push: Dict[str, Any] = {"ok": False}
+            try:
+                from services.ml_eval_hub import (
+                    ensure_model_repo,
+                    push_av_card_metrics,
+                    push_av_eval_results,
+                    push_av_model_artifact,
+                )
+
+                repo = (c.av_model_repo or "").strip()
+                if not repo:
+                    raise RuntimeError("av_model_repo not configured")
+                ensure_model_repo(repo)
+                model_url = push_av_model_artifact(
+                    repo, local_model_path=c.av_local_model_path
+                )
+                hub_push["model_path"] = model_url
+                ds = (c.av_dataset_repo or "").strip()
+                if ds:
+                    hub_push["eval_results"] = push_av_eval_results(
+                        repo, dataset_repo=ds, report=report
+                    )
+                push_av_card_metrics(repo, report)
+                hub_push["metrics_json"] = True
+                hub_push["ok"] = True
+                report["publish_status"] = "published"
+                av["status"] = "published"
+                av["publish_status"] = "published"
+            except Exception as e:
+                hub_push["ok"] = False
+                hub_push["error"] = str(e)[:400]
+                report["publish_status"] = "promote_eligible_local"
+                report["hub_push_error"] = hub_push["error"]
+                av["status"] = "promote_eligible_local"
+                av["publish_status"] = "promote_eligible_local"
+            av["hub_push"] = hub_push
+            report["hub_push"] = hub_push
+        else:
+            report["publish_status"] = "trained_not_published"
+            av["status"] = "trained_not_published"
+            av["publish_status"] = "trained_not_published"
+            av["promote_reason"] = decision.get("reason")
+        av["report"] = report
+        av["ok"] = bool(last_train.get("ok"))
+        if report.get("status") == "insufficient_data":
+            av["status"] = "blocked_on_data"
+            av["ok"] = True  # cycle still healthy
+        try:
+            Path(c.av_local_report_path).write_text(
+                json.dumps(report, indent=2, default=str), encoding="utf-8"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("av-read distill loop failed")
+        av["error"] = str(e)[:400]
+    return av
+
+
 def _step_build_content_dataset(cfg: MLEngineConfig, lookback_days: Optional[int] = None) -> Dict[str, Any]:
     lb = int(lookback_days or cfg.dataset_lookback_days)
     needs_datasets = bool(cfg.content_dataset_repo)
@@ -1071,6 +1197,9 @@ async def run_ml_engine_cycle(
 
         if c.run_content_success:
             result["content"] = await _run_content_loop(c, pool)
+
+        if c.run_av_read_distill:
+            result["av_read"] = await _run_av_read_loop(c, pool)
 
         content_ok = bool((result.get("content") or {}).get("ok"))
         if c.sync_trackio_after_run and (result.get("ok") or content_ok):

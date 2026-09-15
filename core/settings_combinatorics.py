@@ -74,6 +74,7 @@ BOOLEAN_PREF_KEYS: Tuple[str, ...] = (
     "aiServiceSceneUnderstanding",
     "aiServiceFrameInspector",
     "aiServiceVideoAnalyzer",
+    "aiServiceRecognitionTraining",
 )
 
 # Parent → children enforced by normalize_preferences_dict when parent explicitly off.
@@ -128,6 +129,7 @@ _SNAKE_MAP: Dict[str, str] = {
     "aiServiceSceneUnderstanding": "ai_service_scene_understanding",
     "aiServiceFrameInspector": "ai_service_frame_inspector",
     "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
+    "aiServiceRecognitionTraining": "ai_service_recognition_training",
 }
 
 

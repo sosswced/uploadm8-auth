@@ -36,6 +36,7 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Qu
 from pydantic import BaseModel, ConfigDict, Field
 
 import core.state
+from core.db_pool import acquire_db
 from core.config import (
     COST_PER_OPENAI_TOKEN,
     GAZETTEER_PLACES_PATH,
@@ -428,14 +429,65 @@ async def generate_trill_preview(
 
 
 # ── Map unlock: completed upload with Trill score + route evidence (.map telemetry) ─────────────
+def _normalize_trill_range(range_key: str) -> str:
+    """Canonical Trill/analytics range key (bare days + aliases → 7d/30d/…/all)."""
+    from services.canonical_engagement import normalize_analytics_range_key
+
+    return normalize_analytics_range_key(range_key)
+
+
+def _trill_range_context(range_key: str, *, now: Optional[datetime] = None) -> dict:
+    """
+    Shared lookback context for Trill SQL + API metadata.
+    Half-open UTC: created_at >= since AND created_at < until (until always set to now).
+    ``all`` uses ALL_TIME_FLOOR_UTC as since.
+    """
+    from services.canonical_engagement import (
+        ALL_TIME_FLOOR_UTC,
+        engagement_time_window_for_analytics_range,
+        engagement_window_api_dict,
+        sql_since_for_analytics_range,
+    )
+
+    n = now or datetime.now(timezone.utc)
+    if n.tzinfo is None:
+        n = n.replace(tzinfo=timezone.utc)
+    elif n.tzinfo != timezone.utc:
+        n = n.astimezone(timezone.utc)
+    resolved = _normalize_trill_range(range_key)
+    since = sql_since_for_analytics_range(resolved, now=n)
+    start, end = engagement_time_window_for_analytics_range(resolved, now=n)
+    until = end if end is not None else n
+    # Surface floor for all-time so UI can show concrete dates.
+    window_start = start if start is not None else ALL_TIME_FLOOR_UTC
+    return {
+        "range_resolved": resolved,
+        "since": since,
+        "until": until,
+        "now": n,
+        "window": engagement_window_api_dict(start=window_start, end_exclusive=until),
+    }
+
+
 def _trill_since_dt(range_key: str) -> datetime:
     """Lower bound for Trill SQL windows. ``all`` uses the shared analytics all-time floor."""
-    from services.canonical_engagement import sql_since_for_analytics_range
+    return _trill_range_context(range_key)["since"]
 
-    rk = (range_key or "30d").strip().lower()
-    # Map Trill UI keys onto analytics presets (fix 90d typo that was ~182 days).
-    mapped = {"7d": "7d", "30d": "30d", "90d": "90d", "1y": "1y", "365d": "1y", "all": "all"}.get(rk, "30d")
-    return sql_since_for_analytics_range(mapped)
+
+def _leaderboard_summary_from_board_agg(
+    *,
+    driver_count: int,
+    total_runs: int,
+    avg_best_trill: float,
+    max_best_trill: float,
+) -> dict:
+    """Full-board community KPIs (not limited to the returned page of rows)."""
+    return {
+        "driver_count": int(driver_count or 0),
+        "total_runs": int(total_runs or 0),
+        "avg_best_trill": round(float(avg_best_trill or 0), 1),
+        "max_best_trill": round(float(max_best_trill or 0), 1),
+    }
 
 
 _TRILL_DISPLAY_NAME_RE = re.compile(r"^[A-Za-z0-9 _\-]{2,32}$")
@@ -690,14 +742,20 @@ async def trill_leaderboard_regions(
     user: dict = Depends(get_current_user),
 ):
     _ = user
-    since = _trill_since_dt(range)
+    ctx = _trill_range_context(range)
+    since = ctx["since"]
     try:
         async with core.state.db_pool.acquire() as conn:
             regions = await fetch_region_options(conn, since)
     except Exception as e:
         logger.warning("trill leaderboard regions: %s", e)
         regions = []
-    return {"range": range, "regions": regions}
+    return {
+        "range": range,
+        "range_resolved": ctx["range_resolved"],
+        "window": ctx["window"],
+        "regions": regions,
+    }
 
 
 @router.get("/leaderboard")
@@ -711,11 +769,14 @@ async def trill_leaderboard(
 ):
     """Community leaderboard — opted-in users only; aggregates (no route geometry)."""
     uid = user_id
-    cache_key = f"{uid}:{range}:{sort}:{region or ''}:{limit}"
+    ctx = _trill_range_context(range)
+    range_resolved = ctx["range_resolved"]
+    since = ctx["since"]
+    until = ctx["until"]
+    cache_key = f"{uid}:{range_resolved}:{sort}:{region or ''}:{limit}"
     cached_resp = leaderboard_serve_from_cache(_LEADERBOARD_CACHE, cache_key)
     if cached_resp is not None:
         return cached_resp
-    since = _trill_since_dt(range)
     sort_key = (sort or "best_trill").strip()
     if sort_key not in _LEADERBOARD_SORTS:
         sort_key = "best_trill"
@@ -739,6 +800,9 @@ async def trill_leaderboard(
     challenge_completion = None
     challenge_already_done = False
     board_driver_count = 0
+    board_total_runs = 0
+    board_avg_best_trill = 0.0
+    board_max_best_trill = 0.0
     pref_row = None
     opted_in = False
     viewer_row = None
@@ -748,7 +812,7 @@ async def trill_leaderboard(
     viewer_badges: list = []
     viewer_badge_collection: list = []
     try:
-        async with core.state.db_pool.acquire() as conn:
+        async with acquire_db(core.state.db_pool) as conn:
             await require_verified_user_on_conn(conn, uid)
             await ensure_badge_definitions(conn)
             await ensure_current_season(conn)
@@ -791,10 +855,12 @@ async def trill_leaderboard(
                     FROM uploads u
                     WHERE u.user_id = $1
                       AND u.created_at >= $2
+                      AND u.created_at < $3
                       AND {TRILL_SCORED_PREDICATE.strip()}
                     """,
                     uid,
                     since,
+                    until,
                 )
 
                 bucket_rows = await conn.fetch(
@@ -804,10 +870,12 @@ async def trill_leaderboard(
                     INNER JOIN user_preferences pref ON pref.user_id = u.user_id
                         AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
                     WHERE u.created_at >= $1
+                      AND u.created_at < $2
                       AND {TRILL_SCORED_PREDICATE.strip()}
                     GROUP BY 1
                     """,
                     since,
+                    until,
                 )
 
                 rows = await conn.fetch(
@@ -827,6 +895,7 @@ async def trill_leaderboard(
                         INNER JOIN user_preferences pref ON pref.user_id = u.user_id
                             AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
                         WHERE u.created_at >= $1
+                          AND u.created_at < $4
                           AND {TRILL_SCORED_PREDICATE.strip()}
                           AND ($3::text IS NULL OR UPPER(TRIM({state_x})) = $3)
                     ),
@@ -876,6 +945,7 @@ async def trill_leaderboard(
                     since,
                     limit,
                     region_code,
+                    until,
                 )
 
                 rival_ids = set(await fetch_rivals(conn, uid))
@@ -989,35 +1059,46 @@ async def trill_leaderboard(
                         viewer_rank = int(r["rank"])
                         break
 
-                # True community size (not capped by LIMIT) for percentile + out-of-page rank.
-                board_driver_count = int(
-                    await conn.fetchval(
-                        f"""
-                        WITH per_upload AS (
-                            SELECT
-                                u.user_id,
-                                u.trill_score::float AS trill_score,
-                                {speed_x}::float AS speed_mph,
-                                {dist_x}::float AS dist_mi
-                            FROM uploads u
-                            INNER JOIN user_preferences pref ON pref.user_id = u.user_id
-                                AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
-                            WHERE u.created_at >= $1
-                              AND {TRILL_SCORED_PREDICATE.strip()}
-                              AND ($2::text IS NULL OR UPPER(TRIM({state_x})) = $2)
-                        ),
-                        agg AS (
-                            SELECT user_id::text AS user_id
-                            FROM per_upload
-                            GROUP BY user_id
-                        )
-                        SELECT COUNT(*)::int FROM agg
-                        """,
-                        since,
-                        region_code,
+                # True community size + window KPIs (not capped by LIMIT).
+                board_agg = await conn.fetchrow(
+                    f"""
+                    WITH per_upload AS (
+                        SELECT
+                            u.user_id,
+                            u.trill_score::float AS trill_score,
+                            {speed_x}::float AS speed_mph,
+                            {dist_x}::float AS dist_mi
+                        FROM uploads u
+                        INNER JOIN user_preferences pref ON pref.user_id = u.user_id
+                            AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
+                        WHERE u.created_at >= $1
+                          AND u.created_at < $3
+                          AND {TRILL_SCORED_PREDICATE.strip()}
+                          AND ($2::text IS NULL OR UPPER(TRIM({state_x})) = $2)
+                    ),
+                    agg AS (
+                        SELECT
+                            user_id::text AS user_id,
+                            COUNT(*)::int AS run_count,
+                            MAX(trill_score)::float AS best_trill
+                        FROM per_upload
+                        GROUP BY user_id
                     )
-                    or 0
+                    SELECT
+                        COUNT(*)::int AS driver_count,
+                        COALESCE(SUM(run_count), 0)::int AS total_runs,
+                        COALESCE(AVG(best_trill), 0)::float AS avg_best_trill,
+                        COALESCE(MAX(best_trill), 0)::float AS max_best_trill
+                    FROM agg
+                    """,
+                    since,
+                    region_code,
+                    until,
                 )
+                board_driver_count = int((board_agg and board_agg["driver_count"]) or 0)
+                board_total_runs = int((board_agg and board_agg["total_runs"]) or 0)
+                board_avg_best_trill = float((board_agg and board_agg["avg_best_trill"]) or 0)
+                board_max_best_trill = float((board_agg and board_agg["max_best_trill"]) or 0)
 
                 # Opted-in viewer outside the LIMIT page still needs a real rank (never default to #1).
                 if (
@@ -1139,6 +1220,8 @@ async def trill_leaderboard(
             "unlocked": viewer_unlocked,
             "map_unlocked": viewer_unlocked,
             "range": range,
+            "range_resolved": range_resolved,
+            "window": ctx["window"],
             "sort": sort_key,
             "rows": [],
             "summary": {},
@@ -1153,6 +1236,8 @@ async def trill_leaderboard(
             "unlocked": False,
             "map_unlocked": False,
             "range": range,
+            "range_resolved": range_resolved,
+            "window": ctx["window"],
             "sort": sort_key,
             "rows": [],
             "summary": {},
@@ -1263,14 +1348,21 @@ async def trill_leaderboard(
 
     # Prefer full community size for percentile; fall back to returned rows.
     driver_count = int(board_driver_count or len(out_rows))
-    total_runs = sum(int(r["run_count"] or 0) for r in out_rows)
-    best_scores = [float(r["best_trill_score"] or 0) for r in out_rows]
-    summary = {
-        "driver_count": driver_count,
-        "total_runs": total_runs,
-        "avg_best_trill": round(sum(best_scores) / len(out_rows), 1) if out_rows else 0.0,
-        "max_best_trill": round(max(best_scores), 1) if best_scores else 0.0,
-    }
+    if board_driver_count > 0 or board_total_runs > 0:
+        summary = _leaderboard_summary_from_board_agg(
+            driver_count=driver_count,
+            total_runs=board_total_runs,
+            avg_best_trill=board_avg_best_trill,
+            max_best_trill=board_max_best_trill,
+        )
+    else:
+        # Unlocked but empty board / query miss — keep zeros, never invent from empty page.
+        summary = _leaderboard_summary_from_board_agg(
+            driver_count=driver_count,
+            total_runs=0,
+            avg_best_trill=0.0,
+            max_best_trill=0.0,
+        )
 
     highlights = {}
     if out_rows:
@@ -1341,6 +1433,8 @@ async def trill_leaderboard(
         "unlocked": True,
         "map_unlocked": True,
         "range": range,
+        "range_resolved": range_resolved,
+        "window": ctx["window"],
         "sort": sort_key,
         "region": region_code,
         "summary": summary,
@@ -1361,6 +1455,7 @@ async def trill_leaderboard(
 @router.get("/map-feed")
 async def trill_map_feed(
     range: str = Query("30d"),
+    limit: int = Query(500, ge=1, le=500),
     trill_vehicle_make: Optional[str] = Query(None, max_length=120),
     trill_vehicle_model: Optional[str] = Query(None, max_length=120),
     trill_vehicle_make_id: Optional[int] = Query(None, ge=1),
@@ -1369,12 +1464,23 @@ async def trill_map_feed(
 ):
     """Pins for the signed-in user only (no full GPS arrays)."""
     uid = user["id"]
-    since = _trill_since_dt(range)
+    ctx = _trill_range_context(range)
+    since = ctx["since"]
+    until = ctx["until"]
+    empty = {
+        "pins": [],
+        "range": range,
+        "range_resolved": ctx["range_resolved"],
+        "window": ctx["window"],
+        "pins_returned": 0,
+        "pins_total": 0,
+        "pins_capped": False,
+    }
     try:
         async with core.state.db_pool.acquire() as conn:
             vf_sql, vf_vals = await build_trill_vehicle_filter(
                 conn,
-                3,
+                4,
                 trill_vehicle_make,
                 trill_vehicle_model,
                 make_id=trill_vehicle_make_id,
@@ -1382,6 +1488,26 @@ async def trill_map_feed(
             )
             lat_x = trill_map_lat_sql("u")
             lon_x = trill_map_lon_sql("u")
+            pins_total = int(
+                await conn.fetchval(
+                    f"""
+                    SELECT COUNT(*)::int
+                    FROM uploads u
+                    WHERE u.user_id = $1
+                      AND u.created_at >= $2
+                      AND u.created_at < $3
+                      AND {TRILL_SCORED_PREDICATE.strip()}
+                      AND ({lat_x}) IS NOT NULL
+                      {vf_sql}
+                    """,
+                    uid,
+                    since,
+                    until,
+                    *vf_vals,
+                )
+                or 0
+            )
+            pin_limit_idx = 4 + len(vf_vals)
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -1403,19 +1529,22 @@ async def trill_map_feed(
                 FROM uploads u
                 WHERE u.user_id = $1
                   AND u.created_at >= $2
+                  AND u.created_at < $3
                   AND {TRILL_SCORED_PREDICATE.strip()}
                   AND ({lat_x}) IS NOT NULL
                   {vf_sql}
                 ORDER BY u.created_at DESC
-                LIMIT 200
+                LIMIT ${pin_limit_idx}
                 """,
                 uid,
                 since,
+                until,
                 *vf_vals,
+                limit,
             )
     except Exception as e:
         logger.warning("trill map-feed: %s", e)
-        return {"pins": []}
+        return empty
 
     pins = []
     for r in rows:
@@ -1435,7 +1564,15 @@ async def trill_map_feed(
                 "near_padus": bool(r["near_padus"]),
             }
         )
-    return {"pins": pins}
+    return {
+        "pins": pins,
+        "range": range,
+        "range_resolved": ctx["range_resolved"],
+        "window": ctx["window"],
+        "pins_returned": len(pins),
+        "pins_total": pins_total,
+        "pins_capped": bool(pins_total > len(pins)),
+    }
 
 
 @router.get("/route/{upload_id}")

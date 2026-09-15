@@ -42,14 +42,67 @@ logger = logging.getLogger("uploadm8.catalog_sync")
 _YOUTUBE_SHORTS_MAX_SEC = 180
 
 # ── Tuning constants ────────────────────────────────────────────────────────
-_MAX_PAGES_PER_TOKEN = 10       # max API pages to fetch per token per run (non-YouTube)
+# Non-YouTube pages per token/run (incremental cursors resume next run).
+_MAX_PAGES_PER_TOKEN = max(
+    1, min(30, int(os.environ.get("CATALOG_MAX_PAGES_PER_TOKEN", "15") or 15))
+)
 # YouTube: uploads playlist can exceed 500 videos; env override for large channels.
 _YOUTUBE_CATALOG_MAX_PAGES = max(1, min(50, int(os.environ.get("YOUTUBE_CATALOG_MAX_PAGES", "25") or 25)))
 _PAGE_SIZE_TIKTOK    = 20       # TikTok max_count
 _PAGE_SIZE_YOUTUBE   = 50       # YouTube playlistItems maxResults
 _PAGE_SIZE_META      = 25       # Instagram / Facebook page size
-_SEMAPHORE_LIMIT     = 6        # max concurrent token fetches
+_SEMAPHORE_LIMIT     = 3        # max concurrent token fetches (keep headroom in DB_POOL_MAX=10)
+# Cap Meta Graph insight/object enrichment per catalog token run (approved APIs only).
+_META_PCI_ENRICH_CAP = max(1, min(80, int(os.environ.get("META_PCI_ENRICH_CAP", "80") or 80)))
+# Max enrich batches per token/sync (each batch size = _META_PCI_ENRICH_CAP).
+_META_PCI_ENRICH_MAX_BATCHES = max(1, min(8, int(os.environ.get("META_PCI_ENRICH_MAX_BATCHES", "4") or 4)))
+# Parallel Graph enrich calls within a batch (bounded by meta_graph_slot + pool).
+_META_PCI_ENRICH_CONCURRENCY = max(
+    1, min(8, int(os.environ.get("META_PCI_ENRICH_CONCURRENCY", "4") or 4))
+)
 _RETRY_BACKOFF_BASE  = 0.5      # seconds
+
+# CatalogAgg read cache (PCI-only SUM) — clone of admin KPI 90s TTL pattern.
+_CATALOG_AGG_CACHE_TTL_S = 60.0
+_catalog_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def invalidate_catalog_aggregate_cache(user_id: Optional[str] = None) -> None:
+    """Drop CatalogAgg TTL entries (one user or all)."""
+    if not user_id:
+        _catalog_agg_cache.clear()
+        return
+    prefix = f"{str(user_id)}|"
+    for k in list(_catalog_agg_cache.keys()):
+        if k.startswith(prefix):
+            _catalog_agg_cache.pop(k, None)
+
+
+def _catalog_agg_cache_key(
+    user_id: str,
+    *,
+    period: Optional[str],
+    days: Optional[int],
+    platform: Optional[str],
+    source: Optional[str],
+    account_id: Optional[str],
+    window_start: Optional[datetime],
+    window_end_exclusive: Optional[datetime],
+) -> str:
+    ws = window_start.isoformat() if window_start else ""
+    we = window_end_exclusive.isoformat() if window_end_exclusive else ""
+    return "|".join(
+        [
+            str(user_id),
+            str(period or ""),
+            str(days or ""),
+            str(platform or ""),
+            str(source or ""),
+            str(account_id or ""),
+            ws,
+            we,
+        ]
+    )
 
 
 def _int(v: Any) -> int:
@@ -59,22 +112,55 @@ def _int(v: Any) -> int:
         return 0
 
 
+def _fb_likes_from_graph_object(obj: Dict[str, Any]) -> int:
+    """Prefer reactions.summary (per-video truth); fall back to likes.summary."""
+    reactions = _int(((obj.get("reactions") or {}).get("summary") or {}).get("total_count"))
+    likes = _int(((obj.get("likes") or {}).get("summary") or {}).get("total_count"))
+    return max(reactions, likes)
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _merge_catalog_videos_by_id(a: List[Dict], b: List[Dict]) -> List[Dict]:
-    """Stable merge; first list wins metrics for duplicate platform_video_id."""
-    seen: set = set()
-    out: List[Dict] = []
+    """
+    Merge two catalog list pages by platform_video_id.
+
+    Per-metric GREATEST for views/likes/comments/shares so Facebook /videos +
+    /video_reels never keep a weaker first-wins row (e.g. 0 views from /videos
+    when /video_reels has real plays).
+    """
+    by_id: Dict[str, Dict] = {}
+    order: List[str] = []
+
+    def _absorb(v: Dict) -> None:
+        pid = str(v.get("platform_video_id") or "").strip()
+        if not pid:
+            return
+        if pid not in by_id:
+            by_id[pid] = dict(v)
+            order.append(pid)
+            return
+        cur = by_id[pid]
+        for metric in ("views", "likes", "comments", "shares"):
+            cur[metric] = max(_int(cur.get(metric)), _int(v.get(metric)))
+        for field in ("title", "thumbnail_url", "platform_url", "content_kind", "published_at", "duration_seconds"):
+            if cur.get(field) in (None, "", 0) and v.get(field) not in (None, ""):
+                cur[field] = v.get(field)
+        # Prefer richer extra / surface tags from either side
+        ex_a = cur.get("extra") if isinstance(cur.get("extra"), dict) else {}
+        ex_b = v.get("extra") if isinstance(v.get("extra"), dict) else {}
+        if ex_a or ex_b:
+            merged_ex = dict(ex_a)
+            merged_ex.update(ex_b or {})
+            cur["extra"] = merged_ex
+
     for block in (a, b):
         for v in block:
-            pid = str(v.get("platform_video_id") or "")
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            out.append(v)
-    return out
+            if isinstance(v, dict):
+                _absorb(v)
+    return [by_id[pid] for pid in order]
 
 
 def _youtube_content_kind_and_rule(
@@ -154,10 +240,10 @@ async def _upsert_content_item(
             thumbnail_url      = COALESCE(EXCLUDED.thumbnail_url, platform_content_items.thumbnail_url),
             platform_url       = COALESCE(EXCLUDED.platform_url, platform_content_items.platform_url),
             duration_seconds   = COALESCE(EXCLUDED.duration_seconds, platform_content_items.duration_seconds),
-            views              = GREATEST(EXCLUDED.views, platform_content_items.views),
-            likes              = GREATEST(EXCLUDED.likes, platform_content_items.likes),
-            comments           = GREATEST(EXCLUDED.comments, platform_content_items.comments),
-            shares             = GREATEST(EXCLUDED.shares, platform_content_items.shares),
+            views              = GREATEST(COALESCE(EXCLUDED.views, 0), COALESCE(platform_content_items.views, 0)),
+            likes              = GREATEST(COALESCE(EXCLUDED.likes, 0), COALESCE(platform_content_items.likes, 0)),
+            comments           = GREATEST(COALESCE(EXCLUDED.comments, 0), COALESCE(platform_content_items.comments, 0)),
+            shares             = GREATEST(COALESCE(EXCLUDED.shares, 0), COALESCE(platform_content_items.shares, 0)),
             visibility         = COALESCE(EXCLUDED.visibility, platform_content_items.visibility),
             presence           = COALESCE(EXCLUDED.presence, platform_content_items.presence),
             metrics_synced_at  = NOW(),
@@ -461,7 +547,11 @@ async def _list_instagram_media(
     page_size: int = _PAGE_SIZE_META,
 ) -> Tuple[List[Dict], Optional[str], bool]:
     """Instagram Graph API: list user media (Reels + videos)."""
-    fields = "id,caption,media_type,thumbnail_url,permalink,timestamp,like_count,comments_count"
+    # video_view_count/play_count are best-effort on the media object; insights fill gaps later.
+    fields = (
+        "id,caption,media_type,thumbnail_url,permalink,timestamp,"
+        "like_count,comments_count,video_view_count,play_count"
+    )
     params: Dict[str, Any] = {
         "fields": fields,
         "limit": page_size,
@@ -489,6 +579,8 @@ async def _list_instagram_media(
     paging = data.get("paging") or {}
     next_cursor = (paging.get("cursors") or {}).get("after") if paging.get("next") else None
 
+    from services.meta_graph_metrics import _ig_views_from_media
+
     videos = []
     for m in raw:
         mtype = (m.get("media_type") or "").upper()
@@ -508,7 +600,7 @@ async def _list_instagram_media(
         videos.append({
             "platform_video_id": mid,
             "title": (m.get("caption") or "")[:500],
-            "views": 0,  # IG doesn't expose video_views in basic media endpoint
+            "views": _ig_views_from_media(m),
             "likes": _int(m.get("like_count")),
             "comments": _int(m.get("comments_count")),
             "shares": 0,
@@ -529,7 +621,11 @@ async def _list_facebook_videos(
     page_size: int = _PAGE_SIZE_META,
 ) -> Tuple[List[Dict], Optional[str], bool]:
     """Facebook Graph API: list page videos."""
-    fields = "id,title,description,length,created_time,permalink_url,picture,likes.summary(true),comments.summary(true),shares"
+    fields = (
+        "id,title,description,length,created_time,permalink_url,picture,"
+        "video_views,views,likes.summary(true),reactions.summary(true),"
+        "comments.summary(true),shares"
+    )
     params: Dict[str, Any] = {
         "fields": fields,
         "limit": page_size,
@@ -574,8 +670,8 @@ async def _list_facebook_videos(
         videos.append({
             "platform_video_id": vid_id,
             "title": (v.get("title") or v.get("description") or "")[:500],
-            "views": 0,
-            "likes": _int((v.get("likes") or {}).get("summary", {}).get("total_count")),
+            "views": _int(v.get("video_views") or v.get("views")),
+            "likes": _fb_likes_from_graph_object(v),
             "comments": _int((v.get("comments") or {}).get("summary", {}).get("total_count")),
             "shares": _int((v.get("shares") or {}).get("count")),
             "thumbnail_url": v.get("picture"),
@@ -598,7 +694,11 @@ async def _list_facebook_reels(
     Facebook Graph API: list page Reels (GET). Merged with /videos by id in the sync loop.
     Requires appropriate Page permissions; failures are non-fatal (empty list).
     """
-    fields = "id,title,description,length,created_time,permalink_url,picture,likes.summary(true),comments.summary(true),shares"
+    fields = (
+        "id,title,description,length,created_time,permalink_url,picture,"
+        "video_views,views,likes.summary(true),reactions.summary(true),"
+        "comments.summary(true),shares"
+    )
     params: Dict[str, Any] = {
         "fields": fields,
         "limit": page_size,
@@ -651,8 +751,8 @@ async def _list_facebook_reels(
         videos.append({
             "platform_video_id": vid_id,
             "title": (v.get("title") or v.get("description") or "")[:500],
-            "views": 0,
-            "likes": _int((v.get("likes") or {}).get("summary", {}).get("total_count")),
+            "views": _int(v.get("video_views") or v.get("views")),
+            "likes": _fb_likes_from_graph_object(v),
             "comments": _int((v.get("comments") or {}).get("summary", {}).get("total_count")),
             "shares": _int((v.get("shares") or {}).get("count")),
             "thumbnail_url": v.get("picture"),
@@ -715,6 +815,192 @@ async def _mark_youtube_pci_not_in_catalog(
         return int(str(r).split()[-1])
     except Exception:
         return 0
+
+
+# ── Meta PCI views enrichment (approved insights / object fields only) ───────
+async def _fetch_ig_media_engagement(
+    client: httpx.AsyncClient, access_token: str, media_id: str
+) -> Optional[Dict[str, int]]:
+    from services.meta_graph_metrics import fetch_instagram_media_engagement
+
+    return await fetch_instagram_media_engagement(client, access_token, media_id)
+
+
+async def _fetch_fb_video_engagement(
+    client: httpx.AsyncClient, access_token: str, video_id: str
+) -> Optional[Dict[str, int]]:
+    from services.meta_graph_metrics import fetch_facebook_video_engagement
+
+    return await fetch_facebook_video_engagement(client, access_token, video_id)
+
+
+async def _enrich_meta_pci_views(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    platform: str,
+    account_id: str,
+    platform_token_id: str,
+    access_token: str,
+    cap: int = _META_PCI_ENRICH_CAP,
+    max_batches: int = _META_PCI_ENRICH_MAX_BATCHES,
+) -> int:
+    """
+    Fill views on PCI rows that still have views=0 after list ingest.
+
+    Multi-batch: prefer rows with likes|comments > 0 (engagement without plays),
+    then remaining views=0. Uses only approved Meta Graph insights / object fields.
+    Minimal OAuth mode is a no-op.
+    """
+    from services.meta_oauth import meta_oauth_mode
+
+    if platform not in ("instagram", "facebook"):
+        return 0
+    if not access_token or not account_id:
+        return 0
+    # Minimal OAuth mode lacks insights / advanced media fields — do not invent APIs.
+    if meta_oauth_mode() == "minimal":
+        return 0
+
+    batch_cap = max(1, int(cap))
+    batches = max(1, int(max_batches))
+    enriched_total = 0
+    seen_ids: set = set()
+
+    async def _fetch_batch(prefer_engagement: bool, limit: int) -> List[Any]:
+        # Prefer rows that already have social engagement but no views (list APIs).
+        prefer_sql = (
+            "AND (COALESCE(likes, 0) > 0 OR COALESCE(comments, 0) > 0 OR COALESCE(shares, 0) > 0)"
+            if prefer_engagement
+            else ""
+        )
+        async with pool.acquire() as conn:
+            return await conn.fetch(
+                f"""
+                SELECT platform_video_id, title, content_kind, published_at,
+                       thumbnail_url, platform_url, duration_seconds, source,
+                       likes, comments, shares
+                  FROM platform_content_items
+                 WHERE user_id = $1::uuid
+                   AND platform = $2
+                   AND account_id = $3
+                   AND platform_video_id IS NOT NULL AND platform_video_id != ''
+                   AND COALESCE(views, 0) = 0
+                   {prefer_sql}
+                 ORDER BY (COALESCE(likes,0)+COALESCE(comments,0)+COALESCE(shares,0)) DESC,
+                          published_at DESC NULLS LAST, updated_at DESC NULLS LAST
+                 LIMIT $4
+                """,
+                user_id,
+                platform,
+                account_id,
+                int(limit),
+            )
+
+    enrich_sem = asyncio.Semaphore(_META_PCI_ENRICH_CONCURRENCY)
+
+    async def _enrich_one_row(client: httpx.AsyncClient, r: Any) -> bool:
+        vid = str(r["platform_video_id"] or "").strip()
+        if not vid or vid in seen_ids:
+            return False
+        seen_ids.add(vid)
+        async with enrich_sem:
+            try:
+                if platform == "instagram":
+                    metrics = await _fetch_ig_media_engagement(client, access_token, vid)
+                    if not metrics:
+                        from services.meta_graph_metrics import (
+                            extract_instagram_shortcode,
+                            resolve_instagram_media_id_by_shortcode,
+                        )
+
+                        sc = extract_instagram_shortcode(r["platform_url"])
+                        if sc and account_id:
+                            resolved = await resolve_instagram_media_id_by_shortcode(
+                                client, access_token, str(account_id), sc
+                            )
+                            if resolved and resolved != vid:
+                                metrics = await _fetch_ig_media_engagement(
+                                    client, access_token, resolved
+                                )
+                                if metrics:
+                                    vid = resolved
+                else:
+                    metrics = await _fetch_fb_video_engagement(client, access_token, vid)
+            except Exception as e:
+                logger.debug("[catalog-sync] Meta PCI enrich %s/%s: %s", platform, vid[:16], e)
+                return False
+        if not metrics:
+            return False
+        if not (
+            metrics["views"]
+            or metrics["likes"]
+            or metrics["comments"]
+            or metrics["shares"]
+        ):
+            return False
+        try:
+            async with pool.acquire() as conn:
+                await _upsert_content_item(
+                    conn,
+                    user_id=user_id,
+                    platform_token_id=platform_token_id,
+                    platform=platform,
+                    account_id=account_id,
+                    platform_video_id=vid,
+                    source=str(r["source"] or "external"),
+                    content_kind=r["content_kind"],
+                    title=r["title"],
+                    published_at=r["published_at"],
+                    thumbnail_url=r["thumbnail_url"],
+                    platform_url=metrics.get("platform_url") or r["platform_url"],
+                    duration_seconds=r["duration_seconds"],
+                    views=int(metrics["views"]),
+                    likes=max(int(r["likes"] or 0), int(metrics["likes"])),
+                    comments=max(int(r["comments"] or 0), int(metrics["comments"])),
+                    shares=max(int(r["shares"] or 0), int(metrics["shares"])),
+                )
+            # Count as views-filled only when viewership landed; likes-only stays views=0.
+            return bool(int(metrics.get("views") or 0))
+        except Exception as e:
+            logger.debug("[catalog-sync] Meta PCI upsert %s/%s: %s", platform, vid[:16], e)
+            return False
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for batch_i in range(batches):
+            # First half of batches: engagement-without-views; then any views=0.
+            prefer = batch_i < max(1, batches // 2) or batch_i == 0
+            rows = await _fetch_batch(prefer_engagement=prefer, limit=batch_cap)
+            if not rows and prefer:
+                rows = await _fetch_batch(prefer_engagement=False, limit=batch_cap)
+            if not rows:
+                break
+
+            results = await asyncio.gather(
+                *[_enrich_one_row(client, r) for r in rows],
+                return_exceptions=True,
+            )
+            batch_enriched = sum(1 for x in results if x is True)
+            enriched_total += batch_enriched
+            batch_errors = sum(1 for x in results if isinstance(x, Exception))
+            batch_ok = sum(1 for x in results if x is True or x is False)
+
+            if batch_enriched == 0 and batch_ok == 0 and batch_errors == 0:
+                break
+            if batch_enriched == 0 and batch_ok > 0:
+                # Fetchers ran (likes-only or empty views) — avoid re-hitting the same ids.
+                break
+
+    if enriched_total:
+        logger.info(
+            "[catalog-sync] Meta PCI enrich platform=%s account=%s… enriched=%s batches_cap=%s concurrency=%s",
+            platform,
+            str(account_id)[:10],
+            enriched_total,
+            batches,
+            _META_PCI_ENRICH_CONCURRENCY,
+        )
+    return enriched_total
 
 
 # ── Core per-token sync ─────────────────────────────────────────────────────
@@ -839,7 +1125,9 @@ async def sync_catalog_for_token(
             exhausted_playlist = True
             break
 
-    # Persist final state
+    # Persist linker / YouTube reconcile while status remains syncing; Meta enrich
+    # also runs before the final done/error marker so CatalogAgg poll waits for views.
+    linked = 0
     async with pool.acquire() as conn:
         if platform == "youtube" and exhausted_playlist and seen_youtube_ids:
             n_gone = await _mark_youtube_pci_not_in_catalog(
@@ -860,6 +1148,51 @@ async def sync_catalog_for_token(
         # can query fresh metrics going forward.
         if platform == "tiktok":
             await _backfill_tiktok_video_ids(conn, user_id, account_id)
+        # Promote remaining external rows → linked via video-id (any account) and
+        # high-confidence title + publish-time match (all platforms).
+        try:
+            linked += await _link_external_pci_to_uploads(
+                conn, user_id, platform=platform, account_id=account_id
+            )
+        except Exception as e:
+            logger.warning("[catalog-sync] external→upload link failed %s: %s", platform, e)
+
+    # Meta: list APIs often leave views=0 — enrich while status stays syncing so
+    # CatalogAgg sync-status poll waits for views fill before refresh.
+    if platform in ("instagram", "facebook") and access_token:
+        try:
+            await _enrich_meta_pci_views(
+                pool,
+                user_id=user_id,
+                platform=platform,
+                account_id=account_id,
+                platform_token_id=token_row_id,
+                access_token=access_token,
+            )
+        except Exception as e:
+            logger.warning("[catalog-sync] Meta PCI enrich failed %s: %s", platform, e)
+        # Catalog cards can show views while dashboard chips stay 0 until sync-analytics
+        # merges — mirror PCI engagement onto linked uploads immediately.
+        try:
+            from services.upload_analytics_sync import mirror_pci_metrics_into_uploads
+
+            mirrored = await mirror_pci_metrics_into_uploads(
+                pool,
+                user_id=user_id,
+                platform=platform,
+                account_id=account_id,
+            )
+            if mirrored:
+                logger.info(
+                    "[catalog-sync] mirrored PCI→uploads n=%s platform=%s account=%s…",
+                    mirrored,
+                    platform,
+                    str(account_id)[:10],
+                )
+        except Exception as e:
+            logger.warning("[catalog-sync] PCI→uploads mirror failed %s: %s", platform, e)
+
+    async with pool.acquire() as conn:
         await _update_sync_state(
             conn,
             user_id=user_id, platform_token_id=token_row_id, platform=platform,
@@ -945,7 +1278,9 @@ async def _backfill_tiktok_video_ids(
         if not isinstance(pr, list):
             pr = []
 
-        # Check if TikTok entry already has a valid platform_video_id
+        # Check if TikTok entry already has a *real* platform_video_id.
+        # Content Posting often leaves publish_id copied into platform_video_id;
+        # that is not queryable via video/query and must still be backfilled.
         already_has_id = False
         tiktok_idx = -1
         for i, p in enumerate(pr):
@@ -954,7 +1289,8 @@ async def _backfill_tiktok_video_ids(
             if str(p.get("platform") or "").lower() != "tiktok":
                 continue
             vid = str(p.get("platform_video_id") or p.get("video_id") or "").strip()
-            if vid and vid != "null":
+            publish_id = str(p.get("publish_id") or p.get("publishId") or "").strip()
+            if vid and vid != "null" and vid != publish_id:
                 already_has_id = True
                 break
             tiktok_idx = i
@@ -1060,7 +1396,7 @@ async def _link_uploads_for_user_token(
     """
     rows = await conn.fetch(
         """
-        SELECT id, platform_results, title, thumbnail_r2_key, created_at,
+        SELECT id, platform_results, title, thumbnail_r2_key, created_at, completed_at,
                platforms, views, likes, comments, shares
         FROM uploads
         WHERE user_id = $1
@@ -1121,8 +1457,10 @@ async def _link_uploads_for_user_token(
                 linked += 1
                 continue
 
-            # If no external row exists yet, insert as 'uploadm8' sourced
-            pub_at = row["created_at"]
+            # If no external row exists yet, insert as 'uploadm8' sourced.
+            # Prefer completed_at so COALESCE(pci.published_at, u.completed_at, …)
+            # is not stuck on job create time for late-finishing publishes.
+            pub_at = _seed_pci_published_at(row)
             # Seed engagement from upload columns / per-platform PR so catalog
             # cards are not stuck at 0 until the next list-API upsert.
             seed_views = seed_likes = seed_comments = seed_shares = 0
@@ -1188,6 +1526,354 @@ async def _link_uploads_for_user_token(
                 linked += 1
             except Exception as e:
                 logger.debug(f"[catalog-sync] upload insert error: {e}")
+
+    return linked
+
+
+# ── External PCI → upload matching (id + title/time) ─────────────────────────
+_TITLE_TIME_WINDOW_HOURS = max(
+    1, min(48, int(os.environ.get("CATALOG_LINK_TITLE_WINDOW_HOURS", "12") or 12))
+)
+_MIN_TITLE_NORM_LEN = 6
+
+
+def _norm_catalog_title(s: Any) -> str:
+    """Normalize titles/captions for fuzzy catalog↔upload matching."""
+    import re
+
+    t = str(s or "").lower()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _parse_ts(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+    try:
+        s = str(v).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def score_title_time_match(
+    *,
+    pci_title: Any,
+    pci_published_at: Any,
+    upload_title: Any,
+    upload_caption: Any,
+    upload_completed_at: Any,
+    upload_created_at: Any = None,
+    window_hours: int = _TITLE_TIME_WINDOW_HOURS,
+) -> int:
+    """
+    Confidence score for linking an external PCI row to an upload.
+    0 = no match. Higher is better (exact title + within time window wins).
+    Ambiguous multi-matches must still be rejected by the caller.
+    """
+    pci_n = _norm_catalog_title(pci_title)
+    up_n = _norm_catalog_title(upload_title)
+    cap_n = _norm_catalog_title(upload_caption)
+    if not pci_n or len(pci_n) < _MIN_TITLE_NORM_LEN:
+        return 0
+
+    title_score = 0
+    if up_n and len(up_n) >= _MIN_TITLE_NORM_LEN:
+        if up_n == pci_n:
+            title_score = 100
+        elif up_n in pci_n or pci_n in up_n:
+            # Require substantial overlap (avoid short-substring collisions).
+            shorter = min(len(up_n), len(pci_n))
+            longer = max(len(up_n), len(pci_n))
+            ratio = shorter / max(longer, 1)
+            # Contained phrase ≥12 chars is enough even if the other title is longer.
+            if shorter >= _MIN_TITLE_NORM_LEN and (ratio >= 0.55 or shorter >= 12):
+                title_score = 70
+    if title_score == 0 and cap_n and len(cap_n) >= 8:
+        if cap_n == pci_n:
+            title_score = 90
+        elif cap_n in pci_n or pci_n in cap_n:
+            shorter = min(len(cap_n), len(pci_n))
+            longer = max(len(cap_n), len(pci_n))
+            if shorter >= 8 and shorter / max(longer, 1) >= 0.55:
+                title_score = 60
+    if title_score == 0:
+        return 0
+
+    pci_ts = _parse_ts(pci_published_at)
+    up_ts = _parse_ts(upload_completed_at) or _parse_ts(upload_created_at)
+    if pci_ts and up_ts:
+        delta_h = abs((pci_ts - up_ts).total_seconds()) / 3600.0
+        if delta_h > float(window_hours):
+            return 0
+        # Prefer closer times
+        proximity = max(0, int(30 * (1.0 - (delta_h / float(window_hours)))))
+        return title_score + proximity
+
+    # No timestamps: only allow exact title (high bar)
+    if title_score >= 100:
+        return title_score
+    return 0
+
+
+def _collect_pr_video_ids(pr: Any, platform: str) -> Dict[str, Dict[str, Any]]:
+    """Map platform_video_id → PR entry for a platform."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(pr, str):
+        try:
+            pr = json.loads(pr)
+        except Exception:
+            pr = []
+    if isinstance(pr, dict):
+        pr = [{"platform": k, **v} if isinstance(v, dict) else {"platform": k} for k, v in pr.items()]
+    if not isinstance(pr, list):
+        return out
+    plat = str(platform or "").lower()
+    for p in pr:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("platform") or "").lower() != plat:
+            continue
+        vid = (
+            p.get("platform_video_id")
+            or p.get("video_id")
+            or p.get("tiktok_video_id")
+            or p.get("youtube_video_id")
+            or p.get("media_id")
+            or p.get("post_id")
+        )
+        vid_s = str(vid or "").strip()
+        if vid_s and vid_s.lower() not in ("null", "none"):
+            out[vid_s] = p
+    return out
+
+
+async def _patch_upload_pr_video(
+    conn: asyncpg.Connection,
+    *,
+    upload_id: str,
+    platform: str,
+    account_id: str,
+    platform_video_id: str,
+    platform_url: Optional[str],
+) -> None:
+    """Ensure platform_results contains the matched video id / URL for chips."""
+    row = await conn.fetchrow(
+        "SELECT platform_results FROM uploads WHERE id = $1::uuid",
+        upload_id,
+    )
+    if not row:
+        return
+    pr = row["platform_results"]
+    for _ in range(4):
+        if isinstance(pr, str):
+            try:
+                pr = json.loads(pr)
+            except Exception:
+                pr = []
+                break
+        else:
+            break
+    if not isinstance(pr, list):
+        pr = []
+    plat = str(platform or "").lower()
+    vid = str(platform_video_id or "").strip()
+    url = (platform_url or "").strip() or None
+    idx = -1
+    for i, p in enumerate(pr):
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("platform") or "").lower() != plat:
+            continue
+        existing = str(
+            p.get("platform_video_id") or p.get("video_id") or p.get("media_id") or ""
+        ).strip()
+        acct = str(p.get("account_id") or "").strip()
+        if existing == vid or (not existing and (not acct or acct == str(account_id))):
+            idx = i
+            break
+        if idx < 0:
+            idx = i  # fallback: first entry for platform
+    if idx >= 0:
+        pr[idx]["platform_video_id"] = vid
+        pr[idx]["video_id"] = vid
+        if account_id and not pr[idx].get("account_id"):
+            pr[idx]["account_id"] = account_id
+        if url:
+            pr[idx]["platform_url"] = url
+            pr[idx]["url"] = url
+        if pr[idx].get("success") is None:
+            pr[idx]["success"] = True
+    else:
+        pr.append({
+            "platform": plat,
+            "account_id": account_id,
+            "platform_video_id": vid,
+            "video_id": vid,
+            "platform_url": url,
+            "url": url,
+            "success": True,
+        })
+    await conn.execute(
+        """
+        UPDATE uploads
+           SET platform_results = $1::jsonb, updated_at = NOW()
+         WHERE id = $2::uuid
+        """,
+        pr,
+        upload_id,
+    )
+
+
+async def _link_external_pci_to_uploads(
+    conn: asyncpg.Connection,
+    user_id: str,
+    *,
+    platform: str,
+    account_id: str,
+) -> int:
+    """
+    Promote remaining ``source='external'`` PCI rows for this account into
+    ``linked`` when they match an UploadM8 upload by:
+      1) exact platform_video_id already present on any upload PR (any account)
+      2) unique high-confidence title + publish-time match
+
+    Also patches ``uploads.platform_results`` so queue chips get direct links.
+    Returns number of PCI rows linked.
+    """
+    plat = str(platform or "").lower().strip()
+    if not plat:
+        return 0
+
+    pci_rows = await conn.fetch(
+        """
+        SELECT id, platform_video_id, title, published_at, platform_url,
+               views, likes, comments, shares, account_id
+          FROM platform_content_items
+         WHERE user_id = $1::uuid
+           AND platform = $2
+           AND account_id = $3
+           AND source = 'external'
+           AND upload_id IS NULL
+           AND platform_video_id IS NOT NULL
+           AND platform_video_id != ''
+        """,
+        user_id,
+        plat,
+        account_id,
+    )
+    if not pci_rows:
+        return 0
+
+    upload_rows = await conn.fetch(
+        """
+        SELECT id, title, caption, platform_results, created_at, completed_at
+          FROM uploads
+         WHERE user_id = $1::uuid
+           AND status IN ('completed', 'succeeded', 'partial')
+           AND $2 = ANY(platforms)
+        """,
+        user_id,
+        plat,
+    )
+
+    # Index uploads by video id for exact matches
+    by_vid: Dict[str, List[str]] = {}
+    upload_meta: Dict[str, dict] = {}
+    for u in upload_rows:
+        uid = str(u["id"])
+        upload_meta[uid] = dict(u)
+        for vid in _collect_pr_video_ids(u["platform_results"], plat).keys():
+            by_vid.setdefault(vid, []).append(uid)
+
+    linked = 0
+    for pci in pci_rows:
+        pci_id = pci["id"]
+        vid = str(pci["platform_video_id"] or "").strip()
+        if not vid:
+            continue
+
+        chosen: Optional[str] = None
+
+        # 1) Exact video id on an upload (account-agnostic)
+        cand_ids = list(dict.fromkeys(by_vid.get(vid) or []))
+        if len(cand_ids) == 1:
+            chosen = cand_ids[0]
+        elif len(cand_ids) > 1:
+            # Ambiguous id ownership — skip
+            continue
+
+        # 2) Title + time (unique winner only)
+        if not chosen:
+            scored: List[Tuple[int, str]] = []
+            for uid, meta in upload_meta.items():
+                sc = score_title_time_match(
+                    pci_title=pci.get("title"),
+                    pci_published_at=pci.get("published_at"),
+                    upload_title=meta.get("title"),
+                    upload_caption=meta.get("caption"),
+                    upload_completed_at=meta.get("completed_at"),
+                    upload_created_at=meta.get("created_at"),
+                )
+                if sc > 0:
+                    scored.append((sc, uid))
+            if not scored:
+                continue
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            best_score, best_uid = scored[0]
+            # Require clear winner (no tie within 10 points)
+            if len(scored) > 1 and scored[0][0] - scored[1][0] < 10:
+                continue
+            if best_score < 70:
+                continue
+            chosen = best_uid
+
+        if not chosen:
+            continue
+
+        try:
+            result = await conn.execute(
+                """
+                UPDATE platform_content_items
+                   SET upload_id  = $1::uuid,
+                       source     = 'linked',
+                       updated_at = NOW()
+                 WHERE id = $2
+                   AND user_id = $3::uuid
+                   AND source = 'external'
+                   AND upload_id IS NULL
+                """,
+                chosen,
+                pci_id,
+                user_id,
+            )
+            if not result or result == "UPDATE 0":
+                continue
+            await _patch_upload_pr_video(
+                conn,
+                upload_id=chosen,
+                platform=plat,
+                account_id=str(pci.get("account_id") or account_id),
+                platform_video_id=vid,
+                platform_url=pci.get("platform_url"),
+            )
+            linked += 1
+            by_vid.setdefault(vid, []).append(chosen)
+            logger.info(
+                "[catalog-sync] external→linked upload=%s platform=%s video=%s",
+                chosen[:8],
+                plat,
+                vid[:16],
+            )
+        except Exception as e:
+            logger.debug("[catalog-sync] external link update error: %s", e)
 
     return linked
 
@@ -1278,10 +1964,95 @@ async def sync_catalog_for_user(
         totals["errors"] += r.get("errors", 0)
         totals["tokens"] += 1
 
+    invalidate_catalog_aggregate_cache(uid)
     return totals
 
 
 # ── Aggregate stats query ───────────────────────────────────────────────────
+def _seed_pci_published_at(row: Any) -> Any:
+    """Prefer upload completion time over job create time when seeding PCI publish ts."""
+    if row is None:
+        return None
+    try:
+        return row.get("completed_at") or row.get("created_at")
+    except AttributeError:
+        return None
+
+
+def _resolve_catalog_period(
+    period: Optional[str],
+    *,
+    days: Optional[int] = None,
+) -> tuple[Optional[str], str]:
+    """
+    Resolve a user period into (sql_interval|None, canonical_key).
+
+    ``sql_interval`` is a Postgres INTERVAL literal body (e.g. ``'30 days'``),
+    or ``None`` for all-time. Canonical key always matches the SQL window
+    (unknown tokens fall back to ``30d`` / ``30 days`` together).
+    """
+    import re as _re
+
+    if not period:
+        if days and days > 0:
+            d = int(days)
+            return f"{d} days", f"{d}d"
+        return "30 days", "30d"
+
+    p = str(period).strip().lower()
+    if p in ("all", "0", ""):
+        return None, "all"
+
+    # UI aliases (CatalogAgg + analytics header)
+    if p in ("1y", "year", "365d", "365"):
+        return "365 days", "1y"
+    if p in ("month", "30"):
+        return "30 days", "30d"
+    if p in ("week", "7"):
+        return "7 days", "7d"
+    if p in ("day", "1d", "24"):
+        return "24 hours", "24h"
+
+    if _re.fullmatch(r"\d+", p):
+        n = int(p)
+        return f"{n} days", f"{n}d"
+
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*d(?:ays?)?", p)
+    if m:
+        v = float(m.group(1))
+        if v == 365:
+            return "365 days", "1y"
+        iv = f"{v} days" if v != int(v) else f"{int(v)} days"
+        key = f"{v}d" if v != int(v) else f"{int(v)}d"
+        return iv, key
+
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*h(?:ours?)?", p)
+    if m:
+        v = float(m.group(1))
+        iv = f"{v} hours" if v != int(v) else f"{int(v)} hours"
+        key = f"{v}h" if v != int(v) else f"{int(v)}h"
+        return iv, key
+
+    # Months before minutes — ``6mo`` / ``6months`` (``6m`` remains minutes)
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*mo(?:nths?)?", p)
+    if m:
+        v = float(m.group(1))
+        days = int(v * 30) if v == int(v) else v * 30
+        iv = f"{days} days" if isinstance(days, float) and days != int(days) else f"{int(days)} days"
+        key = f"{int(days)}d" if days == int(days) else f"{days}d"
+        return iv, key
+
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?", p)
+    if m:
+        v = float(m.group(1))
+        iv = f"{v} minutes" if v != int(v) else f"{int(v)} minutes"
+        key = f"{v}m" if v != int(v) else f"{int(v)}m"
+        return iv, key
+
+    # Unrecognised — safe 30d fallback; key matches SQL (not the raw token)
+    return "30 days", "30d"
+
+
 def _parse_period_to_sql_interval(period: Optional[str]) -> Optional[str]:
     """
     Convert a user-facing period string to a Postgres INTERVAL expression.
@@ -1290,56 +2061,27 @@ def _parse_period_to_sql_interval(period: Optional[str]) -> Optional[str]:
         • "7d"  / "7 days"  / "30"  (bare number → days)
         • "7h"  / "7 hours"
         • "7m"  / "7 minutes"
+        • "week" / "day" / "1y" aliases
         • "all" / ""  / None  → no time filter
 
     Returns a Postgres-safe interval string like '7 days' / '7 hours',
-    or None for "all time".
+    or None for "all time". Unknown tokens → ``30 days``.
     """
-    import re as _re
-    if not period or str(period).lower() in ("all", "0", ""):
+    if period is None or str(period).strip().lower() in ("all", "0", ""):
         return None
-    p = str(period).strip().lower()
-    # UI aliases
-    if p in ("1y", "year", "365d"):
-        return "365 days"
-    if p in ("month",):
-        return "30 days"
-    # bare integer → days
-    if _re.fullmatch(r"\d+", p):
-        return f"{int(p)} days"
-    # e.g. "7d", "7 days", "30days"
-    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*d(?:ays?)?", p)
-    if m:
-        v = float(m.group(1))
-        return f"{v} days" if v != int(v) else f"{int(v)} days"
-    # e.g. "7h", "24hours", "7 hours"
-    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*h(?:ours?)?", p)
-    if m:
-        v = float(m.group(1))
-        return f"{v} hours" if v != int(v) else f"{int(v)} hours"
-    # e.g. "30m", "90 minutes"
-    m = _re.fullmatch(r"(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?", p)
-    if m:
-        v = float(m.group(1))
-        return f"{v} minutes" if v != int(v) else f"{int(v)} minutes"
-    # Unrecognised — treat as "30 days" safe fallback
-    return "30 days"
+    interval, _ = _resolve_catalog_period(period)
+    return interval
 
 
 def _normalize_period_key(period: Optional[str], *, days: Optional[int] = None) -> str:
     """Canonical period label returned in API JSON (matches CatalogAgg dropdown values)."""
-    if not period and days and days > 0:
-        return f"{int(days)}d"
-    if not period:
-        return "30d"
-    p = str(period).strip().lower()
-    if p in ("all", "0", ""):
+    if period is None or (isinstance(period, str) and not str(period).strip()):
+        _, key = _resolve_catalog_period(None, days=days)
+        return key
+    if str(period).strip().lower() in ("all", "0"):
         return "all"
-    if p in ("1y", "year", "365d"):
-        return "1y"
-    if p in ("month", "30"):
-        return "30d"
-    return p
+    _, key = _resolve_catalog_period(period, days=days)
+    return key
 
 
 async def get_catalog_aggregate(
@@ -1355,18 +2097,37 @@ async def get_catalog_aggregate(
 ) -> Dict[str, Any]:
     """
     Return aggregated views/likes/comments/shares + per-platform breakdown
-    and per-source breakdown from `platform_content_items`.
+    and per-source breakdown from ``platform_content_items`` only (PCI SUM).
 
     Time filtering (first match wins), on
-    ``COALESCE(pci.published_at, u.completed_at, u.created_at)`` (joins ``uploads``):
+    ``COALESCE(pci.published_at, u.completed_at, u.created_at)`` (joins ``uploads``
+    for timestamp fallback only — metrics are not merged from uploads /
+    platform_results; use canonical engagement / Analytics for that):
 
       • Custom UTC window: half-open [start, end) on that effective timestamp.
       • Rolling ``period`` / ``days``: last N hours/days/minutes on that timestamp.
-      • Metrics: ``GREATEST`` catalog row vs linked ``uploads`` row when the upload
-        targets a single platform (or ``platforms`` is unset), matching
-        ``GET /api/catalog/content``.
     """
+    import time as _time
+
     uid = str(user_id)
+    cache_key = _catalog_agg_cache_key(
+        uid,
+        period=period,
+        days=days,
+        platform=platform,
+        source=source,
+        account_id=account_id,
+        window_start=window_start,
+        window_end_exclusive=window_end_exclusive,
+    )
+    cached = _catalog_agg_cache.get(cache_key)
+    if cached:
+        ts, payload = cached
+        if (_time.monotonic() - ts) < _CATALOG_AGG_CACHE_TTL_S:
+            out = dict(payload)
+            out["cache"] = {"hit": True, "ttl_s": _CATALOG_AGG_CACHE_TTL_S}
+            return out
+
     conditions = ["pci.user_id = $1"]
     params: List[Any] = [uid]
 
@@ -1411,110 +2172,59 @@ async def get_catalog_aggregate(
 
     where = " AND ".join(conditions)
 
-    # Per-platform metrics from uploads.platform_results (multi-platform safe).
-    _pr_metric = lambda col, alts: f"""COALESCE((
-        SELECT GREATEST(
-            COALESCE(NULLIF(elem->>'{col}', '')::bigint, 0),
-            {", ".join(f"COALESCE(NULLIF(elem->>'{a}', '')::bigint, 0)" for a in alts)}
+    # Single CTE: PCI metrics only (no uploads.platform_results merge on this path).
+    agg_sql = f"""
+        WITH filtered AS (
+            SELECT
+                pci.platform,
+                pci.source,
+                COALESCE(pci.views, 0)::bigint AS views,
+                COALESCE(pci.likes, 0)::bigint AS likes,
+                COALESCE(pci.comments, 0)::bigint AS comments,
+                COALESCE(pci.shares, 0)::bigint AS shares
+            FROM platform_content_items pci
+            LEFT JOIN uploads u ON u.id = pci.upload_id AND u.user_id = pci.user_id
+            WHERE {where}
+        ),
+        totals AS (
+            SELECT
+                COUNT(*)::bigint AS total_videos,
+                COALESCE(SUM(views), 0)::bigint AS views,
+                COALESCE(SUM(likes), 0)::bigint AS likes,
+                COALESCE(SUM(comments), 0)::bigint AS comments,
+                COALESCE(SUM(shares), 0)::bigint AS shares
+            FROM filtered
+        ),
+        by_platform AS (
+            SELECT
+                platform,
+                COUNT(*)::bigint AS video_count,
+                COALESCE(SUM(views), 0)::bigint AS views,
+                COALESCE(SUM(likes), 0)::bigint AS likes,
+                COALESCE(SUM(comments), 0)::bigint AS comments,
+                COALESCE(SUM(shares), 0)::bigint AS shares
+            FROM filtered
+            GROUP BY platform
+        ),
+        by_source AS (
+            SELECT
+                source,
+                COUNT(*)::bigint AS video_count,
+                COALESCE(SUM(views), 0)::bigint AS views
+            FROM filtered
+            GROUP BY source
         )
-        FROM jsonb_array_elements(
-            CASE
-                WHEN u.platform_results IS NULL THEN '[]'::jsonb
-                WHEN jsonb_typeof(u.platform_results) = 'array' THEN u.platform_results
-                ELSE '[]'::jsonb
-            END
-        ) AS elem
-        WHERE lower(trim(COALESCE(elem->>'platform', ''))) = lower(trim(pci.platform::text))
-        ORDER BY 1 DESC NULLS LAST
-        LIMIT 1
-    ), 0)"""
-
-    _pr_views = _pr_metric("views", ("view_count", "play_count", "impressions", "video_views"))
-    _pr_likes = _pr_metric("likes", ("like_count", "reactions", "reaction_count"))
-    _pr_comments = _pr_metric("comments", ("comment_count",))
-    _pr_shares = _pr_metric("shares", ("share_count",))
-
-    _merge_views = f"""GREATEST(
-        COALESCE(pci.views,0)::bigint,
-        {_pr_views}::bigint,
-        CASE
-            WHEN u.id IS NULL THEN 0
-            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-            THEN COALESCE(u.views,0)::bigint
-            ELSE 0
-        END
-    )"""
-    _merge_likes = f"""GREATEST(
-        COALESCE(pci.likes,0)::bigint,
-        {_pr_likes}::bigint,
-        CASE
-            WHEN u.id IS NULL THEN 0
-            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-            THEN COALESCE(u.likes,0)::bigint
-            ELSE 0
-        END
-    )"""
-    _merge_comments = f"""GREATEST(
-        COALESCE(pci.comments,0)::bigint,
-        {_pr_comments}::bigint,
-        CASE
-            WHEN u.id IS NULL THEN 0
-            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-            THEN COALESCE(u.comments,0)::bigint
-            ELSE 0
-        END
-    )"""
-    _merge_shares = f"""GREATEST(
-        COALESCE(pci.shares,0)::bigint,
-        {_pr_shares}::bigint,
-        CASE
-            WHEN u.id IS NULL THEN 0
-            WHEN u.platforms IS NULL OR COALESCE(cardinality(u.platforms), 0) = 0
-              OR (cardinality(u.platforms) = 1 AND lower(trim(u.platforms[1])) = lower(trim(pci.platform::text)))
-            THEN COALESCE(u.shares,0)::bigint
-            ELSE 0
-        END
-    )"""
-    _from = """
-        platform_content_items pci
-        LEFT JOIN uploads u ON u.id = pci.upload_id AND u.user_id = pci.user_id
+        SELECT
+            (SELECT row_to_json(t) FROM totals t) AS totals,
+            COALESCE(
+                (SELECT json_agg(row_to_json(p) ORDER BY p.views DESC) FROM by_platform p),
+                '[]'::json
+            ) AS by_platform,
+            COALESCE(
+                (SELECT json_agg(row_to_json(s)) FROM by_source s),
+                '[]'::json
+            ) AS by_source
     """
-
-    total_sql = f"""
-            SELECT
-                COUNT(*) as total_videos,
-                COALESCE(SUM({_merge_views}), 0)    as views,
-                COALESCE(SUM({_merge_likes}), 0)    as likes,
-                COALESCE(SUM({_merge_comments}), 0) as comments,
-                COALESCE(SUM({_merge_shares}), 0)   as shares
-            FROM {_from}
-            WHERE {where}
-            """
-    platform_sql = f"""
-            SELECT
-                pci.platform as platform,
-                COUNT(*) as video_count,
-                COALESCE(SUM({_merge_views}), 0)    as views,
-                COALESCE(SUM({_merge_likes}), 0)    as likes,
-                COALESCE(SUM({_merge_comments}), 0) as comments,
-                COALESCE(SUM({_merge_shares}), 0)   as shares
-            FROM {_from}
-            WHERE {where}
-            GROUP BY pci.platform
-            ORDER BY views DESC
-            """
-    source_sql = f"""
-            SELECT
-                pci.source as source,
-                COUNT(*) as video_count,
-                COALESCE(SUM({_merge_views}), 0) as views
-            FROM {_from}
-            WHERE {where}
-            GROUP BY pci.source
-            """
     sync_sql = """
             SELECT platform, status, last_synced_at, total_discovered, total_linked
             FROM platform_content_sync_state
@@ -1522,32 +2232,33 @@ async def get_catalog_aggregate(
             ORDER BY last_synced_at DESC NULLS LAST
             """
 
-    q_params = tuple(params)
-
-    async def _load_total():
+    async def _load_agg():
         async with pool.acquire() as conn:
-            return await conn.fetchrow(total_sql, *q_params)
-
-    async def _load_platform():
-        async with pool.acquire() as conn:
-            return await conn.fetch(platform_sql, *q_params)
-
-    async def _load_source():
-        async with pool.acquire() as conn:
-            return await conn.fetch(source_sql, *q_params)
+            return await conn.fetchrow(agg_sql, *params)
 
     async def _load_sync():
         async with pool.acquire() as conn:
             return await conn.fetch(sync_sql, uid)
 
-    total_row, platform_rows, source_rows, sync_rows = await asyncio.gather(
-        _load_total(), _load_platform(), _load_source(), _load_sync()
-    )
+    agg_row, sync_rows = await asyncio.gather(_load_agg(), _load_sync())
 
-    total_views = int(total_row["views"] or 0)
-    total_likes = int(total_row["likes"] or 0)
-    total_comments = int(total_row["comments"] or 0)
-    total_shares = int(total_row["shares"] or 0)
+    totals_obj = agg_row["totals"] if agg_row else None
+    if isinstance(totals_obj, str):
+        totals_obj = json.loads(totals_obj)
+    totals_obj = totals_obj or {}
+    platform_raw = agg_row["by_platform"] if agg_row else None
+    source_raw = agg_row["by_source"] if agg_row else None
+    if isinstance(platform_raw, str):
+        platform_raw = json.loads(platform_raw)
+    if isinstance(source_raw, str):
+        source_raw = json.loads(source_raw)
+    platform_rows = platform_raw or []
+    source_rows = source_raw or []
+
+    total_views = int(totals_obj.get("views") or 0)
+    total_likes = int(totals_obj.get("likes") or 0)
+    total_comments = int(totals_obj.get("comments") or 0)
+    total_shares = int(totals_obj.get("shares") or 0)
     total_eng = (
         round((total_likes + total_comments + total_shares) / total_views * 100, 2)
         if total_views > 0 else 0.0
@@ -1555,17 +2266,26 @@ async def get_catalog_aggregate(
 
     by_platform = {}
     for r in platform_rows:
-        v = int(r["views"] or 0)
-        l = int(r["likes"] or 0)
-        c = int(r["comments"] or 0)
-        s = int(r["shares"] or 0)
-        by_platform[r["platform"]] = {
-            "video_count": int(r["video_count"]),
+        if not isinstance(r, dict):
+            continue
+        v = int(r.get("views") or 0)
+        l = int(r.get("likes") or 0)
+        c = int(r.get("comments") or 0)
+        s = int(r.get("shares") or 0)
+        by_platform[r.get("platform")] = {
+            "video_count": int(r.get("video_count") or 0),
             "views": v, "likes": l, "comments": c, "shares": s,
             "engagement_rate": round((l + c + s) / v * 100, 2) if v > 0 else 0.0,
         }
 
-    by_source = {r["source"]: {"video_count": int(r["video_count"]), "views": int(r["views"] or 0)} for r in source_rows}
+    by_source = {}
+    for r in source_rows:
+        if not isinstance(r, dict):
+            continue
+        by_source[r.get("source")] = {
+            "video_count": int(r.get("video_count") or 0),
+            "views": int(r.get("views") or 0),
+        }
 
     sync_status = [
         {
@@ -1584,7 +2304,7 @@ async def get_catalog_aggregate(
         period_out = _normalize_period_key(period, days=days)
 
     out: Dict[str, Any] = {
-        "total_videos": int(total_row["total_videos"] or 0),
+        "total_videos": int(totals_obj.get("total_videos") or 0),
         "views": total_views,
         "likes": total_likes,
         "comments": total_comments,
@@ -1597,12 +2317,46 @@ async def get_catalog_aggregate(
         "window_start_utc": window_start.isoformat() if window_start else None,
         "window_end_exclusive_utc": window_end_exclusive.isoformat() if window_end_exclusive else None,
         "generated_at": _now().isoformat(),
+        "cache": {"hit": False, "ttl_s": _CATALOG_AGG_CACHE_TTL_S},
+        "pci_likes_without_views": 0,
+        "has_more_pages": False,
     }
+    try:
+        async with pool.acquire() as conn:
+            health = await conn.fetchrow(
+                """
+                SELECT
+                  (
+                    SELECT COUNT(*)::int FROM platform_content_items
+                     WHERE user_id = $1::uuid
+                       AND lower(platform) IN ('instagram', 'facebook')
+                       AND COALESCE(views, 0) = 0
+                       AND (
+                         COALESCE(likes, 0) > 0
+                         OR COALESCE(comments, 0) > 0
+                         OR COALESCE(shares, 0) > 0
+                       )
+                  ) AS pci_likes_without_views,
+                  (
+                    SELECT EXISTS(
+                      SELECT 1 FROM platform_content_sync_state
+                       WHERE user_id = $1::uuid AND next_cursor IS NOT NULL
+                    )
+                  ) AS has_more_pages
+                """,
+                uid,
+            )
+        if health:
+            out["pci_likes_without_views"] = int(health["pci_likes_without_views"] or 0)
+            out["has_more_pages"] = bool(health["has_more_pages"])
+    except Exception:
+        pass
+
     out["kpi_sources"] = {
         "canonical_engagement_rollup_version": CANONICAL_ENGAGEMENT_ROLLUP_VERSION,
         "vs_canonical_headline": (
             "GET /api/analytics uses deduped canonical engagement (pci + successful platform_results). "
-            "This endpoint uses catalog SQL only — see metric_definitions.catalog_aggregate_engagement "
+            "This endpoint SUMs platform_content_items metrics only — see metric_definitions.catalog_aggregate_engagement "
             "and metric_definitions.engagement_crosswalk."
         ),
         "live_aggregate": (
@@ -1610,11 +2364,13 @@ async def get_catalog_aggregate(
         ),
         "time_basis": (
             "Filter and bucket rows by COALESCE(pci.published_at, u.completed_at, u.created_at) "
-            "(half-open when explicit window; rolling NOW() - interval when using period/days)."
+            "(half-open when explicit window; rolling NOW() - interval when using period/days). "
+            "Metric values are PCI columns only (no platform_results merge)."
         ),
         "period_label": period_out,
     }
     out["metric_definitions"] = metric_definitions_svc.for_catalog_aggregate()
+    _catalog_agg_cache[cache_key] = (_time.monotonic(), {k: v for k, v in out.items() if k != "cache"})
     return out
 
 

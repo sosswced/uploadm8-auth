@@ -163,6 +163,21 @@ def get_ml_hub_urls() -> Dict[str, Optional[str]]:
     if not content_model_url and content_model_repo:
         content_model_url = f"https://huggingface.co/{content_model_repo}"
 
+    # AV-read dataset/model — auto-default from promo owner (mirror content); still opt-in train.
+    av_dataset_repo = _env("UM8_HF_AV_DATASET_REPO")
+    av_model_repo = _env("UM8_HF_AV_MODEL_REPO")
+    if promo_owner:
+        if not av_dataset_repo:
+            av_dataset_repo = f"{promo_owner}/uploadm8-av-read-v1"
+        if not av_model_repo:
+            av_model_repo = f"{promo_owner}/uploadm8-av-read-model-v1"
+    av_dataset_url = _env("UM8_HF_AV_DATASET_URL")
+    if not av_dataset_url and av_dataset_repo:
+        av_dataset_url = f"https://huggingface.co/datasets/{av_dataset_repo}"
+    av_model_url = _env("UM8_HF_AV_MODEL_URL")
+    if not av_model_url and av_model_repo:
+        av_model_url = f"https://huggingface.co/{av_model_repo}"
+
     return {
         "dataset_repo": dataset_repo or None,
         "trackio_space_path": trackio_space_path or None,
@@ -181,6 +196,10 @@ def get_ml_hub_urls() -> Dict[str, Optional[str]]:
         "content_dataset_url": content_dataset_url or None,
         "content_model_repo": content_model_repo or None,
         "content_model_url": content_model_url or None,
+        "av_dataset_repo": av_dataset_repo or None,
+        "av_dataset_url": av_dataset_url or None,
+        "av_model_repo": av_model_repo or None,
+        "av_model_url": av_model_url or None,
     }
 
 
@@ -198,6 +217,10 @@ def ml_hub_huggingface_dict() -> Dict[str, Any]:
         "content_dataset_url": u.get("content_dataset_url"),
         "content_model_repo": u.get("content_model_repo"),
         "content_model_url": u.get("content_model_url"),
+        "av_dataset_repo": u.get("av_dataset_repo"),
+        "av_dataset_url": u.get("av_dataset_url"),
+        "av_model_repo": u.get("av_model_repo"),
+        "av_model_url": u.get("av_model_url"),
         "hub_docs_jobs": HUB_DOCS_JOBS,
         "datasets_hub": DATASETS_HUB_DOC,
         "trl_docs": TRL_ROOT_DOC,

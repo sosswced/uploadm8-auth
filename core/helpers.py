@@ -20,6 +20,22 @@ from stages.entitlements import get_entitlements_for_tier, entitlements_to_dict
 
 logger = logging.getLogger("uploadm8-api")
 
+
+def safe_http_error_snippet(text: str | None, *, limit: int = 160) -> str:
+    """Truncate provider error bodies and strip common secret-bearing substrings."""
+    raw = (text or "").replace("\n", " ").strip()
+    if not raw:
+        return ""
+    # Redact bearer-like and query-ish token shapes without logging values.
+    scrubbed = re.sub(
+        r"(?i)(access_token|refresh_token|client_secret|authorization)=([^&\s\"']+)",
+        r"\1=[REDACTED]",
+        raw,
+    )
+    scrubbed = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-+/=]+", "Bearer [REDACTED]", scrubbed)
+    return scrubbed[: max(32, int(limit))]
+
+
 # ---------------------------------------------------------------------------
 # DB JSON CODECS (architectural cleanliness)
 # Forces asyncpg to decode json/jsonb into Python objects.
@@ -229,6 +245,233 @@ def sanitize_hashtag_body(raw: str | None, *, max_len: int = 50) -> str:
     return s[:max_len] if max_len > 0 else s
 
 
+def clip_at_word_boundary(text: str | None, max_chars: int) -> str:
+    """Trim ``text`` to ``max_chars`` without cutting mid-word.
+
+    Prefers the last whitespace/punctuation break before the limit. Trailing
+    separators are stripped so titles never end with ``-`` / ``,`` / ``…``.
+    """
+    s = str(text or "").strip()
+    if max_chars <= 0 or not s:
+        return ""
+    if len(s) <= max_chars:
+        return s
+    cut = s[: max_chars + 1]
+    # Prefer breaking on whitespace inside the budget.
+    window = cut[:max_chars]
+    break_at = -1
+    for i in range(len(window) - 1, max(0, max_chars // 2) - 1, -1):
+        if window[i].isspace() or window[i] in "-–—|/·•,;:":
+            break_at = i
+            break
+    if break_at > 0:
+        out = window[:break_at].rstrip(" \t-–—|/·•,;:.…")
+        return out if out else window[:max_chars].rstrip()
+    return window.rstrip(" \t-–—|/·•,;:.…")
+
+
+# ACR track titles that are long clauses must not become one smashed discovery tag
+# (#loveinthisclubptii). Short catalogue titles (#hotlinebling) still mint.
+_MUSIC_TITLE_STRIP_RE = re.compile(
+    r"(?i)\s*[\(\[][^\)\]]*[\)\]]\s*|\s*[-–—]\s*(?:live|remix|remaster(?:ed)?|radio\s*edit|explicit).*$"
+)
+_MUSIC_TITLE_PART_RE = re.compile(r"(?i)\b(?:pt\.?|part)\s*[ivx\d]+\b")
+_MUSIC_TITLE_FEAT_RE = re.compile(r"(?i)\s+(?:feat\.?|ft\.?|featuring)\s+.+$")
+_MUSIC_TRACK_STOP = frozenset({
+    "the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "and", "or",
+    "this", "that", "my", "your", "our", "me", "you", "it", "is", "be", "was",
+})
+# Join ≤4 tokens (stopwords kept) so "Love in This Club" → loveinthisclub;
+# longer clauses stay artist-only (never #loveinthisclubptii).
+_MUSIC_TRACK_MAX_WORDS = 4
+_MUSIC_TRACK_MAX_SLUG_LEN = 16
+
+
+def music_track_hashtag_bodies(
+    artist: str | None = None,
+    title: str | None = None,
+    genre: str | None = None,
+    *,
+    max_len: int = 50,
+) -> list[str]:
+    """Emit discovery-safe music hashtag bodies from ACR fields.
+
+    Always prefers artist (+ genre when usable). After stripping Pt./Part/feat,
+    joins ≤4 title tokens (including stopwords) when sanitized length ≤16 —
+    so ``Hotline Bling`` → ``hotlinebling`` and ``Love in This Club, Pt. II`` →
+    ``loveinthisclub`` (never ``loveinthisclubptii``). Longer clauses emit no
+    track slug.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str | None) -> None:
+        body = sanitize_hashtag_body(str(raw or ""), max_len=max_len)
+        if not body or body in seen:
+            return
+        seen.add(body)
+        out.append(body)
+
+    for phrase in split_hashtag_source_phrases(str(artist or "")):
+        _add(phrase)
+
+    g = str(genre or "").strip()
+    if g:
+        # Prefer the primary genre token before slashes ("R&B/Soul/Funk").
+        primary = re.split(r"[/|,;]", g)[0].strip()
+        # Drop ampersands for slug ("R&B" → "rb").
+        g_slug = sanitize_hashtag_body(primary.replace("&", ""), max_len=max_len)
+        if g_slug and len(g_slug) >= 3 and g_slug not in ("music", "song", "audio", "unknown"):
+            _add(g_slug)
+
+    raw_title = str(title or "").strip()
+    if raw_title:
+        cleaned = _MUSIC_TITLE_FEAT_RE.sub("", raw_title)
+        cleaned = _MUSIC_TITLE_STRIP_RE.sub(" ", cleaned)
+        cleaned = _MUSIC_TITLE_PART_RE.sub(" ", cleaned)
+        cleaned = re.sub(r"[,:;]+", " ", cleaned)
+        raw_tokens = [
+            t for t in re.split(r"[\s_/]+", cleaned.strip())
+            if t and not t.isdigit()
+        ]
+        content = [t for t in raw_tokens if t.lower() not in _MUSIC_TRACK_STOP]
+        # Need at least one content word; join all tokens (stops kept) when short.
+        if content and 1 <= len(raw_tokens) <= _MUSIC_TRACK_MAX_WORDS:
+            slug = sanitize_hashtag_body("".join(raw_tokens), max_len=max_len)
+            if slug and len(slug) <= _MUSIC_TRACK_MAX_SLUG_LEN:
+                _add(slug)
+
+    return out
+
+
+# Road instructional boards — never discovery hashtags.
+_INSTRUCTIONAL_ROAD_SIGN_RE = re.compile(
+    r"(?i)^\s*(?:"
+    r"keep\s+(?:left|right)|merge(?:\s+left|\s+right)?|yield|stop|signal|"
+    r"one\s+way|do\s+not\s+enter|no\s+u[\-\s]?turn|speed\s+limit|"
+    r"exit\s+only|wrong\s+way|road\s+closed|detour"
+    r")\s*$"
+)
+# Bare numbered state/US-style shields: "181 SOUTH", "26 N"
+_NUMBERED_DIRECTIONAL_ROUTE_RE = re.compile(
+    r"\b(\d{1,3})\s*(SOUTH|NORTH|EAST|WEST|S|N|E|W)\b",
+    re.IGNORECASE,
+)
+_ROUTE_CARDINAL_EXPAND = {
+    "s": "south",
+    "n": "north",
+    "e": "east",
+    "w": "west",
+    "south": "south",
+    "north": "north",
+    "east": "east",
+    "west": "west",
+}
+_HIGHWAY_PREFIX_PATTERNS = (
+    re.compile(r"\b(I[-\s]?\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\b(US[-\s]?\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\b(SR[-\s]?\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\b(HWY[-\s]?\d{1,3})\b", re.IGNORECASE),
+    re.compile(r"\b(ROUTE[-\s]?\d{1,3})\b", re.IGNORECASE),
+)
+_LOCAL_BUSINESS_SUFFIX_ONLY_RE = re.compile(
+    r"(?i)\b(?P<suffix>Credit\s+Union|LLC|Inc\.?|Market|Cafe|Café|Diner|Grill|"
+    r"Pharmacy|Clinic|Church|School)\b"
+)
+_LOCAL_BUSINESS_NAME_NOISE = frozenset({
+    "keep", "left", "right", "merge", "yield", "stop", "signal", "south", "north",
+    "east", "west", "exit", "only", "mph", "edit", "union",
+})
+
+
+def is_instructional_road_sign(text: str | None) -> bool:
+    """True for KEEP LEFT / YIELD / SIGNAL style boards — not discovery tags."""
+    s = str(text or "").strip()
+    if not s:
+        return False
+    return bool(_INSTRUCTIONAL_ROAD_SIGN_RE.match(s))
+
+
+def extract_highway_route_tokens(ocr_text: str | None, *, limit: int = 4) -> list[str]:
+    """Pull route tokens from OCR: I-5, US101, and bare ``181 SOUTH`` → ``181south``."""
+    text = str(ocr_text or "")
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        body = sanitize_hashtag_body(raw)
+        if not body or body in seen:
+            return
+        seen.add(body)
+        out.append(body)
+
+    for pat in _HIGHWAY_PREFIX_PATTERNS:
+        for m in pat.findall(text):
+            _add(str(m))
+            if len(out) >= limit:
+                return out
+    for m in _NUMBERED_DIRECTIONAL_ROUTE_RE.finditer(text):
+        num = m.group(1)
+        cardinal = _ROUTE_CARDINAL_EXPAND.get(str(m.group(2) or "").lower(), "")
+        if not cardinal:
+            continue
+        # Skip if a prefixed interstate/US/SR hit already covers this number.
+        if any(
+            re.fullmatch(rf"(?:i|us|sr|hwy|route){re.escape(num)}", b, re.I)
+            for b in seen
+        ):
+            continue
+        # Prefer searchable ``181south`` over smashed ``route181``.
+        _add(f"{num}{cardinal}")
+        if len(out) >= limit:
+            return out
+    return out
+
+
+def extract_local_business_boards(ocr_text: str | None, *, limit: int = 2) -> list[str]:
+    """Named local boards from OCR (e.g. Salal Credit Union), not instructional signs."""
+    text = str(ocr_text or "")
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _LOCAL_BUSINESS_SUFFIX_ONLY_RE.finditer(text):
+        suffix = (m.group("suffix") or "").strip()
+        if not suffix:
+            continue
+        before = text[: m.start()].rstrip()
+        toks = re.findall(r"[A-Za-z][A-Za-z'&.-]{1,24}", before)
+        if not toks:
+            continue
+        name_toks = toks[-3:]
+        while name_toks and name_toks[0].lower() in _LOCAL_BUSINESS_NAME_NOISE:
+            name_toks = name_toks[1:]
+        if not name_toks:
+            continue
+        if any(t.lower() in _LOCAL_BUSINESS_NAME_NOISE for t in name_toks):
+            cleaned = [t for t in name_toks if t.lower() not in _LOCAL_BUSINESS_NAME_NOISE]
+            if not cleaned:
+                continue
+            name_toks = cleaned[-2:]
+        phrase = " ".join([*name_toks, suffix])
+        if is_instructional_road_sign(phrase):
+            continue
+        body = sanitize_hashtag_body(phrase)
+        if not body or body in seen or len(body) < 6:
+            continue
+        if any(x in body for x in ("walmart", "costco", "fedex", "uhaul", "shell", "chevron")):
+            continue
+        if sanitize_hashtag_body(" ".join(name_toks)) in ("", "the", "a"):
+            continue
+        seen.add(body)
+        out.append(phrase)
+        if len(out) >= limit:
+            break
+    return out
+
+
 # Full US state names → 2-letter abbr (discovery prefers #losangeles #california,
 # never #losangelesCA / #losangelescalifornia).
 _US_STATE_NAME_TO_ABBR: dict[str, str] = {
@@ -293,7 +536,7 @@ _GEO_ABBR_ENGLISH_COLLISION_RE = re.compile(
 # Abbrs that are also common English suffixes — never infer geo from them.
 # Full state-name suffixes (california, oregon) still split. City+NV/TX/WA/etc. still split.
 _HIGH_COLLISION_STATE_ABBR = frozenset({
-    "al", "ar", "de", "hi", "id", "in", "la", "ma", "me", "ok", "or", "pa",
+    "al", "ar", "de", "hi", "ia", "id", "in", "la", "ma", "me", "ok", "or", "pa",
 })
 # Already-lowercased clause mashups the LLM emitted as one token.
 _MASHED_SENTENCE_GLUE_RE = re.compile(
@@ -451,7 +694,9 @@ def expand_geo_runon_hashtag(body: str | None, *, max_len: int = 50) -> list[str
             return [slug]
         if slug.endswith(state_slug) and len(slug) > len(state_slug) + 3:
             city = slug[: -len(state_slug)]
-            if len(city) >= 4:
+            # Require a real place-length stem. Short English nouns
+            # (hotelcalifornia → hotel+california) are music/brand titles, not geo.
+            if len(city) >= 6:
                 return [city[:max_len], state_slug]
     # city + 2-letter abbr (lasvegasnv). Require a long stem so short brands and
     # given names ending in state letters (angelica→ca, veronica→ca) stay intact.
@@ -598,6 +843,78 @@ def coerce_processed_assets_map(val: object) -> dict[str, str]:
                 out[str(plat)] = str(key)
         return out
     return {}
+
+
+def _is_thumb_or_default_asset_key(key: object) -> bool:
+    k = str(key or "").strip().lower()
+    return (not k) or k == "default" or k.startswith("thumb_")
+
+
+def ensure_processed_assets_platform_keys(
+    assets: object,
+    platforms: object,
+) -> dict[str, str]:
+    """Alias ``default`` onto any missing platform keys before persist/publish.
+
+    Stage-13 sometimes only stores ``default`` (+ thumbs) when ``platform_videos``
+    was empty. Deferred publish previously skipped ``default`` and failed with
+    ``ASSET_DOWNLOAD_FAILED`` (UPLOADM8-BE).
+    """
+    out = dict(coerce_processed_assets_map(assets))
+    default_key = str(out.get("default") or "").strip()
+    if not default_key:
+        return out
+    existing = {
+        str(k).strip().lower()
+        for k in out.keys()
+        if not _is_thumb_or_default_asset_key(k)
+    }
+    for raw in platforms or []:
+        plat = str(raw or "").strip().lower()
+        if not plat or plat in existing:
+            continue
+        out[plat] = default_key
+        existing.add(plat)
+    return out
+
+
+def resolve_publish_asset_keys(
+    assets: object,
+    due_platforms: object = None,
+) -> dict[str, str]:
+    """Map lowercase platform → R2 key for deferred-publish download.
+
+    Prefers platform-specific keys; fills gaps from ``default`` for due platforms
+    (or, when ``due_platforms`` is None, for every non-thumb platform key only —
+    default fill requires an explicit due set).
+    """
+    coerced = coerce_processed_assets_map(assets)
+    default_key = str(coerced.get("default") or "").strip()
+    due: set[str] | None = None
+    if due_platforms is not None:
+        due = {
+            str(p).strip().lower()
+            for p in (due_platforms or [])
+            if str(p or "").strip()
+        }
+
+    out: dict[str, str] = {}
+    for key, r2_key in coerced.items():
+        if _is_thumb_or_default_asset_key(key):
+            continue
+        plat = str(key).strip().lower()
+        rk = str(r2_key or "").strip()
+        if not plat or not rk:
+            continue
+        if due is not None and plat not in due:
+            continue
+        out[plat] = rk
+
+    if default_key and due is not None:
+        for plat in due:
+            if plat not in out:
+                out[plat] = default_key
+    return out
 
 
 def platform_hashtag_map_has_any_tags(m: object) -> bool:

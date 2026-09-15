@@ -324,10 +324,10 @@ async def _create_index(
             f"{TL_BASE_URL}/indexes",
             headers=headers,
             json={
-                "name": name,
+                "index_name": name,
                 "models": [
-                    {"name": "pegasus1.2", "options": ["visual", "audio"]},
-                    {"name": "marengo3.0", "options": ["visual", "audio"]},
+                    {"model_name": "pegasus1.2", "model_options": ["visual", "audio"]},
+                    {"model_name": "marengo3.0", "model_options": ["visual", "audio"]},
                 ],
             },
         )
@@ -380,11 +380,11 @@ async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[
             if preferred and preferred in by_id:
                 logger.info("[twelvelabs] Using healed index from state: %s", preferred)
                 return preferred
-            if preferred and state.get("ignore_env"):
-                # State says ignore env; healed id may still be valid even if
-                # list pagination omitted it — try it before arbitrary picks.
+            if preferred:
+                # Prefer persisted id even when this list page omitted it —
+                # upload will fail-soft via SkipStage if the id is truly gone.
                 logger.info(
-                    "[twelvelabs] Using persisted healed index (not in list page): %s",
+                    "[twelvelabs] Using persisted index id (may be off list page): %s",
                     preferred,
                 )
                 return preferred
@@ -395,7 +395,9 @@ async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[
             for idx in indexes:
                 if not isinstance(idx, dict):
                     continue
-                name = str(idx.get("name") or "").lower()
+                name = str(
+                    idx.get("index_name") or idx.get("name") or ""
+                ).lower()
                 iid = str(idx.get("_id") or idx.get("id") or "").strip()
                 if not iid or "uploadm8" not in name:
                     continue
@@ -407,7 +409,7 @@ async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[
                     any_um8 = iid
             if healed:
                 healed.sort(
-                    key=lambda i: str(i.get("name") or ""),
+                    key=lambda i: str(i.get("index_name") or i.get("name") or ""),
                     reverse=True,
                 )
                 pick = str(healed[0].get("_id") or healed[0].get("id") or "").strip()
@@ -421,7 +423,13 @@ async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[
                 logger.info("[twelvelabs] Using existing index: %s", any_um8)
                 return any_um8
 
-    return await _create_index(ctx=ctx, unique=False)
+    # Create: try canonical name first, then a unique healed name on conflict.
+    created = await _create_index(ctx=ctx, unique=False)
+    if created:
+        _save_index_state(ignore_env=False, resolved_index_id=str(created))
+        return created
+    logger.warning("[twelvelabs] Canonical index create failed; retrying unique name")
+    return await _create_index(ctx=ctx, unique=True)
 
 
 async def _upload_and_index(

@@ -48,7 +48,11 @@ if not JWT_SECRET:
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "15"))
+# Meta-like stay-signed-in for creators (Remember me on). Café / shared: Remember me off → session days.
 REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30"))
+REFRESH_TOKEN_DAYS_SESSION = int(os.environ.get("REFRESH_TOKEN_DAYS_SESSION", "1"))
+# Admin / master_admin sessions are capped shorter than creator remember-me.
+REFRESH_TOKEN_DAYS_ADMIN = int(os.environ.get("REFRESH_TOKEN_DAYS_ADMIN", "7"))
 TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
 
 # HttpOnly auth cookies (see core.cookie_auth). Bearer header still works for API / cross-host dev.
@@ -272,6 +276,7 @@ OAUTH_CONFIG = {
         "token_url": "https://oauth2.googleapis.com/token",
         # yt-analytics.readonly — _fetch_youtube_metrics() youtubeanalytics.googleapis.com
         "scope": (
+            "openid email "
             "https://www.googleapis.com/auth/youtube.upload "
             "https://www.googleapis.com/auth/youtube.readonly "
             "https://www.googleapis.com/auth/yt-analytics.readonly"

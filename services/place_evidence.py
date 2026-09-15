@@ -163,6 +163,11 @@ def _extract_license_plates(text: str) -> List[str]:
             continue
         if p in ("ERROR", "CAMERA", "ESCORT", "SPEED", "MPH"):
             continue
+        # HUD speed mash: 56MPH / 54MPH / 78MPH — never treat as plates.
+        if re.search(r"\d{2,3}\s*MPH\b", p) or p.endswith("MPH") or re.fullmatch(r"\d{2,3}MPH", p):
+            continue
+        if re.fullmatch(r"\d{2,3}", p):
+            continue
         out.append(p)
     return _uniq(out, limit=6)
 

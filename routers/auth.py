@@ -118,16 +118,23 @@ async def session_probe(request: Request, authorization: Optional[str] = Header(
 @router.post("/login")
 async def login(data: UserLogin, request: Request):
     async with core.state.db_pool.acquire() as conn:
-        access, refresh, must_reset = await login_user(conn, data)
+        access, refresh, must_reset, refresh_days = await login_user(conn, data)
     resp = JSONResponse(
         content={
             "access_token": access,
             "refresh_token": refresh,
             "token_type": "bearer",
             "must_reset_password": must_reset,
+            "refresh_expires_days": refresh_days,
         }
     )
-    set_auth_cookies(resp, access, refresh, request)
+    set_auth_cookies(
+        resp,
+        access,
+        refresh,
+        request,
+        refresh_max_age=int(refresh_days) * 86400,
+    )
     return resp
 
 @router.post("/refresh")
@@ -147,11 +154,17 @@ async def refresh(request: Request):
     if not rt:
         raise HTTPException(401, "Missing refresh token")
     async with core.state.db_pool.acquire() as conn:
-        access, new_refresh = await refresh_session(conn, rt)
+        access, new_refresh, refresh_max_age = await refresh_session(conn, rt)
     resp = JSONResponse(
         content={"access_token": access, "refresh_token": new_refresh, "token_type": "bearer"}
     )
-    set_auth_cookies(resp, access, new_refresh, request)
+    set_auth_cookies(
+        resp,
+        access,
+        new_refresh,
+        request,
+        refresh_max_age=refresh_max_age,
+    )
     return resp
 
 
@@ -339,7 +352,7 @@ async def forgot_password(payload: ForgotPasswordRequest, background: Background
                 user_row["id"], token_hash, expires_at
             )
 
-            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={quote(token)}"
+            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password.html?token={quote(token)}"
             background.add_task(send_password_reset_email, user_row["email"], reset_link)
 
     return {"ok": True}

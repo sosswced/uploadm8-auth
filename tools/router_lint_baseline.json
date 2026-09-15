@@ -6,15 +6,15 @@
   },
   "files": {
     "routers/admin.py": {
-      "max_lines": 4505,
-      "max_db_touch_lines": 170
+      "max_lines": 4791,
+      "max_db_touch_lines": 171
     },
     "routers/admin_catalog.py": {
-      "max_lines": 716,
+      "max_lines": 718,
       "max_db_touch_lines": 25
     },
     "routers/admin_contract.py": {
-      "max_lines": 2003,
+      "max_lines": 2064,
       "max_db_touch_lines": 39
     },
     "routers/admin_generic_ban.py": {
@@ -30,20 +30,20 @@
       "max_db_touch_lines": 4
     },
     "routers/analytics.py": {
-      "max_lines": 1652,
-      "max_db_touch_lines": 30
+      "max_lines": 1719,
+      "max_db_touch_lines": 31
     },
     "routers/api_keys.py": {
       "max_lines": 127,
       "max_db_touch_lines": 8
     },
     "routers/auth.py": {
-      "max_lines": 687,
+      "max_lines": 700,
       "max_db_touch_lines": 46
     },
     "routers/billing.py": {
-      "max_lines": 1137,
-      "max_db_touch_lines": 35
+      "max_lines": 1155,
+      "max_db_touch_lines": 36
     },
     "routers/catalog.py": {
       "max_lines": 404,
@@ -82,7 +82,7 @@
       "max_db_touch_lines": 4
     },
     "routers/me.py": {
-      "max_lines": 1770,
+      "max_lines": 1787,
       "max_db_touch_lines": 64
     },
     "routers/me_settings.py": {
@@ -94,11 +94,15 @@
       "max_db_touch_lines": 11
     },
     "routers/oauth.py": {
-      "max_lines": 800,
+      "max_lines": 890,
       "max_db_touch_lines": 14
     },
+    "routers/oauth_readiness.py": {
+      "max_lines": 84,
+      "max_db_touch_lines": 4
+    },
     "routers/ops.py": {
-      "max_lines": 344,
+      "max_lines": 345,
       "max_db_touch_lines": 11
     },
     "routers/platform_avatar_redirect.py": {
@@ -106,11 +110,11 @@
       "max_db_touch_lines": 4
     },
     "routers/platforms.py": {
-      "max_lines": 335,
+      "max_lines": 354,
       "max_db_touch_lines": 11
     },
     "routers/preferences.py": {
-      "max_lines": 947,
+      "max_lines": 975,
       "max_db_touch_lines": 22
     },
     "routers/public_entitlements.py": {
@@ -118,11 +122,11 @@
       "max_db_touch_lines": 4
     },
     "routers/scheduled.py": {
-      "max_lines": 973,
+      "max_lines": 976,
       "max_db_touch_lines": 20
     },
     "routers/scheduling.py": {
-      "max_lines": 170,
+      "max_lines": 158,
       "max_db_touch_lines": 4
     },
     "routers/shell_bootstrap.py": {
@@ -134,7 +138,7 @@
       "max_db_touch_lines": 7
     },
     "routers/thumbnail_studio_api.py": {
-      "max_lines": 3286,
+      "max_lines": 3314,
       "max_db_touch_lines": 71
     },
     "routers/thumbnail_studio_routes.py": {
@@ -142,27 +146,27 @@
       "max_db_touch_lines": 4
     },
     "routers/trill.py": {
-      "max_lines": 1911,
-      "max_db_touch_lines": 44
+      "max_lines": 2052,
+      "max_db_touch_lines": 46
     },
     "routers/uploads.py": {
       "max_lines": 80,
       "max_db_touch_lines": 4
     },
     "routers/uploads_analytics.py": {
-      "max_lines": 674,
-      "max_db_touch_lines": 13
+      "max_lines": 165,
+      "max_db_touch_lines": 7
     },
     "routers/uploads_lifecycle.py": {
-      "max_lines": 922,
+      "max_lines": 936,
       "max_db_touch_lines": 20
     },
     "routers/uploads_read.py": {
-      "max_lines": 380,
+      "max_lines": 434,
       "max_db_touch_lines": 9
     },
     "routers/uploads_schedule_legacy.py": {
-      "max_lines": 92,
+      "max_lines": 93,
       "max_db_touch_lines": 4
     },
     "routers/user_avatar_redirect.py": {
@@ -174,7 +178,7 @@
       "max_db_touch_lines": 13
     },
     "routers/webhooks.py": {
-      "max_lines": 750,
+      "max_lines": 815,
       "max_db_touch_lines": 14
     },
     "routers/workspace.py": {

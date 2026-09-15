@@ -38,6 +38,20 @@ TIKTOK_WEBHOOK_REPLAY_WINDOW_SEC = 300   # reject events older than 5 minutes
 FACEBOOK_WEBHOOK_VERIFY_TOKEN = os.environ.get("FACEBOOK_WEBHOOK_VERIFY_TOKEN", "")
 
 
+def _webhook_prod_fail_closed() -> bool:
+    """Require webhook secrets in Render / production; allow skip in local/dev."""
+    if os.environ.get("ALLOW_INSECURE_WEBHOOKS", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if os.environ.get("RENDER"):
+        return True
+    env = (
+        os.environ.get("SENTRY_ENVIRONMENT")
+        or os.environ.get("ENVIRONMENT")
+        or ""
+    ).strip().lower()
+    return env == "production"
+
+
 def _tiktok_webhook_pr_targets(pr_list, share_id: str) -> list:
     """
     TikTok platform_results rows this webhook may mutate.
@@ -166,11 +180,12 @@ def _verify_tiktok_signature(raw_body: bytes, header: str, secret: str) -> tuple
     ok=True  -> signature is valid and timestamp is fresh.
     ok=False -> verification failed (reason explains why).
 
-    If TIKTOK_WEBHOOK_SECRET is empty the check is skipped and we return
-    (True, "sig-check-skipped-no-secret") so the developer can still receive
-    events during initial setup without crashing.
+    If TIKTOK_WEBHOOK_SECRET is empty: fail-closed in production/Render;
+    local/dev may skip so initial setup still receives events.
     """
     if not secret:
+        if _webhook_prod_fail_closed():
+            return False, "sig-check-required-no-secret"
         return True, "sig-check-skipped-no-secret"
 
     if not header:
@@ -670,7 +685,12 @@ async def facebook_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # -- Verify signature ----------------------------------------------------
     sig_header = request.headers.get("X-Hub-Signature-256", "")
-    if META_APP_SECRET and sig_header:
+    if not META_APP_SECRET:
+        if _webhook_prod_fail_closed():
+            logger.error("[facebook-webhook] META_APP_SECRET unset in production — rejecting")
+            raise HTTPException(503, "Webhook signature verification unavailable")
+        logger.warning("[facebook-webhook] META_APP_SECRET unset — skipping signature check (dev)")
+    elif sig_header:
         import hmac as _hmac_fb
         expected_sig = "sha256=" + _hmac_fb.new(
             META_APP_SECRET.encode(), raw_body, hashlib.sha256
@@ -678,8 +698,8 @@ async def facebook_webhook(request: Request, background_tasks: BackgroundTasks):
         if not _hmac_fb.compare_digest(expected_sig, sig_header):
             logger.warning(f"[facebook-webhook] signature mismatch — header={sig_header[:60]}")
             raise HTTPException(403, "Invalid signature")
-    elif META_APP_SECRET and not sig_header:
-        # Signature header missing entirely -- reject in production
+    else:
+        # Signature header missing entirely -- reject when secret is configured
         logger.warning("[facebook-webhook] missing X-Hub-Signature-256 header")
         raise HTTPException(400, "Missing signature")
 

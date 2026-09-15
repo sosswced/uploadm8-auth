@@ -245,9 +245,24 @@ async def _upload_bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# Map KPI UI range presets → analytics_overview ``days``.
+# Map KPI UI range presets → analytics_overview ``days`` / insights lookback.
 # ``all`` is handled via range=all on analytics_overview (ALL_TIME_FLOOR_UTC).
-_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "1y": 365}
+_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "1y": 365, "6m": 180}
+
+
+def _kpi_lookback_days_from_range(range_key: str) -> int:
+    """Resolve preset or custom Nd to a positive day count for overview/insights/uploads."""
+    import re
+
+    rk = (range_key or "30d").strip().lower()
+    if rk in _KPI_RANGE_DAYS:
+        return int(_KPI_RANGE_DAYS[rk])
+    m = re.fullmatch(r"(\d{1,4})d", rk)
+    if m:
+        return max(1, min(int(m.group(1)), 3650))
+    if rk == "all":
+        return 3650
+    return 30
 
 
 async def _kpi_bootstrap_payload(
@@ -264,27 +279,29 @@ async def _kpi_bootstrap_payload(
     serial phase barrier in kpi.html's loadData into a single round-trip.
     """
     from routers.analytics import analytics_overview, get_analytics
+    from services.canonical_engagement import sql_since_for_analytics_range
     from services.content_insights import build_user_content_insights
 
     uid_billing = str(user.get("billing_user_id") or user["id"])
     uid_plain = str(user["id"])
     rk = (range or "30d").strip().lower()
-    days = int(_KPI_RANGE_DAYS.get(rk, 30))
+    days = _kpi_lookback_days_from_range(rk)
     workspace_id = (user.get("workspace") or {}).get("id")
+    since = sql_since_for_analytics_range(rk)
+    insights_lookback = max(7, min(days, 730))
 
     async def _insights() -> Any:
         async with acquire_db(pool) as conn:
-            return await build_user_content_insights(conn, uid_plain)
+            return await build_user_content_insights(
+                conn, uid_plain, lookback_days=insights_lookback
+            )
 
     overview_kwargs: dict[str, Any] = {
         "platform": platform or "all",
         "user": user,
+        "range": rk if rk else "30d",
+        "days": days,
     }
-    if rk == "all":
-        # Align with get_analytics(range=all) / ALL_TIME_FLOOR_UTC — not a 3650d clamp.
-        overview_kwargs["range"] = "all"
-    else:
-        overview_kwargs["days"] = days
 
     results = await asyncio.gather(
         analytics_overview(**overview_kwargs),
@@ -306,6 +323,7 @@ async def _kpi_bootstrap_payload(
             trill_only=False,
             meta=True,
             workspace_id=workspace_id,
+            since=since,
         ),
         _insights(),
         return_exceptions=True,

@@ -41,6 +41,45 @@ logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(tags=["analytics"])
 
+
+def _is_transient_metrics_transport_error(exc: BaseException) -> bool:
+    """True for httpx/network blips — not token or API-contract bugs (UPLOADM8-BB)."""
+    name = type(exc).__name__
+    if name in (
+        "RemoteProtocolError",
+        "ConnectError",
+        "ReadTimeout",
+        "WriteTimeout",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "NetworkError",
+        "TimeoutException",
+        "LocalProtocolError",
+    ):
+        return True
+    msg = str(exc).lower()
+    return any(
+        n in msg
+        for n in (
+            "server disconnected",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "temporarily unavailable",
+            "broken pipe",
+            "eof occurred",
+            "without sending a response",
+        )
+    )
+
+
+def _log_platform_metrics_failure(platform: str, exc: BaseException) -> None:
+    """Transient transport → warning (no Sentry ERROR); real failures stay error."""
+    if _is_transient_metrics_transport_error(exc):
+        logger.warning("%s metrics transient transport error: %s", platform, exc)
+    else:
+        logger.error("%s metrics error: %s", platform, exc)
+
 # ------------------------------------------------------------
 # Time range parsing (supports presets + custom 'Nd')
 # ------------------------------------------------------------
@@ -209,7 +248,7 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
             }
 
     except Exception as e:
-        logger.error(f"TikTok metrics error: {e}")
+        _log_platform_metrics_failure("TikTok", e)
         return {"status": "error", "error": str(e)}
 
 
@@ -217,97 +256,114 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
     """YouTube Data API v3 + (optional) YouTube Analytics API."""
     if not access_token:
         return {"status": "not_connected"}
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            ch = await client.get(
-                "https://www.googleapis.com/youtube/v3/channels",
-                params={"part": "statistics", "mine": "true"},
+    last_exc: BaseException | None = None
+    for attempt in range(2):
+        try:
+            return await _fetch_youtube_metrics_once(access_token)
+        except Exception as e:
+            last_exc = e
+            if attempt == 0 and _is_transient_metrics_transport_error(e):
+                await _asyncio.sleep(0.35)
+                continue
+            break
+    assert last_exc is not None
+    _log_platform_metrics_failure("YouTube", last_exc)
+    return {"status": "error", "error": str(last_exc)}
+
+
+async def _fetch_youtube_metrics_once(access_token: str) -> dict:
+    """Single YouTube metrics attempt (raises on transport failure)."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        ch = await client.get(
+            "https://www.googleapis.com/youtube/v3/channels",
+            params={"part": "statistics", "mine": "true"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if ch.status_code != 200:
+            return {"status": "error", "error": f"HTTP {ch.status_code}"}
+
+        items = ch.json().get("items", []) or []
+        stats = items[0].get("statistics", {}) if items else {}
+
+        views = likes = comments = shares = 0
+        avg_watch = minutes_watched = None
+        analytics_source = "channel_stats_fallback"
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            an = await client.get(
+                "https://youtubeanalytics.googleapis.com/v2/reports",
+                params={
+                    "ids": "channel==MINE",
+                    "startDate": thirty,
+                    "endDate": today,
+                    # dimensions=day locks column order: [0]=day [1]=views [2]=likes
+                    # [3]=comments [4]=shares [5]=avgDuration [6]=minutesWatched
+                    # Without it r[0] returns a date string, not view count
+                    "dimensions": "day",
+                    "metrics": "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                    "sort": "day",
+                },
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            if ch.status_code != 200:
-                return {"status": "error", "error": f"HTTP {ch.status_code}"}
-
-            items = ch.json().get("items", []) or []
-            stats = items[0].get("statistics", {}) if items else {}
-
-            views = likes = comments = shares = 0
-            avg_watch = minutes_watched = None
-            analytics_source = "channel_stats_fallback"
-            try:
-                today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-                an = await client.get(
-                    "https://youtubeanalytics.googleapis.com/v2/reports",
-                    params={
-                        "ids":        "channel==MINE",
-                        "startDate":  thirty,
-                        "endDate":    today,
-                        # dimensions=day locks column order: [0]=day [1]=views [2]=likes
-                        # [3]=comments [4]=shares [5]=avgDuration [6]=minutesWatched
-                        # Without it r[0] returns a date string, not view count
-                        "dimensions": "day",
-                        "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
-                        "sort":       "day",
-                    },
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-                if an.status_code == 200:
-                    rows = an.json().get("rows", []) or []
-                    if rows:
-                        views           = sum(int(r[1] or 0) for r in rows)
-                        likes           = sum(int(r[2] or 0) for r in rows)
-                        comments        = sum(int(r[3] or 0) for r in rows)
-                        shares          = sum(int(r[4] or 0) for r in rows)
-                        dur_vals        = [float(r[5]) for r in rows if r[5]]
-                        avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
-                        minutes_watched = int(sum(float(r[6] or 0) for r in rows))
-                        analytics_source = "yt-analytics"
-                    else:
-                        views    = int(stats.get("viewCount",    0))
-                        likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
-                        comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
-                elif an.status_code == 403:
-                    logger.warning("YouTube Analytics 403 — yt-analytics.readonly missing from token; user must reconnect")
-                    views    = int(stats.get("viewCount",    0))
-                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
-                    comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+            if an.status_code == 200:
+                rows = an.json().get("rows", []) or []
+                if rows:
+                    views = sum(int(r[1] or 0) for r in rows)
+                    likes = sum(int(r[2] or 0) for r in rows)
+                    comments = sum(int(r[3] or 0) for r in rows)
+                    shares = sum(int(r[4] or 0) for r in rows)
+                    dur_vals = [float(r[5]) for r in rows if r[5]]
+                    avg_watch = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
+                    minutes_watched = int(sum(float(r[6] or 0) for r in rows))
+                    analytics_source = "yt-analytics"
                 else:
-                    views    = int(stats.get("viewCount",    0))
-                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                    views = int(stats.get("viewCount", 0))
+                    likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
                     comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
-            except Exception as ae:
-                logger.warning(f"YouTube Analytics error (non-fatal): {ae}")
-                views    = int(stats.get("viewCount",    0))
-                likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+            elif an.status_code == 403:
+                logger.warning(
+                    "YouTube Analytics 403 — yt-analytics.readonly missing from token; user must reconnect"
+                )
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
                 comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+            else:
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+                comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+        except Exception as ae:
+            logger.warning("YouTube Analytics error (non-fatal): %s", ae)
+            views = int(stats.get("viewCount", 0))
+            likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+            comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
 
-            return {
-                "status": "live",
-                "analytics_source": analytics_source,
-                "views":           views,
-                "likes":           likes,
-                "comments":        comments,
-                "shares":          shares,
-                "subscribers":     int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
-                "avg_watch_seconds": avg_watch,
-                "minutes_watched": minutes_watched,
-                "video_count":     int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
-            }
-    except Exception as e:
-        logger.error(f"YouTube metrics error: {e}")
-        return {"status": "error", "error": str(e)}
+        return {
+            "status": "live",
+            "analytics_source": analytics_source,
+            "views": views,
+            "likes": likes,
+            "comments": comments,
+            "shares": shares,
+            "subscribers": int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
+            "avg_watch_seconds": avg_watch,
+            "minutes_watched": minutes_watched,
+            "video_count": int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
+        }
 
 
 async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
     """
-    Instagram Graph API — Reels insights.
-    Attempt 1: instagram_manage_insights (plays, reach, saved, shares, likes, comments)
-    Attempt 2: basic instagram_basic fields (like_count, comments_count) — no advanced scope needed.
+    Instagram Graph API — account sample rollup.
+    VIDEO/REELS use shared ``fetch_instagram_media_engagement`` (insights + object merge).
+    IMAGE/CAROUSEL keep impressions insights when available.
     """
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
         from services.meta_oauth import meta_graph_slot
+        from services.meta_graph_metrics import fetch_instagram_media_engagement
+
         async with meta_graph_slot(), httpx.AsyncClient(timeout=25) as client:
             media = await client.get(
                 f"https://graph.facebook.com/v21.0/{ig_user_id}/media",
@@ -329,48 +385,65 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
             for item in items[:10]:
                 media_type = (item.get("media_type") or "IMAGE").upper()
-                # "plays" on IMAGE/CAROUSEL silently kills the insights call
-                if media_type in ("VIDEO", "REELS"):
-                    metric_str = "plays,reach,saved,shares,comments,likes"
-                    view_key   = "plays"
-                else:
-                    metric_str = "impressions,reach,saved,shares,comments,likes"
-                    view_key   = "impressions"
+                mid = item.get("id")
+                if not mid:
+                    continue
 
-                # ── Attempt 1: instagram_manage_insights ──────────────────────
+                if media_type in ("VIDEO", "REELS"):
+                    s = await fetch_instagram_media_engagement(client, access_token, str(mid))
+                    if s:
+                        analytics_source = analytics_source or "instagram_manage_insights"
+                        used_fallback = True
+                        total_views += int(s.get("views") or 0)
+                        total_likes += int(s.get("likes") or 0)
+                        total_comments += int(s.get("comments") or 0)
+                        total_shares += int(s.get("shares") or 0)
+                        total_saves += int(s.get("saved") or s.get("saves") or 0)
+                        total_reach += int(s.get("reach") or 0)
+                    continue
+
+                # IMAGE / CAROUSEL — impressions path (no video views).
                 ins = await client.get(
-                    f"https://graph.facebook.com/v21.0/{item['id']}/insights",
-                    params={"access_token": access_token, "metric": metric_str},
+                    f"https://graph.facebook.com/v21.0/{mid}/insights",
+                    params={
+                        "access_token": access_token,
+                        "metric": "impressions,reach,saved,shares,comments,likes",
+                    },
                 )
                 if ins.status_code == 200:
-                    analytics_source = "instagram_manage_insights"
+                    analytics_source = analytics_source or "instagram_manage_insights"
                     for m in ins.json().get("data", []) or []:
                         name = m.get("name", "")
                         vals = m.get("values", [])
-                        val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
+                        val = vals[-1].get("value", 0) if vals else m.get("value", 0)
                         if isinstance(val, dict):
                             val = sum(val.values())
                         val = int(val or 0)
-                        if name == view_key:       total_views    += val
-                        elif name == "likes":      total_likes    += val
-                        elif name == "comments":   total_comments += val
-                        elif name == "saved":      total_saves    += val
-                        elif name == "reach":      total_reach    += val
-                        elif name == "shares":     total_shares   += val
+                        if name == "impressions":
+                            total_views += val
+                        elif name == "likes":
+                            total_likes += val
+                        elif name == "comments":
+                            total_comments += val
+                        elif name == "saved":
+                            total_saves += val
+                        elif name == "reach":
+                            total_reach += val
+                        elif name == "shares":
+                            total_shares += val
                 else:
-                    # ── Attempt 2: basic media fields (instagram_basic only) ───
-                    # like_count and comments_count are always available.
-                    # views/plays unavailable without manage_insights.
                     fallback = await client.get(
-                        f"https://graph.facebook.com/v21.0/{item['id']}",
-                        params={"access_token": access_token,
-                                "fields": "like_count,comments_count"},
+                        f"https://graph.facebook.com/v21.0/{mid}",
+                        params={
+                            "access_token": access_token,
+                            "fields": "like_count,comments_count",
+                        },
                     )
                     if fallback.status_code == 200:
-                        fb = fallback.json()
-                        total_likes    += int(fb.get("like_count")     or 0)
+                        fb = fallback.json() or {}
+                        used_fallback = True
+                        total_likes += int(fb.get("like_count") or 0)
                         total_comments += int(fb.get("comments_count") or 0)
-                        used_fallback   = True
 
             if analytics_source is None and used_fallback:
                 analytics_source = "instagram_basic_fallback"
@@ -387,7 +460,7 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
                 "video_count":      len(items),
             }
     except Exception as e:
-        logger.error(f"Instagram metrics error: {e}")
+        _log_platform_metrics_failure("Instagram", e)
         return {"status": "error", "error": str(e)}
 
 
@@ -401,21 +474,33 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
-        from services.meta_oauth import meta_graph_slot
+        from services.meta_oauth import META_GRAPH_API_VERSION, meta_graph_slot
+        graph = f"https://graph.facebook.com/{META_GRAPH_API_VERSION}"
         async with meta_graph_slot(), httpx.AsyncClient(timeout=25) as client:
             vids = await client.get(
-                f"https://graph.facebook.com/v21.0/{page_id}/videos",
+                f"{graph}/{page_id}/videos",
                 params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
             )
-            if vids.status_code != 200:
+            videos = vids.json().get("data", []) or [] if vids.status_code == 200 else []
+            reels_resp = await client.get(
+                f"{graph}/{page_id}/video_reels",
+                params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
+            )
+            if reels_resp.status_code == 200:
+                seen = {str(v.get("id") or "") for v in videos}
+                for rv in reels_resp.json().get("data", []) or []:
+                    rid = str(rv.get("id") or "")
+                    if rid and rid not in seen:
+                        videos.append(rv)
+                        seen.add(rid)
+            if vids.status_code != 200 and not videos:
                 return {"status": "error", "error": f"HTTP {vids.status_code}"}
 
-            videos = vids.json().get("data", []) or []
             if not videos:
                 followers = 0
                 try:
                     pg = await client.get(
-                        f"https://graph.facebook.com/v21.0/{page_id}",
+                        f"{graph}/{page_id}",
                         params={"access_token": access_token, "fields": "followers_count,fan_count"},
                     )
                     if pg.status_code == 200:
@@ -430,53 +515,20 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
             total_views = total_reactions = total_comments = total_shares = 0
             analytics_source = None
 
+            from services.meta_graph_metrics import fetch_facebook_video_engagement
+
             for vid in videos[:10]:
                 try:
-                    got_vid_stats = False
-
-                    # ── Attempt 1: read_insights scope ────────────────────────
-                    ins = await client.get(
-                        f"https://graph.facebook.com/v21.0/{vid['id']}",
-                        params={
-                            "access_token": access_token,
-                            "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
-                        },
+                    s = await fetch_facebook_video_engagement(
+                        client, access_token, str(vid["id"])
                     )
-                    if ins.status_code == 200:
-                        insights_data = ins.json().get("insights", {}).get("data", []) or []
-                        if insights_data:
-                            analytics_source = "read_insights+pages_read_engagement"
-                            for m in insights_data:
-                                name = m.get("name", "")
-                                vals = m.get("values", [{}])
-                                val  = vals[-1].get("value", 0) if vals else 0
-                                if isinstance(val, dict):
-                                    val = sum(val.values())
-                                val = int(val or 0)
-                                if   name == "total_video_views":                    total_views     += val
-                                elif name == "total_video_reactions_by_type_total":  total_reactions += val
-                                elif name == "total_video_shares":                   total_shares    += val
-                                elif name == "total_video_comments":                 total_comments  += val
-                            got_vid_stats = True
-
-                    # ── Attempt 2: basic video fields (no read_insights needed) ─
-                    if not got_vid_stats:
-                        fallback = await client.get(
-                            f"https://graph.facebook.com/v21.0/{vid['id']}",
-                            params={
-                                "access_token": access_token,
-                                "fields": "video_views,reactions.summary(true),comments.summary(true),shares",
-                            },
-                        )
-                        if fallback.status_code == 200:
-                            fb = fallback.json()
-                            total_views     += int(fb.get("video_views") or 0)
-                            total_reactions += int((fb.get("reactions") or {}).get("summary", {}).get("total_count") or 0)
-                            total_comments  += int((fb.get("comments")  or {}).get("summary", {}).get("total_count") or 0)
-                            total_shares    += int((fb.get("shares")    or {}).get("count") or 0)
-                            if analytics_source is None:
-                                analytics_source = "basic_video_fields_fallback"
-
+                    if not s:
+                        continue
+                    analytics_source = analytics_source or "read_insights+pages_read_engagement"
+                    total_views += int(s.get("views") or 0)
+                    total_reactions += int(s.get("likes") or 0)
+                    total_comments += int(s.get("comments") or 0)
+                    total_shares += int(s.get("shares") or 0)
                 except Exception as ve:
                     logger.warning(f"Facebook video insight error for {vid.get('id')} (skipping): {ve}")
                     continue
@@ -484,7 +536,7 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
             followers = 0
             try:
                 pg = await client.get(
-                    f"https://graph.facebook.com/v21.0/{page_id}",
+                    f"{graph}/{page_id}",
                     params={"access_token": access_token, "fields": "followers_count,fan_count"},
                 )
                 if pg.status_code == 200:
@@ -504,7 +556,7 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                 "video_count":      len(videos),
             }
     except Exception as e:
-        logger.error(f"Facebook metrics error: {e}")
+        _log_platform_metrics_failure("Facebook", e)
         return {"status": "error", "error": str(e)}
 
 
@@ -566,13 +618,28 @@ async def get_analytics(
 ):
     # Align range presets with canonical_engagement (includes 90d, half-open UTC windows).
     # range=all → engagement rollup unbounded; upload/trill SQL uses ALL_TIME_FLOOR_UTC.
-    from services.canonical_engagement import sql_since_for_analytics_range
+    from services.canonical_engagement import (
+        normalize_analytics_range_key,
+        sql_since_for_analytics_range,
+    )
 
     now = _now_utc()
-    win_start, win_end = engagement_time_window_for_analytics_range(range, now=now)
-    since = sql_since_for_analytics_range(range, now=now)
+    range_resolved = normalize_analytics_range_key(range)
+    win_start, win_end = engagement_time_window_for_analytics_range(range_resolved, now=now)
+    since = sql_since_for_analytics_range(range_resolved, now=now)
     uid = user["id"]
     pool = core.state.db_pool
+    # Align upload/chart/trill SQL with engagement: half-open [since, win_end) when bounded.
+    if win_end is not None:
+        upload_time_sql = "created_at >= $2 AND created_at < $3"
+        u_upload_time_sql = "u.created_at >= $2 AND u.created_at < $3"
+        upload_time_args: list = [since, win_end]
+        trill_vf_start = 4
+    else:
+        upload_time_sql = "created_at >= $2"
+        u_upload_time_sql = "u.created_at >= $2"
+        upload_time_args = [since]
+        trill_vf_start = 3
 
     # Single connection: previously asyncio.gather ran four acquire()s in parallel per request,
     # which could exhaust the small asyncpg pool (max 10) alongside /api/dashboard/stats and
@@ -580,45 +647,55 @@ async def get_analytics(
     # uses one connection per request.
     async with pool.acquire() as conn:
         try:
-            stats = await conn.fetchrow("""
+            stats = await conn.fetchrow(
+                f"""
             SELECT COUNT(*)::int AS total,
                    SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
                    COALESCE(SUM(views), 0)::bigint AS views,
                    COALESCE(SUM(likes), 0)::bigint AS likes,
                    COALESCE(SUM(put_spent), 0)::int AS put_used,
                    COALESCE(SUM(aic_spent), 0)::int AS aic_used
-            FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, uid, since)
+            FROM uploads WHERE user_id = $1 AND {upload_time_sql}
+            """,
+                uid,
+                *upload_time_args,
+            )
         except Exception as e:
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
-            stats = await conn.fetchrow("""
+            stats = await conn.fetchrow(
+                f"""
             SELECT COUNT(*)::int AS total,
                    SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
                    0::bigint AS views, 0::bigint AS likes,
                    0::int AS put_used, 0::int AS aic_used
-            FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, uid, since)
+            FROM uploads WHERE user_id = $1 AND {upload_time_sql}
+            """,
+                uid,
+                *upload_time_args,
+            )
 
         daily = await conn.fetch(
-            "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
-            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
-            "GROUP BY DATE(created_at) ORDER BY date",
-            uid, since,
+            f"SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
+            f"FROM uploads WHERE user_id = $1 AND {upload_time_sql} "
+            f"GROUP BY DATE(created_at) ORDER BY date",
+            uid,
+            *upload_time_args,
         )
 
         platforms = await conn.fetch(
-            "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
-            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
-            "AND status IN ('completed','succeeded','partial') "
-            "GROUP BY platform",
-            uid, since,
+            f"SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
+            f"FROM uploads WHERE user_id = $1 AND {upload_time_sql} "
+            f"AND status IN ('completed','succeeded','partial') "
+            f"GROUP BY platform",
+            uid,
+            *upload_time_args,
         )
 
         trill_stats = None
         vf_sql, vf_vals = await build_trill_vehicle_filter(
             conn,
-            3,
+            trill_vf_start,
             trill_vehicle_make,
             trill_vehicle_model,
             make_id=trill_vehicle_make_id,
@@ -647,12 +724,12 @@ async def get_analytics(
                     ), 0)::decimal AS total_distance_miles
                 FROM uploads u
                 WHERE u.user_id = $1
-                AND u.created_at >= $2
+                AND {u_upload_time_sql}
                 AND {TRILL_SCORED_PREDICATE.strip()}
                 {vf_sql}
                 """,
                 uid,
-                since,
+                *upload_time_args,
                 *vf_vals,
             )
 
@@ -662,14 +739,14 @@ async def get_analytics(
                     SELECT speed_bucket, COUNT(*)::int AS count
                     FROM uploads u
                     WHERE u.user_id = $1
-                    AND u.created_at >= $2
+                    AND {u_upload_time_sql}
                     AND speed_bucket IS NOT NULL
                     AND {TRILL_SCORED_PREDICATE.strip()}
                     {vf_sql}
                     GROUP BY speed_bucket
                     """,
                     uid,
-                    since,
+                    *upload_time_args,
                     *vf_vals,
                 )
 
@@ -685,6 +762,40 @@ async def get_analytics(
                     if bucket["speed_bucket"] in bucket_counts:
                         bucket_counts[bucket["speed_bucket"]] = bucket["count"]
 
+                hist_row = await conn.fetchrow(
+                    f"""
+                    SELECT
+                        COUNT(*) FILTER (WHERE spd >= 0 AND spd < 30)::int AS b0,
+                        COUNT(*) FILTER (WHERE spd >= 30 AND spd < 50)::int AS b1,
+                        COUNT(*) FILTER (WHERE spd >= 50 AND spd < 70)::int AS b2,
+                        COUNT(*) FILTER (WHERE spd >= 70 AND spd < 90)::int AS b3,
+                        COUNT(*) FILTER (WHERE spd >= 90)::int AS b4
+                    FROM (
+                        SELECT COALESCE(
+                            u.max_speed_mph,
+                            NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric,
+                            NULLIF(btrim(u.trill_metadata#>>'{{max_speed_mph}}'), '')::numeric
+                        ) AS spd
+                        FROM uploads u
+                        WHERE u.user_id = $1
+                          AND {u_upload_time_sql}
+                          AND {TRILL_SCORED_PREDICATE.strip()}
+                          {vf_sql}
+                    ) s
+                    WHERE spd IS NOT NULL AND spd > 0
+                    """,
+                    uid,
+                    *upload_time_args,
+                    *vf_vals,
+                )
+                speed_hist_bins = [
+                    int((hist_row and hist_row["b0"]) or 0),
+                    int((hist_row and hist_row["b1"]) or 0),
+                    int((hist_row and hist_row["b2"]) or 0),
+                    int((hist_row and hist_row["b3"]) or 0),
+                    int((hist_row and hist_row["b4"]) or 0),
+                ]
+
                 trill_stats = {
                     "trill_uploads": trill_data["trill_uploads"],
                     "avg_score": float(trill_data["avg_score"]),
@@ -692,6 +803,7 @@ async def get_analytics(
                     "max_speed_mph": float(trill_data["max_speed_mph"]),
                     "total_distance_miles": float(trill_data["total_distance_miles"]),
                     "speed_buckets": bucket_counts,
+                    "speed_hist_bins": speed_hist_bins,
                     # Frontend legacy / convenience aliases
                     "avg_trill_score": float(trill_data["avg_score"]),
                     "max_trill_score": float(trill_data["max_score"]),
@@ -728,14 +840,14 @@ async def get_analytics(
                             ) AS distance_miles
                         FROM uploads u
                         WHERE u.user_id = $1
-                          AND u.created_at >= $2
+                          AND {u_upload_time_sql}
                           AND {TRILL_SCORED_PREDICATE.strip()}
                           {vf_sql}
                         ORDER BY u.created_at DESC
                         LIMIT 100
                         """,
                         uid,
-                        since,
+                        *upload_time_args,
                         *vf_vals,
                     )
                     trill_stats["uploads"] = [
@@ -755,6 +867,9 @@ async def get_analytics(
                         }
                         for r in upload_rows
                     ]
+                    trill_stats["uploads_returned"] = len(upload_rows)
+                    trill_stats["uploads_total"] = int(trill_data["trill_uploads"])
+                    trill_stats["truncated"] = int(trill_data["trill_uploads"]) > len(upload_rows)
                     try:
                         top_loc = await conn.fetch(
                             f"""
@@ -771,14 +886,14 @@ async def get_analytics(
                                    COUNT(*)::int AS cnt,
                                    MAX(u.trill_score)::float AS best_trill
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
+                            WHERE u.user_id = $1 AND {u_upload_time_sql} AND {TRILL_SCORED_PREDICATE.strip()}
                             {vf_sql}
                             GROUP BY 1
                             ORDER BY cnt DESC
                             LIMIT 8
                             """,
                             uid,
-                            since,
+                            *upload_time_args,
                             *vf_vals,
                         )
                         top_cars = await conn.fetch(
@@ -791,7 +906,7 @@ async def get_analytics(
                                    COUNT(*)::int AS cnt,
                                    MAX(u.trill_score)::float AS best_trill
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
+                            WHERE u.user_id = $1 AND {u_upload_time_sql} AND {TRILL_SCORED_PREDICATE.strip()}
                               AND u.trill_metadata ? 'vehicle'
                               {vf_sql}
                             GROUP BY 1, 2
@@ -799,7 +914,7 @@ async def get_analytics(
                             LIMIT 8
                             """,
                             uid,
-                            since,
+                            *upload_time_args,
                             *vf_vals,
                         )
                         top_speed_row = await conn.fetchrow(
@@ -811,7 +926,7 @@ async def get_analytics(
                                    u.trill_score::float AS trill_score,
                                    COALESCE(NULLIF(btrim(u.title), ''), u.filename) AS disp_title
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
+                            WHERE u.user_id = $1 AND {u_upload_time_sql} AND {TRILL_SCORED_PREDICATE.strip()}
                             {vf_sql}
                             ORDER BY COALESCE(u.max_speed_mph,
                                 NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric
@@ -819,7 +934,7 @@ async def get_analytics(
                             LIMIT 1
                             """,
                             uid,
-                            since,
+                            *upload_time_args,
                             *vf_vals,
                         )
                         trill_stats["tops"] = {
@@ -923,6 +1038,7 @@ async def get_analytics(
         "metric_definitions": metric_definitions_svc.for_get_analytics(),
         "engagement_crosswalk": metric_definitions_svc.engagement_crosswalk(),
         "range": range,
+        "range_resolved": range_resolved,
     }
 
     if trill_stats:
@@ -1221,6 +1337,14 @@ async def analytics_overview(
         win_end = now
         since = sql_since_for_analytics_range("all", now=now)
         days = max(1, (win_end - win_start).days)
+    elif rk:
+        # Prefer range-key half-open window (same as GET /api/analytics).
+        win_start, win_end = engagement_time_window_for_analytics_range(rk, now=now)
+        if win_start is None or win_end is None:
+            win_start = ALL_TIME_FLOOR_UTC
+            win_end = now
+        since = win_start
+        days = max(1, int(round((win_end - win_start).total_seconds() / 86400)))
     else:
         win_start, win_end = engagement_time_window_for_overview_days(days, now=now)
         since = win_start
@@ -1234,6 +1358,9 @@ async def analytics_overview(
         )
         upload_params.append(pf)
 
+    _SUCCESS_STATUSES = "('completed','succeeded','partial')"
+    _QUEUE_STATUSES = "('queued','pending','scheduled','staged','ready_to_publish')"
+
     async with core.state.db_pool.acquire() as conn:
         # Upload KPIs (defensive against older schemas)
         try:
@@ -1241,8 +1368,9 @@ async def analytics_overview(
                 f"""
                 SELECT
                     COUNT(*)::int AS uploads_total,
-                    SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status IN {_SUCCESS_STATUSES} THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
+                    SUM(CASE WHEN status IN {_QUEUE_STATUSES} THEN 1 ELSE 0 END)::int AS uploads_in_queue,
                     COALESCE(AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))), 0)::double precision AS avg_processing_seconds,
                     COALESCE(SUM(cost_attributed), 0)::double precision AS cost_total
                 FROM uploads
@@ -1258,8 +1386,9 @@ async def analytics_overview(
                 f"""
                 SELECT
                     COUNT(*)::int AS uploads_total,
-                    SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status IN {_SUCCESS_STATUSES} THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
+                    SUM(CASE WHEN status IN {_QUEUE_STATUSES} THEN 1 ELSE 0 END)::int AS uploads_in_queue,
                     0::double precision AS avg_processing_seconds,
                     0::double precision AS cost_total
                 FROM uploads
@@ -1302,6 +1431,7 @@ async def analytics_overview(
             "total": int(row["uploads_total"] or 0),
             "completed": int(row["uploads_completed"] or 0),
             "failed": int(row["uploads_failed"] or 0),
+            "in_queue": int(row["uploads_in_queue"] or 0),
             "avg_processing_seconds": float(row["avg_processing_seconds"] or 0),
         },
         "engagement": {

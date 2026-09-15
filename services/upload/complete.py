@@ -15,6 +15,8 @@ from routers.preferences import get_user_prefs_for_upload
 
 from services.upload.r2_storage_guard import (
     ERROR_SOURCE_NOT_IN_R2,
+    ERROR_TELEMETRY_UPLOAD_MISSING,
+    TELEMETRY_UPLOAD_MISSING_MESSAGE,
     mark_source_not_in_r2_failed,
 )
 from services.upload.schedule_guard import (
@@ -174,6 +176,24 @@ async def complete_upload_transaction(conn, upload_id: str, user_id: str, body: 
                 "code": ERROR_SOURCE_NOT_IN_R2,
                 "message": detail,
                 "hint": "Upload the video file to storage first, then tap Complete again.",
+            },
+        )
+
+    telem_key = str(upload_dict.get("telemetry_r2_key") or "").strip()
+    if telem_key and not await asyncio.to_thread(r2_object_exists, telem_key):
+        detail = UPLOAD_ERROR_MESSAGES.get(
+            ERROR_TELEMETRY_UPLOAD_MISSING, TELEMETRY_UPLOAD_MISSING_MESSAGE
+        )
+        raise HTTPException(
+            409,
+            detail={
+                "code": ERROR_TELEMETRY_UPLOAD_MISSING,
+                "message": detail,
+                "hint": (
+                    "Re-upload the companion .map with the same basename as the video "
+                    "(or use Reprepare), then complete again."
+                ),
+                "telemetry_r2_key": telem_key,
             },
         )
 

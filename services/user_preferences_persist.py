@@ -15,6 +15,7 @@ from stages.entitlements import get_entitlements_from_user
 from stages.ai_service_costs import clamp_ai_service_db_fields
 
 from core.upload_preference_dependencies import normalize_preferences_dict, normalize_upload_preferences_snake
+from services.workspace import resolve_billing_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ _CAMEL_TO_SNAKE: dict[str, str] = {
     "aiServiceSceneUnderstanding": "ai_service_scene_understanding",
     "aiServiceFrameInspector": "ai_service_frame_inspector",
     "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
+    "aiServiceRecognitionTraining": "ai_service_recognition_training",
     "tiktokBurnStyledCover": "tiktok_burn_styled_cover",
     "thumbnailStudioEnabled": "thumbnail_studio_enabled",
     "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
@@ -203,7 +205,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     Full UPDATE user_preferences + user_settings sync + optional users.preferences caption merge.
     Returns {"ok": True, "updatedAt": iso | None}.
     """
-    uid = user["id"]
+    uid = resolve_billing_user_id(user)
     raw_in = dict(payload or {})
     existing_row = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", uid)
     if existing_row:
@@ -259,9 +261,9 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     ai_hashtags_enabled = _coerce_bool(p.get("ai_hashtags_enabled"), False)
 
     try:
-        ai_hashtag_count = int(p.get("ai_hashtag_count", 5))
+        ai_hashtag_count = int(p.get("ai_hashtag_count", 15))
     except Exception:
-        ai_hashtag_count = 5
+        ai_hashtag_count = 15
 
     ai_hashtag_style = str(p.get("ai_hashtag_style", "mixed") or "mixed").lower()
     # UI: lowercase | capitalized | camelcase | mixed — legacy DB rows may use trending/niche.
@@ -484,6 +486,38 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             uid,
         )
 
+        # Consent-only AV recognition training (DB column + JSON mirror).
+        ai_service_recognition_training = _coerce_bool(
+            p.get("aiServiceRecognitionTraining", p.get("ai_service_recognition_training")),
+            False,
+        )
+        try:
+            await conn.execute(
+                """
+                UPDATE user_preferences
+                   SET ai_service_recognition_training = $1, updated_at = NOW()
+                 WHERE user_id = $2
+                """,
+                ai_service_recognition_training,
+                uid,
+            )
+        except Exception as _rt_col:
+            log.debug("ai_service_recognition_training column update skipped: %s", _rt_col)
+
+        # Dashcam OSD (opt-in) — column may be added by migration; also mirrored in users.preferences.
+        try:
+            await conn.execute(
+                """
+                UPDATE user_preferences
+                   SET ai_service_dashcam_osd = $1, updated_at = NOW()
+                 WHERE user_id = $2
+                """,
+                ai_service_dashcam_osd,
+                uid,
+            )
+        except Exception as _osd_col:
+            log.debug("ai_service_dashcam_osd column update skipped: %s", _osd_col)
+
         await conn.execute(
             """
             INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled)
@@ -540,6 +574,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             ("aiServiceSceneUnderstanding", "ai_service_scene_understanding"),
             ("aiServiceFrameInspector", "ai_service_frame_inspector"),
             ("aiServiceVideoAnalyzer", "ai_service_video_analyzer"),
+            ("aiServiceRecognitionTraining", "ai_service_recognition_training"),
             ("tiktokBurnStyledCover", "tiktok_burn_styled_cover"),
         )
         studio_keys = (
@@ -756,6 +791,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                             "aiServiceThumbnailDesigner",
                             "aiServiceFrameInspector",
                             "aiServiceTelemetry",
+                            "aiServiceRecognitionTraining",
                         )
                         val = _coerce_bool(val, False if _opt_in_false else True)
                         users_prefs[camel] = users_prefs[snake] = val

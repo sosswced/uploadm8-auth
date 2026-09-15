@@ -13,6 +13,7 @@ from core.audit import log_system_event
 from core.auth import encrypt_blob
 from core.oauth import mirror_oauth_profile_image_to_r2
 from services.meta_oauth import meta_oauth_mode
+from services.meta_oauth_connect import RECONNECT_WRONG_ACCOUNT_MSG
 from services.platform_oauth_refresh import OAUTH_RECONNECT_RESET_SQL
 from stages.entitlements import can_user_connect_platform
 
@@ -125,6 +126,15 @@ async def persist_meta_destination(
     token_blob = encrypt_blob(blob_payload)
 
     async with core.state.db_pool.acquire() as conn:
+        if reconnect_account_id and reconnect_expected_provider_id:
+            if str(reconnect_expected_provider_id) != str(account_id):
+                return oauth_popup_html(
+                    False,
+                    platform,
+                    post_target,
+                    RECONNECT_WRONG_ACCOUNT_MSG,
+                )
+
         existing = await conn.fetchrow(
             "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
             user_id,
@@ -132,6 +142,13 @@ async def persist_meta_destination(
             account_id,
         )
         if existing:
+            if reconnect_account_id and str(existing["id"]) != str(reconnect_account_id):
+                return oauth_popup_html(
+                    False,
+                    platform,
+                    post_target,
+                    RECONNECT_WRONG_ACCOUNT_MSG,
+                )
             await conn.execute(
                 f"""
                 UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
@@ -147,13 +164,6 @@ async def persist_meta_destination(
             )
             connect_action = "PLATFORM_RECONNECTED"
         elif reconnect_account_id:
-            if reconnect_expected_provider_id and str(reconnect_expected_provider_id) != str(account_id):
-                return oauth_popup_html(
-                    False,
-                    platform,
-                    post_target,
-                    "You authenticated a different account. Please sign in to the same account you selected for reconnect.",
-                )
             await conn.execute(
                 f"""
                 UPDATE platform_tokens

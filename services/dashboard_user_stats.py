@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any, Mapping, Optional
 
-from core.db_pool import is_dead_connection_error
+from core.db_pool import acquire_db, is_dead_connection_error
 from core.deps import require_verified_user_on_conn
 from core.helpers import _now_utc, get_plan
 from core.wallet import get_wallet
@@ -712,7 +712,7 @@ async def fetch_dashboard_stats_for_user_id(
     """
     from core.deps import _attach_workspace_context
 
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         user = await require_verified_user_on_conn(conn, user_id)
         user = await _attach_workspace_context(conn, user, None)
         bill_id = _dashboard_stats_uid(user)

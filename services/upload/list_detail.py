@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import HTTPException
 
+from core.db_pool import acquire_db
 from core.helpers import (
     _load_uploads_columns,
     _pick_cols,
@@ -193,6 +194,7 @@ _ARTIFACT_UI_KEYS = (
     "transcode_status",
     "stage_status",
     "tiktok_music_compliance",
+    "telemetry_ingest",
 )
 
 
@@ -236,6 +238,12 @@ def slim_output_artifacts_for_ui(raw: Any) -> Dict[str, Any]:
             if key == "coach_hints":
                 out[key] = _normalize_coach_hints_artifact(arts[key])
             elif key == "content_hotness" and isinstance(arts[key], str):
+                try:
+                    parsed = json.loads(arts[key])
+                    out[key] = _json_safe_for_api(parsed) if isinstance(parsed, dict) else arts[key]
+                except Exception:
+                    out[key] = _json_safe_for_api(arts[key])
+            elif key == "telemetry_ingest" and isinstance(arts[key], str):
                 try:
                     parsed = json.loads(arts[key])
                     out[key] = _json_safe_for_api(parsed) if isinstance(parsed, dict) else arts[key]
@@ -338,59 +346,126 @@ def timeline_story_from_artifacts(raw: Any) -> list:
     return []
 
 
-def geo_location_hint_for_upload(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+def _geo_flags_from_telemetry_dict(tel: Any) -> tuple[bool, bool]:
+    """Return (has_gps, has_place) from a telemetry-shaped dict."""
+    has_gps = False
+    has_place = False
+    if not isinstance(tel, dict):
+        return has_gps, has_place
+    for k in (
+        "location_display",
+        "location_city",
+        "location_road",
+        "gazetteer_place_name",
+        "padus_unit_name",
+    ):
+        if str(tel.get(k) or "").strip():
+            has_place = True
+            break
+    if tel.get("near_padus") in (True, "true", "1"):
+        has_place = True
+    for k in ("mid_lat", "mid_lon", "start_lat", "start_lon", "lat", "lon"):
+        try:
+            v = float(tel.get(k))
+            if abs(v) > 1e-6:
+                has_gps = True
+                break
+        except (TypeError, ValueError):
+            pass
+    return has_gps, has_place
+
+
+def _geo_flags_from_hydration(row: Dict[str, Any]) -> tuple[bool, bool]:
+    """Union GPS/place from hydration_payload.evidence.geo (pipeline truth)."""
+    arts = output_artifacts_dict(row.get("output_artifacts"))
+    hyd = arts.get("hydration_payload")
+    if isinstance(hyd, str) and hyd.strip():
+        hyd = _safe_json(hyd, None)
+    if not isinstance(hyd, dict):
+        return False, False
+    evidence = hyd.get("evidence")
+    if not isinstance(evidence, dict):
+        return False, False
+    geo = evidence.get("geo")
+    if not isinstance(geo, dict):
+        return False, False
+    has_place = False
+    for k in ("display", "city", "road", "state", "country", "location_display"):
+        if str(geo.get(k) or "").strip():
+            has_place = True
+            break
+    has_gps = False
+    for k in ("lat", "lon", "mid_lat", "mid_lon", "start_lat", "start_lon"):
+        try:
+            v = float(geo.get(k))
+            if abs(v) > 1e-6:
+                has_gps = True
+                break
+        except (TypeError, ValueError):
+            pass
+    return has_gps, has_place
+
+
+def _telemetry_ingest_summary(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    arts = output_artifacts_dict(row.get("output_artifacts"))
+    raw = arts.get("telemetry_ingest")
+    if isinstance(raw, str) and raw.strip():
+        raw = _safe_json(raw, None)
+    if isinstance(raw, dict) and raw:
+        out = _json_safe_for_api(raw)
+        return out if isinstance(out, dict) else None
+    return None
+
+
+def geo_location_hint_for_upload(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     When driving/telemetry content has no resolved place, suggest .map or dashcam HUD.
+
+    Uses the union of ``trill_metadata.telemetry`` and hydration ``evidence.geo`` so
+    successful map parses that landed in hydration do not falsely ask for a .map.
     """
     tel = None
     tm = _safe_json(row.get("trill_metadata"), {}) or {}
     if isinstance(tm, dict) and isinstance(tm.get("telemetry"), dict):
         tel = tm["telemetry"]
-    has_gps = False
-    has_place = False
-    if isinstance(tel, dict):
-        for k in (
-            "location_display",
-            "location_city",
-            "location_road",
-            "gazetteer_place_name",
-            "padus_unit_name",
-        ):
-            if str(tel.get(k) or "").strip():
-                has_place = True
-                break
-        if tel.get("near_padus") in (True, "true", "1"):
-            has_place = True
-        for k in ("mid_lat", "mid_lon", "start_lat", "start_lon"):
-            try:
-                v = float(tel.get(k))
-                if abs(v) > 1e-6:
-                    has_gps = True
-                    break
-            except (TypeError, ValueError):
-                pass
+    has_gps, has_place = _geo_flags_from_telemetry_dict(tel)
+    h_gps, h_place = _geo_flags_from_hydration(row)
+    has_gps = has_gps or h_gps
+    has_place = has_place or h_place
     if has_place:
         return None
-    platforms = list(row.get("platforms") or [])
     filename = str(row.get("filename") or "").lower()
-    drivingish = bool(row.get("telemetry_r2_key")) or filename.endswith(".map")
+    map_key = bool(row.get("telemetry_r2_key"))
+    drivingish = map_key or filename.endswith(".map")
     if not drivingish and not row.get("trill_score"):
         return None
+    ingest = _telemetry_ingest_summary(row)
     if has_gps and not has_place:
         msg = (
             "GPS was detected but place names did not resolve. Confirm gazetteer/PAD-US "
             "tables are loaded on the server, or retry after processing finishes."
         )
+        code = "geo_place_unresolved"
+    elif map_key and not has_gps:
+        msg = (
+            "A companion .map was uploaded but no route GPS was extracted. "
+            "Check map format, Drive Analysis/telemetry processing, or re-upload the pair."
+        )
+        code = "geo_map_uploaded_no_gps"
     else:
         msg = (
             "No route GPS for this upload. Add a companion .map file (same basename as the video) "
             "or use dashcam footage with a burned-in GPS HUD so captions and hashtags can name roads and places."
         )
-    return {
-        "code": "geo_signals_missing",
+        code = "geo_signals_missing"
+    out: Dict[str, Any] = {
+        "code": code,
         "message": msg,
         "settings_path": "settings.html",
     }
+    if ingest:
+        out["telemetry_ingest"] = ingest
+    return out
 
 
 def compute_smart_schedule_display(schedule_mode: str, schedule_metadata: Any) -> Optional[dict]:
@@ -1055,7 +1130,7 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
         "output_artifacts",
         "pipeline_manifest",
     ]
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         user = await conn.fetchrow(
             "SELECT id, status, email_verified FROM users WHERE id = $1",
             user_id,

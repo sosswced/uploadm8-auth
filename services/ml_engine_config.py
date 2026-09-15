@@ -41,6 +41,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _run_av_read_distill_enabled() -> bool:
+    if _env_bool("UM8_ML_ENGINE_RUN_AV_READ", default=False):
+        return True
+    try:
+        from services.av_read_runtime_flags import flag_enabled
+
+        return flag_enabled("UM8_ML_ENGINE_RUN_AV_READ")
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class MLEngineConfig:
     enabled: bool
@@ -68,6 +79,12 @@ class MLEngineConfig:
     content_local_dataset_path: str
     content_local_report_path: str
     content_eval_task_id: str
+    run_av_read_distill: bool
+    av_dataset_repo: Optional[str]
+    av_model_repo: Optional[str]
+    av_local_dataset_path: str
+    av_local_report_path: str
+    av_local_model_path: str
     cold_start_auto_widen: bool
     cold_start_max_lookback_days: int
     seed_bootstrap: bool
@@ -154,6 +171,21 @@ def get_ml_engine_config() -> MLEngineConfig:
             "data/ml/content_success_report.json",
         ),
         content_eval_task_id=_env("UM8_ML_CONTENT_EVAL_TASK_ID", "content_success_roc_auc"),
+        run_av_read_distill=_run_av_read_distill_enabled(),
+        av_dataset_repo=hub.get("av_dataset_repo"),
+        av_model_repo=hub.get("av_model_repo"),
+        av_local_dataset_path=_env(
+            "UM8_ML_ENGINE_AV_DATASET_PATH",
+            "data/ml/av_training_pack_v1.parquet",
+        ),
+        av_local_report_path=_env(
+            "UM8_ML_ENGINE_AV_REPORT_PATH",
+            "data/ml/av_read_distill_report.json",
+        ),
+        av_local_model_path=_env(
+            "UM8_ML_ENGINE_AV_MODEL_PATH",
+            "data/ml/av_read_distill_model.joblib",
+        ),
         cold_start_auto_widen=_env_bool("UM8_ML_ENGINE_AUTO_WIDEN", default=True),
         cold_start_max_lookback_days=max(
             30, _env_int("UM8_ML_ENGINE_MAX_LOOKBACK_DAYS", 730)
@@ -197,6 +229,12 @@ def ml_engine_public_dict(cfg: Optional[MLEngineConfig] = None) -> Dict[str, Any
         "content_model_repo": c.content_model_repo,
         "content_model_url": c.content_model_url,
         "content_eval_task_id": c.content_eval_task_id,
+        "run_av_read_distill": c.run_av_read_distill,
+        "av_dataset_repo": c.av_dataset_repo,
+        "av_model_repo": c.av_model_repo,
+        "av_local_dataset_path": c.av_local_dataset_path,
+        "av_local_report_path": c.av_local_report_path,
+        "av_local_model_path": c.av_local_model_path,
         "cold_start_auto_widen": c.cold_start_auto_widen,
         "cold_start_max_lookback_days": c.cold_start_max_lookback_days,
         "seed_bootstrap": c.seed_bootstrap,

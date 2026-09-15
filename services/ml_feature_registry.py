@@ -175,6 +175,17 @@ CONTENT_FEATURES: List[Feature] = [
     Feature("clip_kind", "output_artifacts.clip_kind / multimodal_depth_route_v1", "categorical", "cat",
             status="experimental",
             notes="Routing enum (dashcam/concert/museum/wearable/vlog/…); not a product taxonomy. Do not train on yet."),
+    # AV training pack (P3) — coarse flags only (no free text in attribution).
+    Feature("pack_present", "output_artifacts.av_training_pack_v1", "int", "num",
+            status="experimental",
+            notes="1 when opt-in pack meta exists."),
+    Feature("pack_keyframe_count", "av_training_pack_v1.keyframe_count", "int", "num",
+            status="experimental"),
+    Feature("pack_tl_status", "av_training_pack_v1.tl_status", "categorical", "cat",
+            status="experimental",
+            notes="ok|skipped|failed|disabled — TL backup cohort."),
+    Feature("pack_needs_deep_teacher", "av_training_pack_v1.needs_deep_teacher", "int", "num",
+            status="experimental"),
 
     # Engagement label inputs (kept as meta, used to build the label)
     Feature("views", "platform_results engagement", "int", "meta"),

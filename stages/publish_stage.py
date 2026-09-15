@@ -28,13 +28,14 @@ import json
 import asyncio
 import logging
 import base64
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from core.helpers import strip_stray_hashtag_json_blob
+from core.helpers import clip_at_word_boundary, strip_stray_hashtag_json_blob, safe_http_error_snippet
 
 from core.cancel_signal import is_cancelled_fast as _cancel_is_set_fast
 
@@ -89,9 +90,22 @@ logger = logging.getLogger("uploadm8-worker")
 # Graph API version for Meta platforms (Instagram + Facebook)
 META_API_VERSION = "v21.0"
 
-# Instagram container polling
-IG_POLL_INTERVAL = 5       # seconds between polls
-IG_POLL_MAX_ATTEMPTS = 36  # 3 minutes max (36 * 5s)
+# Instagram container polling + fallback ladder
+# L0  Base poll 15s × 20 = 5m (Meta guidance), soft-extend +10m only on IN_PROGRESS.
+# L1  On timeout: persist creation_id; next attempt resumes that container if still valid.
+# L2  If container ERROR/EXPIRED/gone: create a fresh container (auto-retry / user Retry).
+# L3  PLATFORM_RATE_LIMIT: fail closed this attempt; auto-retry with backoff (no soft-extend).
+# Soft polls use a slower cadence so we do not burn Graph rate limits.
+IG_POLL_INTERVAL = 15
+IG_POLL_MAX_ATTEMPTS = 20  # 5m base (20 * 15s)
+IG_POLL_SOFT_EXTEND_INTERVAL = 60
+IG_POLL_SOFT_EXTEND_ATTEMPTS = 10  # +10m if still IN_PROGRESS → 15m total
+IG_POLL_READY_STATUSES = frozenset({"FINISHED", "PUBLISHED"})
+IG_POLL_ACTIVE_STATUSES = frozenset({"IN_PROGRESS"})
+# Meta containers expire ~24h; leave a 1h safety margin for resume.
+IG_CONTAINER_RESUME_MAX_AGE_HOURS = 23
+IG_PENDING_ARTIFACT_KEY = "ig_pending_containers"
+IG_RESUME_ERROR_CODES = frozenset({"CONTAINER_TIMEOUT", "PLATFORM_RATE_LIMIT"})
 # IG Comment API message limit (stay under Meta limits; UTF-8 safe slice)
 IG_HASHTAG_COMMENT_MAX = 1900
 
@@ -1000,7 +1014,11 @@ async def _refresh_tiktok_token(
                         logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
                 return updated
             else:
-                logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
+                logger.warning(
+                    "TikTok: Token refresh failed: %s %s",
+                    resp.status_code,
+                    safe_http_error_snippet(resp.text),
+                )
                 return token_data
     except Exception as e:
         logger.warning(f"TikTok: Token refresh exception: {e}")
@@ -1602,7 +1620,11 @@ async def _refresh_youtube_token(
                         logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")
                 return updated
             else:
-                logger.warning(f"YouTube: Token refresh failed: {resp.status_code} {resp.text[:200]}")
+                logger.warning(
+                    "YouTube: Token refresh failed: %s %s",
+                    resp.status_code,
+                    safe_http_error_snippet(resp.text),
+                )
                 return token_data
     except Exception as e:
         logger.warning(f"YouTube: Token refresh exception: {e}")
@@ -1645,13 +1667,16 @@ async def publish_to_youtube(
             (getattr(ctx, "audio_context", None) or {}).get("copyright_risk"),
         )
 
-    title = _get_title(ctx, "youtube")[:100]
+    title = clip_at_word_boundary(_get_title(ctx, "youtube"), 100)
     caption = _build_platform_caption(ctx, "youtube")
     if rights_long_form:
-        title = _strip_youtube_shorts_hashtag_markers(title)[:100]
+        title = clip_at_word_boundary(_strip_youtube_shorts_hashtag_markers(title), 100)
         if not (title or "").strip():
             uid = str(getattr(ctx, "upload_id", "") or "").strip()
-            title = (f"UploadM8 {uid}" if uid else "UploadM8 video")[:100]
+            title = clip_at_word_boundary(
+                f"UploadM8 {uid}" if uid else "UploadM8 video",
+                100,
+            )
         caption = _strip_youtube_shorts_hashtag_markers(caption)
     description = caption[:5000] if caption else ""
 
@@ -1814,6 +1839,139 @@ async def _instagram_cover_public_url(
     return r2_stage.generate_presigned_url(meta_key, expires=PRESIGNED_URL_EXPIRY)
 
 
+def _ig_pending_container_key(token_row_id: Optional[str], ig_user_id: Optional[str]) -> str:
+    return str(token_row_id or ig_user_id or "default").strip() or "default"
+
+
+def _stash_instagram_pending_container(
+    ctx: JobContext,
+    *,
+    token_row_id: Optional[str],
+    ig_user_id: Optional[str],
+    creation_id: str,
+    last_status: str,
+) -> None:
+    """Remember creation_id so a retry can resume instead of double-creating."""
+    key = _ig_pending_container_key(token_row_id, ig_user_id)
+    payload = {
+        "creation_id": str(creation_id),
+        "last_status": str(last_status or "UNKNOWN"),
+        "ig_user_id": str(ig_user_id or ""),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    raw = (ctx.output_artifacts or {}).get(IG_PENDING_ARTIFACT_KEY)
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[key] = payload
+    ctx.output_artifacts[IG_PENDING_ARTIFACT_KEY] = json.dumps(data)
+
+
+def _clear_instagram_pending_container(
+    ctx: JobContext,
+    *,
+    token_row_id: Optional[str],
+    ig_user_id: Optional[str],
+) -> None:
+    key = _ig_pending_container_key(token_row_id, ig_user_id)
+    raw = (ctx.output_artifacts or {}).get(IG_PENDING_ARTIFACT_KEY)
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except Exception:
+        data = {}
+    if not isinstance(data, dict) or key not in data:
+        return
+    data.pop(key, None)
+    if data:
+        ctx.output_artifacts[IG_PENDING_ARTIFACT_KEY] = json.dumps(data)
+    else:
+        ctx.output_artifacts.pop(IG_PENDING_ARTIFACT_KEY, None)
+
+
+def _pending_creation_id_from_artifacts(
+    ctx: JobContext,
+    *,
+    token_row_id: Optional[str],
+    ig_user_id: Optional[str],
+) -> Optional[str]:
+    key = _ig_pending_container_key(token_row_id, ig_user_id)
+    raw = (ctx.output_artifacts or {}).get(IG_PENDING_ARTIFACT_KEY)
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    entry = data.get(key)
+    if not isinstance(entry, dict):
+        return None
+    cid = str(entry.get("creation_id") or "").strip()
+    return cid or None
+
+
+async def _load_instagram_pending_creation_id(
+    db_pool,
+    *,
+    upload_id: str,
+    token_row_id: Optional[str],
+) -> Optional[str]:
+    """Load a resumable IG creation_id from a recent failed publish_attempt."""
+    if db_pool is None or not upload_id:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            if token_row_id:
+                row = await conn.fetchrow(
+                    """
+                    SELECT publish_id
+                    FROM publish_attempts
+                    WHERE upload_id = $1::uuid
+                      AND LOWER(platform) = 'instagram'
+                      AND token_row_id = $2::uuid
+                      AND publish_id IS NOT NULL
+                      AND TRIM(publish_id) <> ''
+                      AND LOWER(COALESCE(status, '')) = 'failed'
+                      AND UPPER(COALESCE(error_code, '')) = ANY($3::text[])
+                      AND updated_at > NOW() - make_interval(hours => $4::int)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    str(upload_id),
+                    str(token_row_id),
+                    list(IG_RESUME_ERROR_CODES),
+                    int(IG_CONTAINER_RESUME_MAX_AGE_HOURS),
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT publish_id
+                    FROM publish_attempts
+                    WHERE upload_id = $1::uuid
+                      AND LOWER(platform) = 'instagram'
+                      AND publish_id IS NOT NULL
+                      AND TRIM(publish_id) <> ''
+                      AND LOWER(COALESCE(status, '')) = 'failed'
+                      AND UPPER(COALESCE(error_code, '')) = ANY($2::text[])
+                      AND updated_at > NOW() - make_interval(hours => $3::int)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    str(upload_id),
+                    list(IG_RESUME_ERROR_CODES),
+                    int(IG_CONTAINER_RESUME_MAX_AGE_HOURS),
+                )
+        if not row:
+            return None
+        cid = str(row["publish_id"] or "").strip()
+        return cid or None
+    except Exception as e:
+        logger.warning("Instagram: pending creation_id lookup failed: %s", e)
+        return None
+
+
 async def publish_to_instagram(
     video_path: Path,
     ctx: JobContext,
@@ -1904,175 +2062,405 @@ async def publish_to_instagram(
 
     try:
         async with meta_graph_slot(), httpx.AsyncClient(timeout=120) as client:
-            # Step 1: Create media container
-            logger.info(f"Instagram: Creating Reels container for ig_user_id={ig_user_id} (privacy={ig_privacy})")
-            ig_params = {
-                "access_token": access_token,
-                "media_type": "REELS",
-                "video_url": video_url,
-                "caption": caption[:2200] if caption else "",
-                "share_to_feed": "true" if ig_privacy == "public" else "false",
-            }
-            # Instagram cover_url must be set at creation time — cannot change after publish.
-            # Prefer platform-specific styled 9:16 thumbnail (Pikzels / persona / custom).
-            thumb_cover_url = None
-            thumb_path = await _ensure_platform_thumbnail_local(ctx, "instagram")
-            if thumb_path:
-                try:
-                    import tempfile
-
-                    tmp_dir = Path(tempfile.mkdtemp(prefix="ig_cover_"))
-                    jpeg_path = tmp_dir / "cover_meta.jpg"
-                    jpeg_path.write_bytes(thumb_path.read_bytes())
-                    ensure_jpeg_file(jpeg_path)
-                    user_id = getattr(ctx, "user_id", None) or "unknown"
-                    upload_id = getattr(ctx, "upload_id", None) or "unknown"
-                    meta_key = f"thumbnails/{user_id}/{upload_id}/instagram_ig_cover.jpg"
-                    await r2_stage.upload_file(jpeg_path, meta_key, "image/jpeg")
-                    thumb_cover_url = r2_stage.get_public_url(meta_key)
-                    if not thumb_cover_url:
-                        thumb_cover_url = r2_stage.generate_presigned_url(
-                            meta_key, expires=PRESIGNED_URL_EXPIRY
-                        )
-                    if thumb_cover_url:
-                        logger.info("Instagram: cover_url set from styled thumbnail (JPEG-safe)")
-                except Exception as _e:
-                    logger.warning(f"Instagram: could not set cover_url from local thumb: {_e}")
-            if not thumb_cover_url:
-                thumb_r2_key = None
-                pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
-                try:
-                    pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
-                    thumb_r2_key = pt_keys.get("instagram")
-                except Exception:
-                    pass
-                thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
-                if thumb_r2_key:
-                    try:
-                        thumb_cover_url = await _instagram_cover_public_url(thumb_r2_key, ctx)
-                        if thumb_cover_url:
-                            logger.info("Instagram: cover_url set from R2 key (JPEG-safe)")
-                    except Exception as _e:
-                        logger.warning(f"Instagram: could not set cover_url: {_e}")
-            if thumb_cover_url:
-                ig_params["cover_url"] = thumb_cover_url
-                _record_platform_thumb_push(
-                    ctx,
-                    "instagram",
-                    {"ok": True, "cover_url_set": True, "stage": "container_create"},
-                )
-                try:
-                    rep_raw = ctx.output_artifacts.get("studio_render_report")
-                    if isinstance(rep_raw, str) and rep_raw.strip():
-                        rep = json.loads(rep_raw)
-                        if isinstance(rep, dict):
-                            rep["instagram_cover_url_set"] = True
-                            ctx.output_artifacts["studio_render_report"] = json.dumps(rep)
-                except Exception:
-                    pass
-            else:
-                method = str(ctx.output_artifacts.get("thumbnail_render_method") or "").strip().lower()
-                _record_platform_thumb_push(
-                    ctx,
-                    "instagram",
-                    {
-                        "ok": False,
-                        "cover_url_set": False,
-                        "stage": "container_create",
-                        "error_code": "instagram_cover_missing",
-                        "message": (
-                            "No 9:16 Pikzels/styled cover available at Reels container create. "
-                            f"thumbnail_render_method={method or 'unknown'}"
-                        ),
-                    },
-                )
-                logger.warning(
-                    "Instagram: publishing Reels without cover_url (no platform thumb) upload=%s method=%s",
-                    getattr(ctx, "upload_id", ""),
-                    method,
-                )
-            create_resp = await client.post(
-                instagram_reels_container_url(ig_user_id, version=META_API_VERSION),
-                params=ig_params
-            )
-
-            if create_resp.status_code != 200:
-                error_body = create_resp.text[:300]
-                logger.error(f"Instagram container creation failed: {error_body}")
-                rl = meta_graph_is_rate_limited(
-                    create_resp.status_code, error_body, getattr(create_resp, "headers", None)
-                )
-                return PlatformResult(
-                    platform="instagram",
-                    success=False,
-                    http_status=create_resp.status_code,
-                    error_code="PLATFORM_RATE_LIMIT" if rl else "CONTAINER_FAILED",
-                    error_message=f"Container creation failed: {error_body}"
-                )
-
-            creation_id = create_resp.json().get("id")
-            if not creation_id:
-                return PlatformResult(
-                    platform="instagram",
-                    success=False,
-                    error_code="NO_CREATION_ID",
-                    error_message="No creation_id returned from container endpoint"
-                )
-
-            logger.info(f"Instagram: Container created, creation_id={creation_id}, polling status...")
-
-            # Step 2: Poll until container is ready
+            creation_id = None
             container_ready = False
+            resumed_container = False
             final_status = "UNKNOWN"
 
-            for attempt in range(IG_POLL_MAX_ATTEMPTS):
-                await asyncio.sleep(IG_POLL_INTERVAL)
+            # L1 fallback: resume a prior timed-out container before creating another.
+            pending_creation_id = _pending_creation_id_from_artifacts(
+                ctx, token_row_id=token_row_id, ig_user_id=str(ig_user_id) if ig_user_id else None
+            )
+            if not pending_creation_id:
+                pending_creation_id = await _load_instagram_pending_creation_id(
+                    db_pool,
+                    upload_id=str(getattr(ctx, "upload_id", "") or ""),
+                    token_row_id=token_row_id,
+                )
+            if pending_creation_id:
+                logger.info(
+                    "Instagram: Probing pending container creation_id=%s (resume fallback)",
+                    pending_creation_id,
+                )
+                probe = await client.get(
+                    f"https://graph.facebook.com/{META_API_VERSION}/{pending_creation_id}",
+                    params={
+                        "access_token": access_token,
+                        "fields": "status_code,status",
+                    },
+                )
+                if probe.status_code == 200:
+                    try:
+                        probe_data = probe.json()
+                    except Exception:
+                        probe_data = {}
+                    if not isinstance(probe_data, dict):
+                        probe_data = {}
+                    probe_status = (
+                        str(probe_data.get("status_code") or "UNKNOWN").strip().upper()
+                        or "UNKNOWN"
+                    )
+                    final_status = probe_status
+                    if probe_status in IG_POLL_READY_STATUSES:
+                        creation_id = pending_creation_id
+                        container_ready = True
+                        resumed_container = True
+                        logger.info(
+                            "Instagram: Resuming FINISHED container creation_id=%s",
+                            creation_id,
+                        )
+                    elif probe_status in IG_POLL_ACTIVE_STATUSES:
+                        creation_id = pending_creation_id
+                        resumed_container = True
+                        logger.info(
+                            "Instagram: Resuming IN_PROGRESS container creation_id=%s",
+                            creation_id,
+                        )
+                    else:
+                        logger.info(
+                            "Instagram: Abandoning pending container status=%s — creating fresh",
+                            probe_status,
+                        )
+                        _clear_instagram_pending_container(
+                            ctx,
+                            token_row_id=token_row_id,
+                            ig_user_id=str(ig_user_id) if ig_user_id else None,
+                        )
+                else:
+                    logger.info(
+                        "Instagram: Pending container probe HTTP %s — creating fresh",
+                        probe.status_code,
+                    )
+                    _clear_instagram_pending_container(
+                        ctx,
+                        token_row_id=token_row_id,
+                        ig_user_id=str(ig_user_id) if ig_user_id else None,
+                    )
+
+            # Step 1: Create media container (skipped when L1 resume holds a live creation_id)
+            if not creation_id:
+                logger.info(
+                    f"Instagram: Creating Reels container for ig_user_id={ig_user_id} (privacy={ig_privacy})"
+                )
+                ig_params = {
+                    "access_token": access_token,
+                    "media_type": "REELS",
+                    "video_url": video_url,
+                    "caption": caption[:2200] if caption else "",
+                    "share_to_feed": "true" if ig_privacy == "public" else "false",
+                }
+                # Instagram cover_url must be set at creation time — cannot change after publish.
+                # Prefer platform-specific styled 9:16 thumbnail (Pikzels / persona / custom).
+                thumb_cover_url = None
+                thumb_path = await _ensure_platform_thumbnail_local(ctx, "instagram")
+                if thumb_path:
+                    try:
+                        import tempfile
+
+                        tmp_dir = Path(tempfile.mkdtemp(prefix="ig_cover_"))
+                        jpeg_path = tmp_dir / "cover_meta.jpg"
+                        jpeg_path.write_bytes(thumb_path.read_bytes())
+                        ensure_jpeg_file(jpeg_path)
+                        user_id = getattr(ctx, "user_id", None) or "unknown"
+                        upload_id = getattr(ctx, "upload_id", None) or "unknown"
+                        meta_key = f"thumbnails/{user_id}/{upload_id}/instagram_ig_cover.jpg"
+                        await r2_stage.upload_file(jpeg_path, meta_key, "image/jpeg")
+                        thumb_cover_url = r2_stage.get_public_url(meta_key)
+                        if not thumb_cover_url:
+                            thumb_cover_url = r2_stage.generate_presigned_url(
+                                meta_key, expires=PRESIGNED_URL_EXPIRY
+                            )
+                        if thumb_cover_url:
+                            logger.info("Instagram: cover_url set from styled thumbnail (JPEG-safe)")
+                    except Exception as _e:
+                        logger.warning(f"Instagram: could not set cover_url from local thumb: {_e}")
+                if not thumb_cover_url:
+                    thumb_r2_key = None
+                    pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
+                    try:
+                        pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
+                        thumb_r2_key = pt_keys.get("instagram")
+                    except Exception:
+                        pass
+                    thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
+                    if thumb_r2_key:
+                        try:
+                            thumb_cover_url = await _instagram_cover_public_url(thumb_r2_key, ctx)
+                            if thumb_cover_url:
+                                logger.info("Instagram: cover_url set from R2 key (JPEG-safe)")
+                        except Exception as _e:
+                            logger.warning(f"Instagram: could not set cover_url: {_e}")
+                if thumb_cover_url:
+                    ig_params["cover_url"] = thumb_cover_url
+                    _record_platform_thumb_push(
+                        ctx,
+                        "instagram",
+                        {"ok": True, "cover_url_set": True, "stage": "container_create"},
+                    )
+                    try:
+                        rep_raw = ctx.output_artifacts.get("studio_render_report")
+                        if isinstance(rep_raw, str) and rep_raw.strip():
+                            rep = json.loads(rep_raw)
+                            if isinstance(rep, dict):
+                                rep["instagram_cover_url_set"] = True
+                                ctx.output_artifacts["studio_render_report"] = json.dumps(rep)
+                    except Exception:
+                        pass
+                else:
+                    method = str(ctx.output_artifacts.get("thumbnail_render_method") or "").strip().lower()
+                    _record_platform_thumb_push(
+                        ctx,
+                        "instagram",
+                        {
+                            "ok": False,
+                            "cover_url_set": False,
+                            "stage": "container_create",
+                            "error_code": "instagram_cover_missing",
+                            "message": (
+                                "No 9:16 Pikzels/styled cover available at Reels container create. "
+                                f"thumbnail_render_method={method or 'unknown'}"
+                            ),
+                        },
+                    )
+                    logger.warning(
+                        "Instagram: publishing Reels without cover_url (no platform thumb) upload=%s method=%s",
+                        getattr(ctx, "upload_id", ""),
+                        method,
+                    )
+                create_resp = await client.post(
+                    instagram_reels_container_url(ig_user_id, version=META_API_VERSION),
+                    params=ig_params
+                )
+
+                if create_resp.status_code != 200:
+                    error_body = create_resp.text[:300]
+                    logger.error(f"Instagram container creation failed: {error_body}")
+                    rl = meta_graph_is_rate_limited(
+                        create_resp.status_code, error_body, getattr(create_resp, "headers", None)
+                    )
+                    return PlatformResult(
+                        platform="instagram",
+                        success=False,
+                        http_status=create_resp.status_code,
+                        error_code="PLATFORM_RATE_LIMIT" if rl else "CONTAINER_FAILED",
+                        error_message=f"Container creation failed: {error_body}"
+                    )
+
+                creation_id = create_resp.json().get("id")
+                if not creation_id:
+                    return PlatformResult(
+                        platform="instagram",
+                        success=False,
+                        error_code="NO_CREATION_ID",
+                        error_message="No creation_id returned from container endpoint"
+                    )
+
+                logger.info(f"Instagram: Container created, creation_id={creation_id}, polling status...")
+
+            # Step 2: Poll until container is ready (base 5m, soft-extend on IN_PROGRESS)
+            # Resumed FINISHED containers skip polling.
+            last_poll_http: Optional[int] = None
+            last_poll_body = ""
+            poll_failures = 0
+            rate_limited_polls = 0
+            waited_s = 0
+            soft_extended = False
+
+            async def _poll_once() -> Optional[PlatformResult]:
+                """One status GET. Returns PlatformResult on terminal ERROR/EXPIRED."""
+                nonlocal container_ready, final_status, last_poll_http, last_poll_body
+                nonlocal poll_failures, rate_limited_polls
 
                 status_resp = await client.get(
                     f"https://graph.facebook.com/{META_API_VERSION}/{creation_id}",
                     params={
                         "access_token": access_token,
                         "fields": "status_code,status",
-                    }
+                    },
                 )
+                last_poll_http = status_resp.status_code
+                last_poll_body = (status_resp.text or "")[:200]
 
                 if status_resp.status_code != 200:
-                    logger.warning(f"Instagram: Status poll failed (attempt {attempt + 1}): {status_resp.status_code}")
-                    continue
+                    poll_failures += 1
+                    if meta_graph_is_rate_limited(
+                        status_resp.status_code,
+                        last_poll_body,
+                        getattr(status_resp, "headers", None),
+                    ):
+                        rate_limited_polls += 1
+                    logger.warning(
+                        "Instagram: Status poll failed (waited %ss): HTTP %s body=%s",
+                        waited_s,
+                        status_resp.status_code,
+                        last_poll_body[:120],
+                    )
+                    return None
 
-                status_data = status_resp.json()
-                final_status = status_data.get("status_code", "UNKNOWN")
+                try:
+                    status_data = status_resp.json()
+                except Exception:
+                    status_data = {}
+                if not isinstance(status_data, dict):
+                    status_data = {}
+                raw_status = status_data.get("status_code")
+                final_status = str(raw_status or "UNKNOWN").strip().upper() or "UNKNOWN"
 
-                if final_status == "FINISHED":
+                if final_status in IG_POLL_READY_STATUSES:
                     container_ready = True
-                    logger.info(f"Instagram: Container ready after {(attempt + 1) * IG_POLL_INTERVAL}s")
-                    break
-                elif final_status == "ERROR":
+                    logger.info(
+                        "Instagram: Container ready after %ss (status=%s)",
+                        waited_s,
+                        final_status,
+                    )
+                    return None
+                if final_status == "ERROR":
                     error_detail = status_data.get("status", "Unknown error")
+                    _clear_instagram_pending_container(
+                        ctx,
+                        token_row_id=token_row_id,
+                        ig_user_id=str(ig_user_id) if ig_user_id else None,
+                    )
                     return PlatformResult(
                         platform="instagram",
                         success=False,
                         error_code="CONTAINER_ERROR",
-                        error_message=f"Container processing failed: {error_detail}"
+                        error_message=f"Container processing failed: {error_detail}",
                     )
-                elif final_status == "EXPIRED":
+                if final_status == "EXPIRED":
+                    _clear_instagram_pending_container(
+                        ctx,
+                        token_row_id=token_row_id,
+                        ig_user_id=str(ig_user_id) if ig_user_id else None,
+                    )
                     return PlatformResult(
                         platform="instagram",
                         success=False,
                         error_code="CONTAINER_EXPIRED",
-                        error_message="Container expired before publishing"
+                        error_message="Container expired before publishing",
                     )
-                else:
-                    # IN_PROGRESS or other status
-                    if (attempt + 1) % 6 == 0:  # Log every 30s
-                        logger.info(f"Instagram: Still processing... status={final_status} ({(attempt + 1) * IG_POLL_INTERVAL}s)")
+                return None
 
             if not container_ready:
+                base_attempts = (
+                    IG_POLL_SOFT_EXTEND_ATTEMPTS
+                    if resumed_container
+                    else IG_POLL_MAX_ATTEMPTS
+                )
+                base_interval = (
+                    IG_POLL_SOFT_EXTEND_INTERVAL
+                    if resumed_container
+                    else IG_POLL_INTERVAL
+                )
+                if resumed_container:
+                    logger.info(
+                        "Instagram: Resume poll for creation_id=%s (%s attempts @ %ss)",
+                        creation_id,
+                        base_attempts,
+                        base_interval,
+                    )
+
+                for attempt in range(base_attempts):
+                    await asyncio.sleep(base_interval)
+                    waited_s = (attempt + 1) * base_interval
+                    early = await _poll_once()
+                    if early is not None:
+                        return early
+                    if container_ready:
+                        break
+                    if final_status in IG_POLL_ACTIVE_STATUSES and (
+                        (attempt + 1) % max(1, 60 // max(base_interval, 1)) == 0
+                    ):
+                        logger.info(
+                            "Instagram: Still processing... status=%s (%ss)",
+                            final_status,
+                            waited_s,
+                        )
+
+                # Soft extend past Meta's 5m guidance only when we have live IN_PROGRESS
+                # on a freshly created container (resume already used the slow cadence).
+                if (
+                    not container_ready
+                    and not resumed_container
+                    and final_status in IG_POLL_ACTIVE_STATUSES
+                    and IG_POLL_SOFT_EXTEND_ATTEMPTS > 0
+                ):
+                    soft_extended = True
+                    logger.info(
+                        "Instagram: Soft-extending container poll (%ss more @ %ss) "
+                        "after base window; status=%s creation_id=%s",
+                        IG_POLL_SOFT_EXTEND_ATTEMPTS * IG_POLL_SOFT_EXTEND_INTERVAL,
+                        IG_POLL_SOFT_EXTEND_INTERVAL,
+                        final_status,
+                        creation_id,
+                    )
+                    for soft_attempt in range(IG_POLL_SOFT_EXTEND_ATTEMPTS):
+                        await asyncio.sleep(IG_POLL_SOFT_EXTEND_INTERVAL)
+                        waited_s += IG_POLL_SOFT_EXTEND_INTERVAL
+                        early = await _poll_once()
+                        if early is not None:
+                            return early
+                        if container_ready:
+                            break
+                        logger.info(
+                            "Instagram: Soft-extend still processing... status=%s (%ss)",
+                            final_status,
+                            waited_s,
+                        )
+
+            if not container_ready:
+                # UNKNOWN + failed polls usually means Graph rejected status reads
+                # (often rate limit), not that Meta was still encoding.
+                never_saw_status = final_status == "UNKNOWN" and poll_failures > 0
+                _stash_instagram_pending_container(
+                    ctx,
+                    token_row_id=token_row_id,
+                    ig_user_id=str(ig_user_id) if ig_user_id else None,
+                    creation_id=str(creation_id),
+                    last_status=final_status,
+                )
+                timeout_payload = {
+                    "ig_creation_id": str(creation_id),
+                    "last_status": final_status,
+                    "soft_extended": soft_extended,
+                    "resumed_container": resumed_container,
+                    "poll_failures": poll_failures,
+                }
+                if never_saw_status and rate_limited_polls > 0:
+                    return PlatformResult(
+                        platform="instagram",
+                        success=False,
+                        http_status=last_poll_http,
+                        error_code="PLATFORM_RATE_LIMIT",
+                        error_message=(
+                            f"Instagram container status polls rate-limited after {waited_s}s "
+                            f"(creation_id={creation_id}, poll_failures={poll_failures}, "
+                            f"last_http={last_poll_http})"
+                        ),
+                        publish_id=str(creation_id),
+                        response_payload=timeout_payload,
+                    )
+                detail_bits = [
+                    f"last status: {final_status}",
+                    f"creation_id={creation_id}",
+                    f"poll_failures={poll_failures}",
+                    f"soft_extended={soft_extended}",
+                    f"resumed={resumed_container}",
+                ]
+                if last_poll_http is not None:
+                    detail_bits.append(f"last_http={last_poll_http}")
+                if never_saw_status and last_poll_body:
+                    detail_bits.append(f"last_body={last_poll_body[:120]}")
                 return PlatformResult(
                     platform="instagram",
                     success=False,
+                    http_status=last_poll_http if never_saw_status else None,
                     error_code="CONTAINER_TIMEOUT",
-                    error_message=f"Container not ready after {IG_POLL_MAX_ATTEMPTS * IG_POLL_INTERVAL}s (last status: {final_status})"
+                    error_message=(
+                        f"Container not ready after {waited_s}s ({'; '.join(detail_bits)})"
+                    ),
+                    publish_id=str(creation_id),
+                    response_payload=timeout_payload,
                 )
 
             # Step 3: Publish the container
@@ -2099,6 +2487,7 @@ async def publish_to_instagram(
 
             media_id = publish_resp.json().get("id")
             platform_url: Optional[str] = None
+            ig_shortcode: Optional[str] = None
             last_http: Optional[int] = None
             if media_id:
                 for _ig_attempt in range(2):
@@ -2107,7 +2496,7 @@ async def publish_to_instagram(
                             f"https://graph.facebook.com/{META_API_VERSION}/{media_id}",
                             params={
                                 "access_token": access_token,
-                                "fields": "permalink,shortcode",
+                                "fields": "permalink,shortcode,ig_id",
                             },
                         )
                         last_http = perm_resp.status_code
@@ -2118,6 +2507,7 @@ async def publish_to_instagram(
                             if not platform_url and sc:
                                 platform_url = f"https://www.instagram.com/reel/{sc}/"
                             if platform_url:
+                                ig_shortcode = sc or None
                                 break
                     except Exception as _e:
                         logger.warning(f"Instagram: permalink fetch for {media_id}: {_e}")
@@ -2129,6 +2519,49 @@ async def publish_to_instagram(
                         media_id,
                         last_http,
                     )
+                # Publish sometimes returns a non-listable / container-family id. Reconcile
+                # against /{ig-user-id}/media using shortcode or caption.
+                try:
+                    from services.meta_graph_metrics import reconcile_instagram_graph_media_id
+
+                    await asyncio.sleep(1.0)
+                    reconciled = await reconcile_instagram_graph_media_id(
+                        client,
+                        access_token,
+                        str(ig_user_id),
+                        media_id=str(media_id) if media_id else None,
+                        shortcode=ig_shortcode,
+                        creation_id=str(creation_id) if creation_id else None,
+                        caption_hint=(_get_caption(ctx, "instagram") or "")[:120],
+                    )
+                    if reconciled and str(reconciled) != str(media_id):
+                        logger.info(
+                            "Instagram: reconciled media_id %s → %s (shortcode=%s)",
+                            media_id,
+                            reconciled,
+                            ig_shortcode,
+                        )
+                        media_id = reconciled
+                        try:
+                            perm_resp = await client.get(
+                                f"https://graph.facebook.com/{META_API_VERSION}/{media_id}",
+                                params={
+                                    "access_token": access_token,
+                                    "fields": "permalink,shortcode,ig_id",
+                                },
+                            )
+                            if perm_resp.status_code == 200:
+                                pj = perm_resp.json() or {}
+                                platform_url = (pj.get("permalink") or "").strip() or platform_url
+                                sc = (pj.get("shortcode") or "").strip()
+                                if sc:
+                                    ig_shortcode = sc
+                                    if not platform_url:
+                                        platform_url = f"https://www.instagram.com/reel/{sc}/"
+                        except Exception as _e:
+                            logger.warning("Instagram: permalink refresh after reconcile: %s", _e)
+                except Exception as _e:
+                    logger.warning("Instagram: media id reconcile skipped: %s", _e)
 
             # First-comment hashtags: reel caption stays prose-only; tag block posted as /comments.
             if media_id and _instagram_first_comment_mode(ctx):
@@ -2148,11 +2581,17 @@ async def publish_to_instagram(
                         )
 
             logger.info(f"Instagram publish accepted: media_id={media_id} url={platform_url}")
+            _clear_instagram_pending_container(
+                ctx,
+                token_row_id=token_row_id,
+                ig_user_id=str(ig_user_id) if ig_user_id else None,
+            )
             return PlatformResult(
                 platform="instagram",
                 success=True,
                 platform_video_id=media_id,
                 platform_url=platform_url,
+                shortcode=ig_shortcode,
                 publish_id=creation_id,
                 verify_status="pending",
             )
@@ -2929,6 +3368,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                         error_message=result.error_message or "Publish failed",
                         http_status=result.http_status,
                         response_payload=result.response_payload,
+                        publish_id=result.publish_id,
                     )
             except Exception as e:
                 logger.warning(f"{account_label}: Could not update publish_attempt: {e}")

@@ -66,6 +66,11 @@ from services.admin_kpi_reliability import (
     fetch_admin_growth_metrics,
     fetch_admin_reliability_metrics,
 )
+from services.admin_kpi_window import (
+    AdminKpiWindowError,
+    previous_equal_window,
+    resolve_admin_kpi_window,
+)
 from services.canonical_engagement import ROLLUP_VERSION, compute_admin_engagement_totals
 from services import metric_definitions as metric_definitions_svc
 from services.ml_hub_config import (
@@ -122,7 +127,7 @@ def _platform_upload_mix_sql() -> str:
         SELECT p AS platform, COUNT(*)::int AS uploads
         FROM uploads u,
              LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS u_p(p)
-        WHERE u.created_at >= $1
+        WHERE u.created_at >= $1 AND u.created_at < $2
         GROUP BY p
     """
 
@@ -209,6 +214,13 @@ async def ml_observability_overview(
             "content_dataset_exists": content_dataset_path.exists(),
             "content_report_path": str(content_report_path),
             "content_report_exists": content_report_path.exists(),
+            "av_read_distill_model_path": str(root / "data" / "ml" / "av_read_distill_model.joblib"),
+            "av_read_distill_model_exists": (root / "data" / "ml" / "av_read_distill_model.joblib").exists(),
+            "av_pack_ttl_days": int(os.environ.get("AV_TRAINING_PACK_TTL_DAYS", "90") or "90"),
+            "av_training_dataset_path": str(root / "data" / "ml" / "av_training_pack_v1.parquet"),
+            "av_training_dataset_exists": (root / "data" / "ml" / "av_training_pack_v1.parquet").exists(),
+            "av_read_report_path": str(root / "data" / "ml" / "av_read_distill_report.json"),
+            "av_read_report_exists": (root / "data" / "ml" / "av_read_distill_report.json").exists(),
         },
         "huggingface": {
             "token_configured": bool(hf_token),
@@ -308,9 +320,16 @@ async def ml_observability_overview(
             "cycle_status": last_run.get("cycle_status"),
             "promo_status": last_run.get("status"),
             "content_status": (last_run.get("content") or {}).get("status"),
+            "av_read_status": (last_run.get("av_read") or {}).get("status"),
             "blocked_on_data": last_run.get("cycle_status") == "blocked_on_data",
             "last_hf_job_url": (last_run.get("steps") or {}).get("hf_jobs_train", {}).get("job_url"),
         }
+        try:
+            from services.av_read_runtime_flags import status_snapshot as _av_flags_snap
+
+            summary["av_read_flags"] = _av_flags_snap()
+        except Exception:
+            summary["av_read_flags"] = None
         summary["feature_catalog_count"] = len(_ml_feature_registry_catalog())
 
     set_observability_cache(mode, summary)
@@ -426,6 +445,65 @@ async def ml_engine_run(user: dict = Depends(require_admin)):
         raise HTTPException(503, "Database not ready")
     result = await run_ml_engine_cycle(core.state.db_pool, force=True)
     return result
+
+
+class AvReadFlagsBody(BaseModel):
+    enabled: bool = False
+    floors_ack: bool = False
+    confirm: bool = False
+    notes: Optional[str] = Field(None, max_length=500)
+
+
+@router.get("/ml/av-read-flags")
+async def ml_av_read_flags_get(user: dict = Depends(require_admin)):
+    """Operator AV-read flag bundle status (env + admin one-button)."""
+    from services.av_read_runtime_flags import load_bundle_from_db, status_snapshot
+
+    if core.state.db_pool is not None:
+        async with core.state.db_pool.acquire() as conn:
+            await load_bundle_from_db(conn)
+    return status_snapshot()
+
+
+@router.post("/ml/av-read-flags")
+async def ml_av_read_flags_set(
+    body: AvReadFlagsBody,
+    request: Request,
+    user: dict = Depends(require_master_admin),
+):
+    """
+    One master-admin button: enable/disable the full AV-read operator flag bundle.
+    Requires confirm=true and floors_ack=true when enabling.
+    """
+    from services.av_read_runtime_flags import set_bundle
+
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+    async with core.state.db_pool.acquire() as conn:
+        try:
+            out = await set_bundle(
+                conn,
+                enabled=bool(body.enabled),
+                floors_ack=bool(body.floors_ack),
+                master_user_id=str(user.get("id") or ""),
+                notes=body.notes,
+                confirm=bool(body.confirm),
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        await log_admin_audit(
+            conn,
+            user_id=str(user.get("id") or ""),
+            admin=user,
+            action="AV_READ_OPERATOR_BUNDLE",
+            details={"enabled": body.enabled, "floors_ack": body.floors_ack, "effective": out.get("effective")},
+            request=request,
+            resource_type="av_read_operator_bundle",
+            resource_id="av_read_operator_bundle_v1",
+            severity="WARNING" if body.enabled else "INFO",
+            outcome="SUCCESS",
+        )
+    return out
 
 
 @router.get("/ml/publish-hour-insights")
@@ -549,28 +627,33 @@ async def ml_observability_trends(days: int = Query(30, ge=7, le=90), user: dict
 # Time range helpers (used by several KPI endpoints)
 # ============================================================
 
-_RANGE_PRESETS_MINUTES = {
-    "24h": 24 * 60,
-    "7d": 7 * 24 * 60,
-    "30d": 30 * 24 * 60,
-    "90d": 90 * 24 * 60,
-    "6m": 180 * 24 * 60,
-    "1y": 365 * 24 * 60,
-}
+def _resolve_kpi_window_or_400(
+    range: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+):
+    try:
+        return resolve_admin_kpi_window(
+            range_key=range,
+            start=start,
+            end=end,
+            strict_range=True,
+        )
+    except AdminKpiWindowError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
 
 def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
-    r = (range_str or "").strip()
-    if not r:
+    """Compat wrapper — prefer ``_resolve_kpi_window_or_400`` for new code."""
+    from services.admin_kpi_window import range_key_to_minutes
+
+    if not (range_str or "").strip():
         return default_minutes
-    if r in _RANGE_PRESETS_MINUTES:
-        return _RANGE_PRESETS_MINUTES[r]
-    m = re.fullmatch(r"(\d{1,4})d", r)
-    if m:
-        days = int(m.group(1))
-        # Guardrails: 1 day .. 10 years
-        days = max(1, min(days, 3650))
-        return days * 24 * 60
-    return default_minutes
+    try:
+        return range_key_to_minutes(range_str, strict=False)
+    except Exception:
+        return default_minutes
+
 
 def _range_label(range_str: str | None, fallback: str = "30d") -> str:
     r = (range_str or "").strip()
@@ -1107,6 +1190,10 @@ async def admin_ban_user(user_id: str, request: Request, user: dict = Depends(re
     async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
+        await conn.execute(
+            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+            user_id,
+        )
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_BAN_USER",
                               details={"target_email": target["email"] if target else None},
                               request=request, resource_type="user", resource_id=user_id,
@@ -1125,8 +1212,7 @@ async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(
 
 
 @router.put("/users/{user_id}/email")
-async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
-    require_admin(user)
+async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
     new_email = payload.email.lower().strip()
 
     async with core.state.db_pool.acquire() as conn:
@@ -1215,8 +1301,7 @@ async def admin_verify_email(user_id: str, request: Request, user: dict = Depend
 
 
 @router.post("/users/{user_id}/reset-password")
-async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
-    require_admin(user)
+async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
     temp = payload.temp_password
     pw_hash = bcrypt.hashpw(temp.encode("utf-8"), bcrypt.gensalt(12)).decode("utf-8")
 
@@ -1312,7 +1397,7 @@ async def admin_audit(
     source: str = "all",           # "all" | "admin" | "system"
     limit: int = 100,
     offset: int = 0,
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(require_admin),
 ):
     """
     Corporate-grade audit log endpoint.
@@ -1321,7 +1406,6 @@ async def admin_audit(
     - Auto-purges records older than 6 months on each call (once per hour max via in-memory flag)
     - Pagination via limit/offset
     """
-    require_admin(user)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
 
@@ -1542,9 +1626,7 @@ async def admin_audit_data_integrity(
 # ============================================================
 
 @router.get("/analytics/users")
-async def admin_analytics_users(user: dict = Depends(get_current_user)):
-    require_admin(user)
-
+async def admin_analytics_users(user: dict = Depends(require_admin)):
     async with core.state.db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='active'")
@@ -1566,9 +1648,7 @@ async def admin_analytics_users(user: dict = Depends(get_current_user)):
 
 
 @router.get("/analytics/revenue")
-async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
-    require_admin(user)
-
+async def admin_analytics_revenue(user: dict = Depends(require_admin)):
     async with core.state.db_pool.acquire() as conn:
         launch_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='launch'")
         creator_lite_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_lite'")
@@ -1722,19 +1802,35 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
 
 
 @router.get("/kpis")
-async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def get_admin_kpis(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None, description="ISO-8601 UTC inclusive start (with end)"),
+    end: Optional[str] = Query(None, description="ISO-8601 UTC exclusive end"),
+    user: dict = Depends(require_admin),
+):
     """Combined KPI endpoint that returns all metrics in one call"""
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    prev_since = since - timedelta(minutes=minutes)
+    since, until, win_meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
+    prev_since, prev_until = previous_equal_window(since, until)
 
     async with acquire_db(core.state.require_pool()) as conn:
         # Users
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
-        prev_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", prev_since, since)
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
+        prev_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2",
+            prev_since,
+            prev_until,
+        )
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'")
-        active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
+        active_users = await conn.fetchval(
+            "SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
 
         new_users_change = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users > 0 else 0
 
@@ -1763,25 +1859,28 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             SELECT COALESCE(SUM(amount), 0)::decimal AS total,
                 COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups,
                 COUNT(*) FILTER (WHERE source = 'topup')::int AS topup_cnt
-            FROM revenue_tracking WHERE created_at >= $1
+            FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2
             """,
             since,
+            until,
         )
-
-        until = _now_utc()
 
         # Uploads (fast SQL — heavy cost/engagement rollups run in parallel after this block)
         upload_stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
             COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
-            FROM uploads WHERE created_at >= $1
-        """, since)
+            FROM uploads WHERE created_at >= $1 AND created_at < $2
+        """, since, until)
         total_uploads = upload_stats["total"] if upload_stats else 0
         successful_uploads = upload_stats["completed"] if upload_stats else 0
         success_rate = (successful_uploads / max(total_uploads, 1)) * 100
 
-        prev_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2", prev_since, since)
+        prev_uploads = await conn.fetchval(
+            "SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2",
+            prev_since,
+            prev_until,
+        )
         uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
 
         w_min = float(os.environ.get("KPI_WHISPER_ASSUMED_MINUTES_PER_UPLOAD", "0.5") or 0.5)
@@ -1789,7 +1888,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         whisper_cost_estimate_usd = float(successful_uploads or 0) * w_min * w_usd
 
         # Platform distribution
-        platform_data = await conn.fetch(_platform_upload_mix_sql(), since)
+        platform_data = await conn.fetch(_platform_upload_mix_sql(), since, until)
         platform_distribution = {
             str(p["platform"] or "unknown").lower(): p["uploads"] for p in platform_data if p["platform"]
         }
@@ -1797,12 +1896,26 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         queue_depth = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
 
         # Funnels
-        funnel_connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
-        funnel_uploaded = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
+        funnel_connected = await conn.fetchval(
+            "SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id "
+            "WHERE u.created_at >= $1 AND u.created_at < $2",
+            since,
+            until,
+        )
+        funnel_uploaded = await conn.fetchval(
+            "SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
         funnel_signup_connect = (funnel_connected / max(new_users, 1)) * 100
         funnel_connect_upload = (funnel_uploaded / max(funnel_connected, 1)) * 100
 
-        cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
+        cancellations = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' "
+            "AND updated_at >= $1 AND updated_at < $2",
+            since,
+            until,
+        )
 
         # Quota pressure (same signal as /kpi/burn) for Health Targets tile
         quota_rows = await conn.fetch(
@@ -1840,7 +1953,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
     async def _load_cost_summary():
         async with acquire_db(pool) as c:
             return await build_admin_costs_summary(
-                c, since=since, until=until, range_key=range,
+                c, since=since, until=until, range_key=win_meta.get("range_key") or range,
             )
 
     async def _load_admin_eng():
@@ -1866,8 +1979,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         try:
             from services.upload_funnel_metrics import funnel_conversion_summary
 
-            lookback_days = max(1, int(minutes / (24 * 60)))
-            return await funnel_conversion_summary(pool, lookback_days=lookback_days)
+            return await funnel_conversion_summary(pool, since=since, until=until)
         except Exception:
             return {"error": "unavailable"}
 
@@ -2030,13 +2142,25 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             "effective_minutes_per_upload": w_min,
             "usd_per_minute": w_usd,
         },
+        "window_mode": win_meta.get("mode"),
+        "window_start_utc": win_meta.get("window_start_utc"),
+        "window_end_exclusive_utc": win_meta.get("window_end_exclusive_utc"),
+        "range": win_meta.get("range_key") or range,
+        "snapshot_metrics": [
+            "total_mrr", "mrr_by_tier", "tier_breakdown", "queue_depth",
+            "quota_hit_rate", "users_hitting_quota", "paid_users",
+        ],
     }
 
 
 @router.get("/kpi/margins")
-async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+async def kpi_margins(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
 
     async with core.state.db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
@@ -2045,25 +2169,30 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
                 COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
                 COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
                 COALESCE(SUM(CASE WHEN category IN ('stripe_fees','mailgun','bandwidth','postgres','redis') THEN cost_usd ELSE 0 END), 0)::decimal AS other
-            FROM cost_tracking WHERE created_at >= $1
-        """, since)
-        revenue = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE created_at >= $1", since)
+            FROM cost_tracking WHERE created_at >= $1 AND created_at < $2
+        """, since, until)
+        revenue = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
 
         tier_data = await conn.fetch("""
             SELECT u.subscription_tier, COUNT(up.id)::int AS uploads, 0::decimal AS cost
-            FROM users u LEFT JOIN uploads up ON up.user_id = u.id AND up.created_at >= $1
+            FROM users u LEFT JOIN uploads up ON up.user_id = u.id AND up.created_at >= $1 AND up.created_at < $2
             GROUP BY u.subscription_tier
-        """, since)
+        """, since, until)
 
         platform_data = await conn.fetch(
             """
             SELECT p AS platform, COUNT(*)::int AS uploads, 0::decimal AS cost
             FROM uploads u,
                  LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS u_p(p)
-            WHERE u.created_at >= $1
+            WHERE u.created_at >= $1 AND u.created_at < $2
             GROUP BY p
             """,
             since,
+            until,
         )
 
     total_cost = float(costs["openai"] or 0) + float(costs["storage"] or 0) + float(costs["compute"] or 0) + float(costs.get("other") or 0)
@@ -2083,20 +2212,25 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
             for p in platform_data
             if p["platform"]
         },
+        **_meta,
     }
 
 @router.get("/kpi/burn")
-async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+async def kpi_burn(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
 
     async with core.state.db_pool.acquire() as conn:
         token_stats = await conn.fetchrow("""
             SELECT COALESCE(SUM(CASE WHEN token_type = 'put' AND delta < 0 THEN ABS(delta) ELSE 0 END), 0)::int AS put_spent,
             COALESCE(SUM(CASE WHEN token_type = 'aic' AND delta < 0 THEN ABS(delta) ELSE 0 END), 0)::int AS aic_spent,
             COALESCE(SUM(CASE WHEN reason = 'topup' THEN delta ELSE 0 END), 0)::int AS tokens_purchased
-            FROM token_ledger WHERE created_at >= $1
-        """, since)
+            FROM token_ledger WHERE created_at >= $1 AND created_at < $2
+        """, since, until)
 
         quota_data = await conn.fetch("""
             SELECT u.id, u.subscription_tier, w.put_balance, w.put_reserved
@@ -2113,10 +2247,17 @@ async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
         "users_hitting_quota": hitting_quota,
         "total_active_users": total_active,
         "quota_hit_pct": (hitting_quota / max(total_active, 1)) * 100,
+        **_meta,
     }
 
 @router.get("/kpi/funnels")
-async def kpi_funnels(user: dict = Depends(require_admin)):
+async def kpi_funnels(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, win_meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
         signups_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
         first_uploads_24h = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE user_id IN (SELECT id FROM users WHERE created_at >= NOW() - INTERVAL '24 hours')")
@@ -2129,13 +2270,20 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
 
         topup_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM token_ledger WHERE reason = 'topup'")
         flex_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE flex_enabled = TRUE")
-        churned = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= NOW() - INTERVAL '30 days'")
+        churned = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' "
+            "AND updated_at >= $1 AND updated_at < $2",
+            since,
+            until,
+        )
 
     upload_pipeline_funnel: dict = {}
     try:
         from services.upload_funnel_metrics import funnel_conversion_summary
 
-        upload_pipeline_funnel = await funnel_conversion_summary(core.state.db_pool, lookback_days=30)
+        upload_pipeline_funnel = await funnel_conversion_summary(
+            core.state.db_pool, since=since, until=until
+        )
     except Exception:
         upload_pipeline_funnel = {"error": "unavailable"}
 
@@ -2147,23 +2295,34 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
         "flex_adoption": {"users": flex_users},
         "churn_30d": churned,
         "upload_pipeline_funnel": upload_pipeline_funnel,
+        **win_meta,
     }
 
 
 @router.get("/kpi/revenue")
-async def get_kpi_revenue(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    until = _now_utc()
+async def get_kpi_revenue(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.require_pool().acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'") or 1
         mrr_data = await conn.fetch("SELECT subscription_tier, COUNT(*) AS count FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active' GROUP BY subscription_tier")
         total_mrr = sum(_tier_list_price_usd(r["subscription_tier"]) * r["count"] for r in mrr_data)
-        topup = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE source = 'topup' AND created_at >= $1", since)
-        topup_n = await conn.fetchval(
-            "SELECT COUNT(*)::int FROM revenue_tracking WHERE source = 'topup' AND created_at >= $1",
+        topup = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking "
+            "WHERE source = 'topup' AND created_at >= $1 AND created_at < $2",
             since,
+            until,
+        )
+        topup_n = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM revenue_tracking "
+            "WHERE source = 'topup' AND created_at >= $1 AND created_at < $2",
+            since,
+            until,
         )
     refunds_total, refunds_count = await fetch_stripe_refunds_window(since, until)
     return {
@@ -2182,10 +2341,13 @@ async def get_kpi_revenue(range: str = Query("30d"), user: dict = Depends(requir
 
 
 @router.get("/kpi/costs")
-async def get_kpi_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    until = _now_utc()
+async def get_kpi_costs(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
         summary = await build_admin_costs_summary(
             conn, since=since, until=until, range_key=range,
@@ -2194,19 +2356,25 @@ async def get_kpi_costs(range: str = Query("30d"), user: dict = Depends(require_
 
 
 @router.get("/kpi/growth")
-async def get_kpi_growth(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    until = _now_utc()
+async def get_kpi_growth(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
         return await fetch_admin_growth_metrics(conn, since, until)
 
 
 @router.get("/kpi/reliability")
-async def get_kpi_reliability(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    until = _now_utc()
+async def get_kpi_reliability(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.require_pool().acquire() as conn:
         return await fetch_admin_reliability_metrics(conn, since, until)
 
@@ -2231,6 +2399,8 @@ async def trigger_kpi_refresh(background_tasks: BackgroundTasks, user: dict = De
 @router.get("/kpi/recognition")
 async def get_kpi_recognition(
     range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     user: dict = Depends(require_admin),
 ):
@@ -2246,23 +2416,24 @@ async def get_kpi_recognition(
         here" widget on the admin dashboard).
       - ``with_people_pct`` — share of clips with at least one person segment.
     """
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
 
     async with core.state.require_pool().acquire() as conn:
         # Health: how many uploads in window vs how many got a summary
         upload_total = await conn.fetchval(
-            "SELECT COUNT(*)::int FROM uploads WHERE created_at >= $1",
+            "SELECT COUNT(*)::int FROM uploads WHERE created_at >= $1 AND created_at < $2",
             since,
+            until,
         )
         summary_total = await conn.fetchval(
             """
             SELECT COUNT(*)::int
               FROM upload_recognition_summary rs
               JOIN uploads u ON u.id = rs.upload_id
-             WHERE u.created_at >= $1
+             WHERE u.created_at >= $1 AND u.created_at < $2
             """,
             since,
+            until,
         )
 
         stats = await conn.fetchrow(
@@ -2278,9 +2449,10 @@ async def get_kpi_recognition(
                 COALESCE(AVG(rs.coverage_seconds), 0)::double precision AS avg_coverage_seconds
               FROM upload_recognition_summary rs
               JOIN uploads u ON u.id = rs.upload_id
-             WHERE u.created_at >= $1
+             WHERE u.created_at >= $1 AND u.created_at < $2
             """,
             since,
+            until,
         )
 
         # Top descriptions across all per-detection rows in the window.
@@ -2290,13 +2462,14 @@ async def get_kpi_recognition(
               FROM video_recognition vr
               JOIN uploads u ON u.id = vr.upload_id
              WHERE vr.kind = 'object'
-               AND u.created_at >= $1
+               AND u.created_at >= $1 AND u.created_at < $2
                AND length(description) > 0
              GROUP BY lower(description)
              ORDER BY n DESC
-             LIMIT $2
+             LIMIT $3
             """,
             since,
+            until,
             limit,
         )
         top_logos = await conn.fetch(
@@ -2305,13 +2478,14 @@ async def get_kpi_recognition(
               FROM video_recognition vr
               JOIN uploads u ON u.id = vr.upload_id
              WHERE vr.kind = 'logo'
-               AND u.created_at >= $1
+               AND u.created_at >= $1 AND u.created_at < $2
                AND length(description) > 0
              GROUP BY lower(description)
              ORDER BY n DESC
-             LIMIT $2
+             LIMIT $3
             """,
             since,
+            until,
             limit,
         )
         top_text = await conn.fetch(
@@ -2320,13 +2494,14 @@ async def get_kpi_recognition(
               FROM video_recognition vr
               JOIN uploads u ON u.id = vr.upload_id
              WHERE vr.kind = 'text'
-               AND u.created_at >= $1
+               AND u.created_at >= $1 AND u.created_at < $2
                AND length(description) > 0
              GROUP BY lower(description)
              ORDER BY n DESC
-             LIMIT $2
+             LIMIT $3
             """,
             since,
+            until,
             limit,
         )
 
@@ -2405,16 +2580,35 @@ async def admin_sync_visual_entities_hub(
 
 
 @router.get("/kpi/usage")
-async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    until = _now_utc()
+async def get_kpi_usage(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
+    prev_since, prev_until = previous_equal_window(since, until)
     async with acquire_db(core.state.require_pool()) as conn:
-        active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
-        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
-        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
-        prev_since = since - timedelta(minutes=minutes)
-        prev_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", prev_since, since)
+        active = await conn.fetchval(
+            "SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
+        uploads = await conn.fetchval(
+            "SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2",
+            since,
+            until,
+        )
+        prev_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2",
+            prev_since,
+            prev_until,
+        )
         admin_eng = await compute_admin_engagement_totals(
             conn, window_start=since, window_end_exclusive=until,
         )
@@ -2432,33 +2626,53 @@ async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_
 # ============================================================
 
 @router.get("/chart/revenue")
-async def get_chart_revenue(period: str = Query("30d"), user: dict = Depends(require_admin)):
-    days = int(period.replace("d", "")) if period.endswith("d") and period[:-1].isdigit() else 30
-    since = _now_utc() - timedelta(days=days)
+async def get_chart_revenue(
+    period: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=period, start=start, end=end)
     async with core.state.db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT DATE(created_at) as date, COALESCE(SUM(amount), 0)::decimal as revenue FROM revenue_tracking WHERE created_at >= $1 GROUP BY DATE(created_at) ORDER BY date", since)
+        rows = await conn.fetch(
+            "SELECT DATE(created_at) as date, COALESCE(SUM(amount), 0)::decimal as revenue "
+            "FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2 "
+            "GROUP BY DATE(created_at) ORDER BY date",
+            since,
+            until,
+        )
     data = {r["date"]: float(r["revenue"]) for r in rows}
-    labels, values, current, end = [], [], since.date(), _now_utc().date()
-    while current <= end:
+    labels, values, current, end_d = [], [], since.date(), (until - timedelta(microseconds=1)).date()
+    while current <= end_d:
         labels.append(current.strftime("%b %d"))
         values.append(data.get(current, 0))
         current += timedelta(days=1)
-    return {"labels": labels, "values": values}
+    return {"labels": labels, "values": values, **_meta}
 
 
 @router.get("/chart/users")
-async def get_chart_users(period: str = Query("30d"), user: dict = Depends(require_admin)):
-    days = int(period.replace("d", "")) if period.endswith("d") and period[:-1].isdigit() else 30
-    since = _now_utc() - timedelta(days=days)
+async def get_chart_users(
+    period: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=period, start=start, end=end)
     async with core.state.require_pool().acquire() as conn:
-        rows = await conn.fetch("SELECT DATE(created_at) as date, COUNT(*)::int as users FROM users WHERE created_at >= $1 GROUP BY DATE(created_at) ORDER BY date", since)
+        rows = await conn.fetch(
+            "SELECT DATE(created_at) as date, COUNT(*)::int as users "
+            "FROM users WHERE created_at >= $1 AND created_at < $2 "
+            "GROUP BY DATE(created_at) ORDER BY date",
+            since,
+            until,
+        )
     data = {r["date"]: r["users"] for r in rows}
-    labels, values, current, end = [], [], since.date(), _now_utc().date()
-    while current <= end:
+    labels, values, current, end_d = [], [], since.date(), (until - timedelta(microseconds=1)).date()
+    while current <= end_d:
         labels.append(current.strftime("%b %d"))
         values.append(data.get(current, 0))
         current += timedelta(days=1)
-    return {"labels": labels, "values": values}
+    return {"labels": labels, "values": values, **_meta}
 
 
 # ============================================================
@@ -3374,22 +3588,45 @@ async def admin_adjust_wallet(
 # ============================================================
 
 @router.get("/leaderboard")
-async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"), user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "90d": 129600}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+async def get_leaderboard(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    sort: str = Query("uploads"),
+    user: dict = Depends(require_admin),
+):
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     async with core.state.require_pool().acquire() as conn:
         if sort == "revenue":
-            rows = await conn.fetch("SELECT u.id, u.name, u.email, u.subscription_tier, COALESCE(SUM(r.amount), 0)::decimal AS revenue, COUNT(DISTINCT up.id)::int AS uploads FROM users u LEFT JOIN revenue_tracking r ON u.id = r.user_id AND r.created_at >= $1 LEFT JOIN uploads up ON u.id = up.user_id AND up.created_at >= $1 GROUP BY u.id ORDER BY revenue DESC LIMIT 10", since)
+            rows = await conn.fetch(
+                "SELECT u.id, u.name, u.email, u.subscription_tier, COALESCE(SUM(r.amount), 0)::decimal AS revenue, "
+                "COUNT(DISTINCT up.id)::int AS uploads FROM users u "
+                "LEFT JOIN revenue_tracking r ON u.id = r.user_id AND r.created_at >= $1 AND r.created_at < $2 "
+                "LEFT JOIN uploads up ON u.id = up.user_id AND up.created_at >= $1 AND up.created_at < $2 "
+                "GROUP BY u.id ORDER BY revenue DESC LIMIT 10",
+                since,
+                until,
+            )
         else:
-            rows = await conn.fetch("SELECT u.id, u.name, u.email, u.subscription_tier, 0::decimal AS revenue, COUNT(up.id)::int AS uploads FROM users u LEFT JOIN uploads up ON u.id = up.user_id AND up.created_at >= $1 GROUP BY u.id ORDER BY uploads DESC LIMIT 10", since)
+            rows = await conn.fetch(
+                "SELECT u.id, u.name, u.email, u.subscription_tier, 0::decimal AS revenue, COUNT(up.id)::int AS uploads "
+                "FROM users u LEFT JOIN uploads up ON u.id = up.user_id AND up.created_at >= $1 AND up.created_at < $2 "
+                "GROUP BY u.id ORDER BY uploads DESC LIMIT 10",
+                since,
+                until,
+            )
     return [{"id": str(r["id"]), "name": r["name"] or "Unknown", "email": r["email"], "tier": r["subscription_tier"] or "free", "uploads": r["uploads"] or 0, "revenue": float(r["revenue"] or 0), "views": 0} for r in rows]
 
 
 @router.get("/countries")
-async def get_countries(range: str = Query("30d"), user: dict = Depends(require_admin)):
+async def get_countries(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
     """Return user count by country. Populated from CF-IPCountry header at registration."""
-    days = int(range.replace("d", "")) if range.endswith("d") and range[:-1].isdigit() else 30
-    since = _now_utc() - timedelta(days=days)
+    since, until, _meta = _resolve_kpi_window_or_400(range=range, start=start, end=end)
     try:
         async with core.state.db_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -3397,12 +3634,13 @@ async def get_countries(range: str = Query("30d"), user: dict = Depends(require_
                 SELECT country, COUNT(*) AS users
                 FROM users
                 WHERE country IS NOT NULL
-                  AND created_at >= $1
+                  AND created_at >= $1 AND created_at < $2
                 GROUP BY country
                 ORDER BY users DESC
                 LIMIT 50
                 """,
                 since,
+                until,
             )
         return [{"country": r["country"], "users": int(r["users"])} for r in rows]
     except Exception:
@@ -3927,6 +4165,7 @@ def _collect_upload_diagnostics(
 ) -> Dict[str, Any]:
     expected = [
         "hydration_payload",
+        "publish_pack_v1",
         "thumbnail_trace",
         "pikzels_prompt_by_platform",
         "ai_pipeline_trace_v1",
@@ -4012,6 +4251,7 @@ def _serialize_upload_ai_trace_row(
     output_artifacts = _coerce_output_artifacts_dict(row.get("output_artifacts"))
     ai_trace_blob, _ = _parse_artifact_json_with_error(output_artifacts, "ai_pipeline_trace_v1")
     hydration_payload, _ = _parse_artifact_json_with_error(output_artifacts, "hydration_payload")
+    publish_pack, _ = _parse_artifact_json_with_error(output_artifacts, "publish_pack_v1")
     thumbnail_trace, _ = _parse_artifact_json_with_error(output_artifacts, "thumbnail_trace")
     pikzels_prompt_by_platform, _ = _parse_artifact_json_with_error(output_artifacts, "pikzels_prompt_by_platform")
     provider_error_trace, _ = _parse_artifact_json_with_error(output_artifacts, "provider_error_trace")
@@ -4022,6 +4262,8 @@ def _serialize_upload_ai_trace_row(
         pikzels_prompt_by_platform = {}
     if not isinstance(provider_error_trace, list):
         provider_error_trace = []
+    if not isinstance(publish_pack, dict):
+        publish_pack = {}
     platform_results = _normalize_platform_results(row.get("platform_results"))
     diagnostics = _collect_upload_diagnostics(
         output_artifacts=output_artifacts,
@@ -4083,6 +4325,7 @@ def _serialize_upload_ai_trace_row(
         "ai_generated_caption": row.get("ai_generated_caption"),
         "ai_generated_hashtags": list(row.get("ai_generated_hashtags") or []),
         "hydration_payload": hydration_payload,
+        "publish_pack_v1": publish_pack,
         "thumbnail_trace": thumbnail_trace,
         "pikzels_prompt_by_platform": pikzels_prompt_by_platform,
         "provider_error_trace": provider_error_trace,

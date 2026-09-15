@@ -1,16 +1,9 @@
 from __future__ import annotations
 
 import json
-import calendar
-import math
-from datetime import datetime, timezone
 from typing import Optional
 
-from stages.entitlements import get_entitlements_for_tier, wallet_bypass_for_user_record
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+from stages.entitlements import wallet_bypass_for_user_record
 
 
 async def get_wallet(conn, user_id: str) -> dict:
@@ -222,77 +215,233 @@ async def transfer_tokens(
         return True
 
 
-async def daily_refill(conn, user_id: str, tier: str):
-    # Avoid BEGIN/COMMIT for paid/internal tiers - hot path on every authenticated request.
-    ent = get_entitlements_for_tier(tier)
-    if getattr(ent, "is_internal", False) or str(getattr(ent, "tier", "")) != "free":
-        return
+async def daily_refill(conn, user_id: str, tier: str, wallet: dict | None = None):
+    """Delegate to ``core.wallet.daily_refill`` (live GET-user hot path)."""
+    from core.wallet import daily_refill as _core_daily_refill
 
+    return await _core_daily_refill(conn, user_id, tier, wallet=wallet)
+
+
+async def capture_hold_tokens(
+    conn,
+    upload_id: str,
+    user_id: str,
+    put_cost: int,
+    aic_cost: int,
+    meta: Optional[dict] = None,
+) -> bool:
+    """
+    Confirm a hold: reserved → spent. Idempotent — only one winner per upload.
+
+    Returns True if this call captured (or hold already captured), False if
+    reserved balance was insufficient / hold missing.
+    """
+    put_cost = int(put_cost or 0)
+    aic_cost = int(aic_cost or 0)
     async with conn.transaction():
-        wallet = await get_wallet(conn, user_id)
-        last_refill = wallet.get("last_refill_date")
-        today = _now_utc().date()
-        if last_refill and last_refill >= today:
-            return
+        hold = await conn.fetchrow(
+            """
+            SELECT status FROM wallet_holds
+            WHERE upload_id = $1
+            ORDER BY created_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            upload_id,
+        )
+        upload_hold = await conn.fetchval(
+            "SELECT hold_status FROM uploads WHERE id = $1",
+            upload_id,
+        )
+        if (hold and str(hold.get("status") or "") == "captured") or str(upload_hold or "") == "captured":
+            return True
 
-        # Split monthly entitlements over calendar days in current UTC month.
-        # Cap by subscription budget for the month (put_drip_granted), not by wallet
-        # balance — rollover/top-ups can push balance above the monthly allowance.
-        days_in_month = calendar.monthrange(today.year, today.month)[1]
-        put_daily = max(0, int(math.ceil((ent.put_monthly or 0) / max(1, days_in_month))))
-        aic_daily = max(0, int(math.ceil((ent.aic_monthly or 0) / max(1, days_in_month))))
-
-        put_cap = int(ent.put_monthly or 0)
-        aic_cap = int(ent.aic_monthly or 0)
-        month_key = f"{today.year}-{today.month:02d}"
-
-        drip_month = wallet.get("subscription_drip_month")
-        put_g = int(wallet.get("put_drip_granted") or 0)
-        aic_g = int(wallet.get("aic_drip_granted") or 0)
-        if (drip_month or "") != month_key:
-            put_g = 0
-            aic_g = 0
-
-        put_remaining = max(0, put_cap - put_g)
-        aic_remaining = max(0, aic_cap - aic_g)
-
-        put_add = min(put_daily, put_remaining)
-        aic_add = min(aic_daily, aic_remaining)
-        new_put_g = put_g + put_add
-        new_aic_g = aic_g + aic_add
-
-        if put_add <= 0 and aic_add <= 0:
-            await conn.execute(
-                "UPDATE wallets SET last_refill_date = $1, subscription_drip_month = $2, put_drip_granted = $3, aic_drip_granted = $4 WHERE user_id = $5",
-                today,
-                month_key,
-                new_put_g,
-                new_aic_g,
-                user_id,
+        claimed = await conn.fetchval(
+            """
+            UPDATE wallet_holds
+            SET status = 'capturing', resolved_at = NULL
+            WHERE upload_id = $1 AND status = 'held'
+            RETURNING id
+            """,
+            upload_id,
+        )
+        # If no wallet_holds row, still allow capture via uploads.hold_status claim
+        if not claimed:
+            u_claimed = await conn.fetchval(
+                """
+                UPDATE uploads
+                SET hold_status = 'capturing'
+                WHERE id = $1 AND COALESCE(hold_status, 'held') IN ('held', 'reserved', '')
+                RETURNING id
+                """,
+                upload_id,
             )
-            return
+            if not u_claimed and str(upload_hold or "") not in ("held", "reserved", "", "None"):
+                return str(upload_hold or "") == "captured"
+
+        row = await conn.fetchrow(
+            """
+            UPDATE wallets SET
+                put_balance  = put_balance  - $1,
+                aic_balance  = aic_balance  - $2,
+                put_reserved = put_reserved - $1,
+                aic_reserved = aic_reserved - $2,
+                updated_at   = NOW()
+            WHERE user_id = $3
+              AND put_reserved >= $1
+              AND aic_reserved >= $2
+            RETURNING user_id
+            """,
+            put_cost,
+            aic_cost,
+            user_id,
+        )
+        if not row:
+            # Roll claim back to held so a later retry can capture
+            await conn.execute(
+                """
+                UPDATE wallet_holds SET status = 'held', resolved_at = NULL
+                WHERE upload_id = $1 AND status = 'capturing'
+                """,
+                upload_id,
+            )
+            await conn.execute(
+                """
+                UPDATE uploads SET hold_status = 'held'
+                WHERE id = $1 AND hold_status = 'capturing'
+                """,
+                upload_id,
+            )
+            return False
+
+        meta_obj = meta or {}
+        if put_cost > 0:
+            await ledger_entry(
+                conn, user_id, "put", -put_cost, "upload_debit", upload_id, meta=meta_obj
+            )
+        if aic_cost > 0:
+            await ledger_entry(
+                conn, user_id, "aic", -aic_cost, "upload_debit", upload_id, meta=meta_obj
+            )
+        await conn.execute(
+            """
+            UPDATE wallet_holds SET status = 'captured', resolved_at = NOW()
+            WHERE upload_id = $1 AND status IN ('held', 'capturing')
+            """,
+            upload_id,
+        )
+        await conn.execute(
+            "UPDATE uploads SET hold_status = 'captured' WHERE id = $1",
+            upload_id,
+        )
+        return True
+
+
+async def release_hold_tokens(
+    conn,
+    upload_id: str,
+    user_id: str,
+    put_cost: int,
+    aic_cost: int,
+    reason: str = "release",
+) -> bool:
+    """
+    Release a hold without spending. Single-shot — no phantom ledger after capture.
+    """
+    put_cost = int(put_cost or 0)
+    aic_cost = int(aic_cost or 0)
+    async with conn.transaction():
+        hold_status = await conn.fetchval(
+            """
+            SELECT status FROM wallet_holds
+            WHERE upload_id = $1 AND status = 'held'
+            LIMIT 1
+            """,
+            upload_id,
+        )
+        upload_hold = await conn.fetchval(
+            "SELECT hold_status FROM uploads WHERE id = $1",
+            upload_id,
+        )
+        if str(upload_hold or "") in ("captured", "released"):
+            return False
+        if hold_status is None and str(upload_hold or "") not in ("held", "reserved", "", "None"):
+            return False
+
+        claimed = await conn.fetchval(
+            """
+            UPDATE wallet_holds
+            SET status = 'releasing'
+            WHERE upload_id = $1 AND status = 'held'
+            RETURNING id
+            """,
+            upload_id,
+        )
+        if not claimed:
+            u_claimed = await conn.fetchval(
+                """
+                UPDATE uploads SET hold_status = 'releasing'
+                WHERE id = $1 AND COALESCE(hold_status, 'held') IN ('held', 'reserved', '')
+                RETURNING id
+                """,
+                upload_id,
+            )
+            if not u_claimed:
+                return False
 
         await conn.execute(
             """
-            UPDATE wallets
-            SET
-                put_balance = put_balance + $1,
-                aic_balance = aic_balance + $2,
-                last_refill_date = $3,
-                subscription_drip_month = $4,
-                put_drip_granted = $5,
-                aic_drip_granted = $6
-            WHERE user_id = $7
+            UPDATE wallets SET
+                put_reserved = GREATEST(0, put_reserved - $1),
+                aic_reserved = GREATEST(0, aic_reserved - $2),
+                updated_at   = NOW()
+            WHERE user_id = $3
             """,
-            put_add,
-            aic_add,
-            today,
-            month_key,
-            new_put_g,
-            new_aic_g,
+            put_cost,
+            aic_cost,
             user_id,
         )
-        if put_add > 0:
-            await ledger_entry(conn, user_id, "put", put_add, "daily_refill")
-        if aic_add > 0:
-            await ledger_entry(conn, user_id, "aic", aic_add, "daily_refill")
+        # No positive balance ledger — reserved was never spent; release is not a credit.
+        await conn.execute(
+            """
+            UPDATE wallet_holds SET status = 'released', resolved_at = NOW()
+            WHERE upload_id = $1 AND status IN ('held', 'releasing')
+            """,
+            upload_id,
+        )
+        await conn.execute(
+            "UPDATE uploads SET hold_status = 'released' WHERE id = $1",
+            upload_id,
+        )
+        return True
+
+
+async def partial_refund_idempotent(
+    conn,
+    user_id: str,
+    upload_id: str,
+    succeeded_platforms: list,
+    failed_platforms: list,
+    original_put_cost: int,
+    original_aic_cost: int = 0,
+) -> bool:
+    """Credit partial refund once per upload (guards on existing ledger reason)."""
+    existing = await conn.fetchval(
+        """
+        SELECT 1 FROM token_ledger
+        WHERE upload_id = $1 AND reason = 'partial_platform_refund'
+        LIMIT 1
+        """,
+        upload_id,
+    )
+    if existing:
+        return False
+    await partial_refund_upload_partial_success(
+        conn,
+        user_id,
+        upload_id,
+        succeeded_platforms,
+        failed_platforms,
+        original_put_cost,
+        original_aic_cost,
+    )
+    return True

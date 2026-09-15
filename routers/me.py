@@ -37,6 +37,7 @@ from core.deps import (
 )
 from core.auth import hash_password, verify_password, encrypt_blob, decrypt_blob
 from core.wallet import get_wallet, credit_wallet, transfer_tokens
+from services.billing import topup_checkout_metadata
 from core.r2 import (
     generate_presigned_download_url,
     r2_presign_get_url,
@@ -138,9 +139,16 @@ class ApplyContentInsightsBody(BaseModel):
 
 
 @router.get("/api/me/content-insights")
-async def get_me_content_insights(user: dict = Depends(get_current_user)):
+async def get_me_content_insights(
+    lookback_days: Optional[int] = Query(None, ge=7, le=730),
+    days: Optional[int] = Query(None, ge=7, le=730, description="Alias for lookback_days"),
+    user: dict = Depends(get_current_user),
+):
     """Ranked settings buckets vs engagement + anomaly hints (from attributed uploads)."""
+    lb = lookback_days if lookback_days is not None else days
     async with core.state.db_pool.acquire() as conn:
+        if lb is not None:
+            return await build_user_content_insights(conn, user["id"], lookback_days=int(lb))
         return await build_user_content_insights(conn, user["id"])
 
 
@@ -774,6 +782,15 @@ async def _execute_account_deletion(
         pass
     await conn.execute("DELETE FROM users WHERE id = $1", user["id"])
 
+    # P7: purge compact AV training packs (ml-packs/{user}/) — no forever masters.
+    try:
+        from services.av_training_pack_retention import purge_user_ml_packs
+
+        ml_pack_deleted = purge_user_ml_packs(user_id)
+        rows_deleted["ml_packs_r2"] = int(ml_pack_deleted or 0)
+    except Exception:
+        rows_deleted["ml_packs_r2"] = 0
+
     r2_deleted = await _delete_r2_objects(r2_keys)
     return {"r2_deleted": r2_deleted, "tokens_revoked": tokens_revoked, "rows_deleted": rows_deleted}
 
@@ -937,14 +954,11 @@ async def delete_account(
 # Wallet
 # ============================================================
 @router.get("/api/wallet")
-async def get_wallet_endpoint(user_id: str = Depends(get_verified_user_id)):
+async def get_wallet_endpoint(user: dict = Depends(get_current_user_readonly)):
     """
-    Wallet balances, plan limits, and recent ledger rows.
-
-    Uses ``get_verified_user_id`` plus ``fetch_me_wallet_endpoint_data`` so users + wallets +
-    ledger share **one** pooled connection (avoids duplicate ``pg_advisory_unlock_all`` from a
-    separate ledger-only checkout).
+    Wallet balances, plan limits, and recent ledger rows for the billing owner.
     """
+    user_id = resolve_billing_user_id(user)
     pool = core.state.db_pool
     empty_wallet = {"put_balance": 0, "aic_balance": 0, "put_reserved": 0, "aic_reserved": 0}
     plan_limits_fallback = {"put_daily": 1, "put_monthly": 30, "aic_monthly": 0}
@@ -976,7 +990,7 @@ async def get_wallet_endpoint(user_id: str = Depends(get_verified_user_id)):
 
 @router.get("/api/wallet/ledger")
 async def get_wallet_ledger(
-    user_id: str = Depends(get_verified_user_id),
+    user: dict = Depends(get_current_user_readonly),
     limit: int = Query(40, ge=1, le=100),
     token_type: Optional[str] = Query(None, pattern="^(put|aic)$"),
     reason_prefix: Optional[str] = Query(None, max_length=80),
@@ -987,6 +1001,7 @@ async def get_wallet_ledger(
     cursor_id: Optional[str] = Query(None),
 ):
     """Paginated ledger with upload context, period summary, and pricing rules (read-only)."""
+    user_id = resolve_billing_user_id(user)
     pool = core.state.db_pool
     if pool is None:
         raise HTTPException(503, "Database unavailable")
@@ -1015,9 +1030,10 @@ async def get_wallet_ledger(
 
 @router.get("/api/wallet/disputes")
 async def list_my_wallet_disputes(
-    user_id: str = Depends(get_verified_user_id),
+    user: dict = Depends(get_current_user_readonly),
     limit: int = Query(40, ge=1, le=100),
 ):
+    user_id = resolve_billing_user_id(user)
     pool = core.state.db_pool
     if pool is None:
         raise HTTPException(503, "Database unavailable")
@@ -1032,8 +1048,10 @@ async def list_my_wallet_disputes(
 @router.post("/api/wallet/disputes")
 async def create_my_wallet_dispute(
     data: WalletDisputeCreate,
-    user_id: str = Depends(get_verified_user_id),
+    user: dict = Depends(get_current_user),
 ):
+    require_can_manage_billing(user)
+    user_id = resolve_billing_user_id(user)
     pool = core.state.db_pool
     if pool is None:
         raise HTTPException(503, "Database unavailable")
@@ -1073,12 +1091,7 @@ async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_u
         mode="payment",
         success_url=STRIPE_SUCCESS_URL,
         cancel_url=STRIPE_CANCEL_URL,
-        metadata={
-            "user_id": bill_id,
-            "lookup_key": data.lookup_key,
-            "wallet": product.get("wallet", "put"),
-            "amount": str(product.get("amount", 0)),
-        },
+        metadata=topup_checkout_metadata(bill_id, data.lookup_key, product),
     )
     return {"checkout_url": session.url}
 

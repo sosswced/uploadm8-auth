@@ -3,8 +3,12 @@ UploadM8 wallet & ledger functions — extracted from app.py.
 Token balances, reservations, spending, refunds, daily refills.
 """
 
+import calendar
 import json
 import logging
+import math
+from datetime import date
+from typing import Any
 
 from core.helpers import _now_utc
 from stages.entitlements import get_entitlements_for_tier, wallet_bypass_for_user_record
@@ -213,6 +217,35 @@ async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: s
         await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
     return True
 
+def compute_free_daily_drip(
+    *,
+    put_monthly: int,
+    aic_monthly: int,
+    today: date,
+    drip_month: str | None,
+    put_drip_granted: int,
+    aic_drip_granted: int,
+) -> dict[str, Any]:
+    """Split monthly free-tier PUT/AIC over calendar days (matches GET /api/wallet daily_topup)."""
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    put_daily = max(0, int(math.ceil((int(put_monthly or 0)) / max(1, days_in_month))))
+    aic_daily = max(0, int(math.ceil((int(aic_monthly or 0)) / max(1, days_in_month))))
+    month_key = f"{today.year}-{today.month:02d}"
+    put_g = 0 if (drip_month or "") != month_key else int(put_drip_granted or 0)
+    aic_g = 0 if (drip_month or "") != month_key else int(aic_drip_granted or 0)
+    put_add = min(put_daily, max(0, int(put_monthly or 0) - put_g))
+    aic_add = min(aic_daily, max(0, int(aic_monthly or 0) - aic_g))
+    return {
+        "put_daily": put_daily,
+        "aic_daily": aic_daily,
+        "put_add": put_add,
+        "aic_add": aic_add,
+        "month_key": month_key,
+        "new_put_granted": put_g + put_add,
+        "new_aic_granted": aic_g + aic_add,
+    }
+
+
 async def daily_refill(conn, user_id: str, tier: str, wallet: dict | None = None) -> dict | None:
     """Drip the user's daily token allowance.
 
@@ -222,13 +255,8 @@ async def daily_refill(conn, user_id: str, tier: str, wallet: dict | None = None
     provide a wallet AND we short-circuited before fetching one (paid/internal
     tiers) — the caller is then expected to fetch the wallet itself if needed.
 
-    Optimisations vs. the original implementation:
-      * Skip the entire wallet read + UPDATE for non-free / internal tiers
-        (these tiers never drip — see ``services/wallet.py`` for parity).
-      * Accept a pre-fetched ``wallet`` to avoid the redundant
-        ``SELECT * FROM wallets`` flagged by Sentry "Consecutive DB Queries".
-      * No transaction wrapper — a single conditional UPDATE is atomic on its
-        own and the daily-once guard makes idempotency trivial.
+    Free tier: PUT + AIC split of monthly caps across calendar days (same math as
+    ``daily_topup`` on GET /api/wallet). Paid/internal tiers refill on invoice.
     """
     ent = get_entitlements_for_tier(tier)
     if getattr(ent, "is_internal", False) or str(getattr(ent, "tier", "")) != "free":
@@ -242,27 +270,51 @@ async def daily_refill(conn, user_id: str, tier: str, wallet: dict | None = None
     if last_refill and last_refill >= today:
         return wallet
 
-    daily = ent.put_daily * 4  # 4 platforms
-    monthly_cap = ent.put_monthly
-    current = wallet["put_balance"]
-    if current >= monthly_cap:
-        # Still mark today as "refilled" so we don't re-enter this branch on
-        # every subsequent request today (was a hidden hot-path SELECT before).
-        await conn.execute(
-            "UPDATE wallets SET last_refill_date = $1 WHERE user_id = $2",
-            today, user_id,
-        )
-        wallet["last_refill_date"] = today
-        return wallet
-
-    add = min(daily, monthly_cap - current)
-    await conn.execute(
-        "UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3",
-        add, today, user_id,
+    drip = compute_free_daily_drip(
+        put_monthly=int(getattr(ent, "put_monthly", 0) or 0),
+        aic_monthly=int(getattr(ent, "aic_monthly", 0) or 0),
+        today=today,
+        drip_month=wallet.get("subscription_drip_month"),
+        put_drip_granted=int(wallet.get("put_drip_granted") or 0),
+        aic_drip_granted=int(wallet.get("aic_drip_granted") or 0),
     )
-    await ledger_entry(conn, user_id, "put", add, "daily_refill")
-    wallet["put_balance"] = current + add
-    wallet["last_refill_date"] = today
+    put_add = int(drip["put_add"])
+    aic_add = int(drip["aic_add"])
+
+    row = await conn.fetchrow(
+        """
+        UPDATE wallets
+        SET put_balance = put_balance + $1,
+            aic_balance = aic_balance + $2,
+            last_refill_date = $3,
+            subscription_drip_month = $4,
+            put_drip_granted = $5,
+            aic_drip_granted = $6
+        WHERE user_id = $7
+          AND (last_refill_date IS NULL OR last_refill_date < $3)
+        RETURNING put_balance, aic_balance, last_refill_date,
+                  put_drip_granted, aic_drip_granted, subscription_drip_month
+        """,
+        put_add,
+        aic_add,
+        today,
+        drip["month_key"],
+        drip["new_put_granted"],
+        drip["new_aic_granted"],
+        user_id,
+    )
+    if not row:
+        return wallet
+    if put_add > 0:
+        await ledger_entry(conn, user_id, "put", put_add, "daily_refill")
+    if aic_add > 0:
+        await ledger_entry(conn, user_id, "aic", aic_add, "daily_refill")
+    wallet["put_balance"] = int(row["put_balance"])
+    wallet["aic_balance"] = int(row["aic_balance"])
+    wallet["last_refill_date"] = row["last_refill_date"]
+    wallet["put_drip_granted"] = int(row["put_drip_granted"] or 0)
+    wallet["aic_drip_granted"] = int(row["aic_drip_granted"] or 0)
+    wallet["subscription_drip_month"] = row["subscription_drip_month"]
     return wallet
 
 async def partial_refund_tokens(

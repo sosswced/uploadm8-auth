@@ -202,13 +202,18 @@ def _put(
     s = str(value or "").strip()
     if not s:
         return
+    # One entity → one discovery slug: "Iron County, Utah" → ironcounty (not ironcountyutah).
+    if cls == "place_primary" and "," in s:
+        slug_src = s.split(",", 1)[0].strip() or s
+    else:
+        slug_src = s
     facts[cls] = FactEntry(
         cls=cls,
         value=s,
         source=source,
         confidence=confidence,
         publishable=publishable and confidence == "high",
-        slug=_sanitize_slug(s),
+        slug=_sanitize_slug(slug_src),
     )
 
 
@@ -361,7 +366,11 @@ def soft_weave_missing_into_caption(
 
 
 def ledger_hashtag_bodies(ledger: FactLedger) -> List[str]:
-    """Ordered discovery tags from publishable ledger facts (no leading #)."""
+    """Ordered discovery tags from publishable ledger facts (no leading #).
+
+    Music titles go through ``music_track_hashtag_bodies`` (never raw smash).
+    Trill bucket is caption-weave only — not a discovery hashtag source.
+    """
     order = (
         "music_artist",
         "music_title",
@@ -369,12 +378,36 @@ def ledger_hashtag_bodies(ledger: FactLedger) -> List[str]:
         "road_primary",
         "vehicle_make",
         "vehicle_model",
-        "trill_bucket",
         "speed_peak",
     )
     out: List[str] = []
     seen: set = set()
+
+    # Artist + short track fragment once (title class alone would smash).
+    artist_ent = ledger.facts.get("music_artist")
+    title_ent = ledger.facts.get("music_title")
+    if (artist_ent and artist_ent.publishable) or (title_ent and title_ent.publishable):
+        try:
+            from core.helpers import music_track_hashtag_bodies
+
+            for body in music_track_hashtag_bodies(
+                artist_ent.value if artist_ent and artist_ent.publishable else None,
+                title_ent.value if title_ent and title_ent.publishable else None,
+            ):
+                b = _sanitize_slug(body)
+                if b and b not in seen:
+                    seen.add(b)
+                    out.append(b)
+        except Exception:
+            if artist_ent and artist_ent.publishable:
+                b = _sanitize_slug(artist_ent.value)
+                if b and b not in seen:
+                    seen.add(b)
+                    out.append(b)
+
     for cls in order:
+        if cls in ("music_artist", "music_title"):
+            continue
         entry = ledger.facts.get(cls)
         if not entry or not entry.publishable:
             continue
@@ -495,15 +528,20 @@ def apply_fact_ledger_to_ctx(ctx: Any, pool: Any = None) -> Dict[str, Any]:
     report["ledger"] = ledger.to_report()
 
     us = getattr(ctx, "user_settings", None) or {}
-    target = 15
     try:
-        raw = us.get("maxHashtags")
-        if raw is None:
-            raw = us.get("max_hashtags")
-        if raw is not None:
-            target = max(1, min(30, int(raw)))
-    except (TypeError, ValueError):
+        from core.hashtag_prefs import resolve_hashtag_ceiling
+
+        target = resolve_hashtag_ceiling(us)
+    except Exception:
         target = 15
+        try:
+            raw = us.get("maxHashtags")
+            if raw is None:
+                raw = us.get("max_hashtags")
+            if raw is not None:
+                target = max(1, min(30, int(raw)))
+        except (TypeError, ValueError):
+            target = 15
     report["hashtag_target"] = target
 
     title = str(getattr(ctx, "ai_title", "") or "")

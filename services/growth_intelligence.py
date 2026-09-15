@@ -107,23 +107,11 @@ def parse_range_since_until(range_key: str) -> Tuple[datetime, datetime]:
     plus custom ``Nd`` (1–3650 days) to a UTC half-open window ``[since, until)``.
 
     ``all`` uses the shared analytics all-time floor (same as GET /api/analytics).
+    Delegates to ``services.admin_kpi_window`` for a single source of truth.
     """
-    from services.canonical_engagement import sql_since_for_analytics_range
+    from services.admin_kpi_window import trailing_window
 
-    now = datetime.now(timezone.utc)
-    rk = (range_key or "30d").strip()
-    if rk.lower() == "all":
-        return sql_since_for_analytics_range("all", now=now), now
-    if rk in RANGE_MINUTES:
-        mins = RANGE_MINUTES[rk]
-    else:
-        m = re.fullmatch(r"(\d{1,4})d", rk)
-        if m:
-            days = max(1, min(int(m.group(1)), 3650))
-            mins = days * 24 * 60
-        else:
-            mins = 43200
-    return now - timedelta(minutes=mins), now
+    return trailing_window(range_key, strict=False)
 
 
 def _is_internal_tier(tier: Optional[str]) -> bool:
@@ -347,8 +335,9 @@ async def fetch_promo_schedule_hints(conn, since: datetime, until: datetime) -> 
 
 
 async def build_recommended_comms(levers: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Rule-based channel plan from live levers (fires at small early-cohort counts)."""
     plans: List[Dict[str, str]] = []
-    if levers.get("users_low_put_available_0_29", 0) > 5:
+    if levers.get("users_low_put_available_0_29", 0) >= 1:
         plans.append(
             {
                 "channel": "in_app",
@@ -356,7 +345,7 @@ async def build_recommended_comms(levers: Dict[str, Any]) -> List[Dict[str, str]
                 "trigger": f"~{levers['users_low_put_available_0_29']} accounts need top-up nudges",
             }
         )
-    if levers.get("users_low_aic_available_0_9", 0) > 5:
+    if levers.get("users_low_aic_available_0_9", 0) >= 1:
         plans.append(
             {
                 "channel": "email",
@@ -364,7 +353,7 @@ async def build_recommended_comms(levers: Dict[str, Any]) -> List[Dict[str, str]
                 "trigger": f"~{levers['users_low_aic_available_0_9']} accounts low on AI credits — Thumbnail Studio + captions",
             }
         )
-    if levers.get("free_users_uploading_last_7d", 0) > 3:
+    if levers.get("free_users_uploading_last_7d", 0) >= 1:
         plans.append(
             {
                 "channel": "mixed",
@@ -372,7 +361,7 @@ async def build_recommended_comms(levers: Dict[str, Any]) -> List[Dict[str, str]
                 "trigger": f"{levers['free_users_uploading_last_7d']} active free uploaders — upgrade path",
             }
         )
-    if levers.get("users_3plus_platform_connections", 0) > 2:
+    if levers.get("users_3plus_platform_connections", 0) >= 2:
         plans.append(
             {
                 "channel": "discord",
@@ -493,8 +482,21 @@ async def fetch_lifecycle_crm_rollup(conn, since: datetime, until: datetime) -> 
     }
 
 
-async def build_marketing_intel_bundle(conn, range_key: str) -> Dict[str, Any]:
-    since, until = parse_range_since_until(range_key)
+async def build_marketing_intel_bundle(
+    conn,
+    range_key: str,
+    *,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Build marketing intel for ``[since, until)``.
+
+    When ``since``/``until`` are omitted, derive them from ``range_key``.
+    Callers with an explicit admin KPI window must pass the resolved bounds
+    so custom start/end are not ignored (Bugbot / admin_contract).
+    """
+    if since is None or until is None:
+        since, until = parse_range_since_until(range_key)
     funnel = await fetch_marketing_funnel(conn, since, until)
     levers = await fetch_sales_opportunity_levers(conn)
     promos = await fetch_promo_schedule_hints(conn, since, until)
@@ -978,14 +980,25 @@ async def _coach_parallel_prefs(conn: Any, uid: uuid.UUID):
     try:
         return await conn.fetchrow(
             """
-            SELECT auto_captions, ai_hashtags_enabled, ai_service_speech_to_text
+            SELECT auto_captions, ai_hashtags_enabled, ai_service_speech_to_text,
+                   ai_service_recognition_training
             FROM user_preferences WHERE user_id = $1
             """,
             uid,
         )
     except Exception as e:
-        logger.warning("coach user_preferences unavailable user_id=%s: %s", uid, e)
-        return None
+        # Column may be missing pre-migration 1107 — fall back without recognition flag.
+        try:
+            return await conn.fetchrow(
+                """
+                SELECT auto_captions, ai_hashtags_enabled, ai_service_speech_to_text
+                FROM user_preferences WHERE user_id = $1
+                """,
+                uid,
+            )
+        except Exception as e2:
+            logger.warning("coach user_preferences unavailable user_id=%s: %s", uid, e2)
+            return None
 
 
 async def _coach_avg_grounding(conn: Any, uid: uuid.UUID) -> Optional[float]:
@@ -1297,6 +1310,34 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
                 "source": "grounding_score",
             }
         )
+
+    # P5 coach: recognition training is consent-only (no AIC) — advisory opt-in hint.
+    try:
+        pref_map = dict(prefs) if prefs is not None and hasattr(prefs, "keys") else {}
+        rt_on = bool(
+            pref_map.get("aiServiceRecognitionTraining")
+            if pref_map.get("aiServiceRecognitionTraining") is not None
+            else pref_map.get("ai_service_recognition_training", False)
+        )
+        if not rt_on and ok_u >= 3 and avg_grounding is not None and float(avg_grounding) < 0.5:
+            suggestions.append(
+                {
+                    "id": "recognition_training_opt_in",
+                    "severity": "info",
+                    "title": "Improve Smart recognition (opt-in, no extra AIC)",
+                    "body": (
+                        "Optional recognition-training packs help UploadM8 learn sense+align from your "
+                        "uploads. Default is off; turn on in Settings → AI services. Compact packs only — "
+                        "not forever masters."
+                    ),
+                    "cta_label": "Open AI services",
+                    "cta_href": "/settings.html#ai-services",
+                    "confidence": 0.55,
+                    "source": "av_read_consent",
+                }
+            )
+    except Exception:
+        pass
 
     put_avail = 0
     aic_avail = 0

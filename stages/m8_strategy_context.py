@@ -237,6 +237,18 @@ async def build_m8_strategy_context(pool, user_id: str, ctx) -> str:
 
 
 
+    # P4: soft AV-read bias (flag default off) — advisory prompt only, never prefs.
+    try:
+        from services.av_read_soft_bias import soft_strategy_block
+
+        soft = soft_strategy_block(ctx)
+        if soft:
+            blocks.append(soft)
+    except Exception as e:
+        logger.debug("m8 strategy av_read soft bias skipped: %s", e)
+
+
+
     if not blocks:
 
         return ""

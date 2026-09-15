@@ -29,6 +29,7 @@ from core.notifications import notify_mrr, notify_topup
 import core.state
 from services.billing_service_weights import fetch_service_weights_map
 from core.wallet import credit_wallet, ledger_entry
+from services.billing import topup_checkout_metadata
 from migrations.runtime_migrations import ensure_subscription_tier_constraint
 from routers.preferences import get_user_prefs_for_upload
 from stages.ai_service_costs import compute_presign_put_aic_costs
@@ -287,12 +288,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
             mode        = "payment",
             success_url = STRIPE_SUCCESS_URL,
             cancel_url  = STRIPE_CANCEL_URL,
-            metadata    = {
-                "user_id": bill_id,
-                "lookup_key": data.lookup_key,
-                "wallet":  product.get("wallet", "put"),
-                "amount":  str(product.get("amount", 0)),
-            },
+            metadata    = topup_checkout_metadata(bill_id, data.lookup_key, product),
         )
 
     return {"checkout_url": session.url, "session_id": session.id}
@@ -648,9 +644,17 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     user_id,
                 )
 
-                # Seed wallet for first period / trial — deduped by invoice id
-                refill_ref = _stripe_field(sub, "latest_invoice") or session.id
-                await _do_monthly_refill(conn, user_id, tier, ent, refill_ref, period_start, period_end)
+                # Seed wallet for first period / trial — only when Stripe invoice id is known.
+                # If we only have session.id, skip here so invoice.paid does not double-credit.
+                latest_inv = _stripe_field(sub, "latest_invoice")
+                if latest_inv:
+                    await _do_monthly_refill(conn, user_id, tier, ent, latest_inv, period_start, period_end)
+                else:
+                    logger.info(
+                        "checkout.session.completed: deferring monthly refill until invoice.paid user=%s session=%s",
+                        user_id,
+                        session.id,
+                    )
 
                 amount = (session.amount_total or 0) / 100
                 await conn.execute(
@@ -680,18 +684,15 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 # Idempotency: credit_wallet stamps token_ledger.stripe_event_id with
                 # session.id, so a re-delivered checkout.session.completed must not
                 # re-credit the wallet (the credit path is not otherwise idempotent).
-                already_credited = await conn.fetchval(
-                    "SELECT 1 FROM token_ledger "
-                    "WHERE stripe_event_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                    session.id,
-                )
-                if already_credited:
-                    logger.info("topup already credited for session %s — skipping", session.id)
-                    return {"status": "topup_already_processed"}
-
                 meta = session.metadata or {}
                 lookup_key = str(meta.get("lookup_key") or "").strip().lower()
                 prod = get_effective_topup_products().get(lookup_key) if lookup_key else None
+                if prod is None and str(meta.get("wallet") or "") == "bundle":
+                    prod = {
+                        "wallet": "bundle",
+                        "put": int(meta.get("put") or 0),
+                        "aic": int(meta.get("aic") or 0),
+                    }
 
                 async def _wallet_balances() -> tuple[int, int]:
                     row = await conn.fetchrow(
@@ -701,92 +702,115 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         return (0, 0)
                     return (int(row["put_balance"] or 0), int(row["aic_balance"] or 0))
 
-                if prod is None:
-                    # Legacy sessions: wallet + amount only (no lookup_key)
-                    wallet_type = meta.get("wallet", "put")
-                    amount_tokens = int(meta.get("amount", 0))
-                    if amount_tokens <= 0:
-                        return {"status": "no_topup_amount"}
-                    prior = await conn.fetchval(
-                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                        user_id,
+                async def _topup_side_done(token_type: str) -> bool:
+                    return bool(
+                        await conn.fetchval(
+                            "SELECT 1 FROM token_ledger "
+                            "WHERE stripe_event_id = $1 AND reason = 'topup_purchase' "
+                            "AND token_type = $2 LIMIT 1",
+                            session.id,
+                            token_type,
+                        )
                     )
-                    bonus = int(amount_tokens * 0.25) if not prior else 0
-                    total = amount_tokens + bonus
-                    await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
-                    amount = (session.amount_total or 0) / 100
-                    await conn.execute(
-                        "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
-                        user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
-                    )
-                    background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
-                    background_tasks.add_task(
-                        send_topup_receipt_email,
-                        email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
-                    )
-                elif prod.get("wallet") == "bundle":
-                    put_base = int(prod.get("put", 0))
-                    aic_base = int(prod.get("aic", 0))
-                    if put_base <= 0 and aic_base <= 0:
-                        return {"status": "invalid_bundle"}
-                    prior = await conn.fetchval(
-                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                        user_id,
-                    )
-                    bonus_put = int(put_base * 0.25) if (put_base > 0 and not prior) else 0
-                    bonus_aic = int(aic_base * 0.25) if (aic_base > 0 and not prior) else 0
-                    put_total = put_base + bonus_put
-                    aic_total = aic_base + bonus_aic
-                    if put_total > 0:
-                        await credit_wallet(conn, user_id, "put", put_total, "topup_purchase", session.id)
-                    if aic_total > 0:
-                        await credit_wallet(conn, user_id, "aic", aic_total, "topup_purchase", session.id)
-                    put_bal, aic_bal = await _wallet_balances()
-                    amount = (session.amount_total or 0) / 100
-                    await conn.execute(
-                        "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
-                        user_id, amount, session.id, f"bundle_{lookup_key}",
-                    )
-                    tok_label = f"{put_total} PUT + {aic_total} AIC"
-                    background_tasks.add_task(notify_topup, amount, email, "bundle", tok_label)
-                    background_tasks.add_task(
-                        send_bundle_topup_receipt_email,
-                        email,
-                        uname,
-                        put_total,
-                        aic_total,
-                        amount,
-                        session.id,
-                        bonus_put=bonus_put,
-                        bonus_aic=bonus_aic,
-                        put_balance=put_bal,
-                        aic_balance=aic_bal,
-                    )
-                else:
-                    wallet_type = str(prod.get("wallet", "put"))
-                    amount_tokens = int(prod.get("amount", 0))
-                    if amount_tokens <= 0:
-                        return {"status": "no_topup_amount"}
-                    prior = await conn.fetchval(
-                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                        user_id,
-                    )
-                    bonus = int(amount_tokens * 0.25) if not prior else 0
-                    total = amount_tokens + bonus
-                    await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
-                    amount = (session.amount_total or 0) / 100
-                    await conn.execute(
-                        "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
-                        user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
-                    )
-                    background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
-                    background_tasks.add_task(
-                        send_topup_receipt_email,
-                        email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
-                    )
+
+                async with conn.transaction():
+                    if prod is None:
+                        # Legacy sessions: wallet + amount only (no lookup_key)
+                        wallet_type = meta.get("wallet", "put")
+                        amount_tokens = int(meta.get("amount", 0))
+                        if amount_tokens <= 0:
+                            return {"status": "no_topup_amount"}
+                        if await _topup_side_done(wallet_type):
+                            logger.info("topup already credited for session %s — skipping", session.id)
+                            return {"status": "topup_already_processed"}
+                        prior = await conn.fetchval(
+                            "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                            user_id,
+                        )
+                        bonus = int(amount_tokens * 0.25) if not prior else 0
+                        total = amount_tokens + bonus
+                        await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
+                        amount = (session.amount_total or 0) / 100
+                        await conn.execute(
+                            "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
+                            "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
+                            user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
+                        )
+                        background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
+                        background_tasks.add_task(
+                            send_topup_receipt_email,
+                            email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
+                        )
+                    elif prod.get("wallet") == "bundle":
+                        put_base = int(prod.get("put", 0) or meta.get("put") or 0)
+                        aic_base = int(prod.get("aic", 0) or meta.get("aic") or 0)
+                        if put_base <= 0 and aic_base <= 0:
+                            return {"status": "invalid_bundle"}
+                        put_done = await _topup_side_done("put")
+                        aic_done = await _topup_side_done("aic")
+                        if put_done and aic_done:
+                            logger.info("topup already credited for session %s — skipping", session.id)
+                            return {"status": "topup_already_processed"}
+                        prior = await conn.fetchval(
+                            "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                            user_id,
+                        )
+                        bonus_put = int(put_base * 0.25) if (put_base > 0 and not prior) else 0
+                        bonus_aic = int(aic_base * 0.25) if (aic_base > 0 and not prior) else 0
+                        put_total = put_base + bonus_put
+                        aic_total = aic_base + bonus_aic
+                        if put_total > 0 and not put_done:
+                            await credit_wallet(conn, user_id, "put", put_total, "topup_purchase", session.id)
+                        if aic_total > 0 and not aic_done:
+                            await credit_wallet(conn, user_id, "aic", aic_total, "topup_purchase", session.id)
+                        put_bal, aic_bal = await _wallet_balances()
+                        amount = (session.amount_total or 0) / 100
+                        await conn.execute(
+                            "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
+                            "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
+                            user_id, amount, session.id, f"bundle_{lookup_key}",
+                        )
+                        tok_label = f"{put_total} PUT + {aic_total} AIC"
+                        background_tasks.add_task(notify_topup, amount, email, "bundle", tok_label)
+                        background_tasks.add_task(
+                            send_bundle_topup_receipt_email,
+                            email,
+                            uname,
+                            put_total,
+                            aic_total,
+                            amount,
+                            session.id,
+                            bonus_put=bonus_put,
+                            bonus_aic=bonus_aic,
+                            put_balance=put_bal,
+                            aic_balance=aic_bal,
+                        )
+                    else:
+                        wallet_type = str(prod.get("wallet", "put"))
+                        amount_tokens = int(prod.get("amount", 0))
+                        if amount_tokens <= 0:
+                            return {"status": "no_topup_amount"}
+                        if await _topup_side_done(wallet_type):
+                            logger.info("topup already credited for session %s — skipping", session.id)
+                            return {"status": "topup_already_processed"}
+                        prior = await conn.fetchval(
+                            "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                            user_id,
+                        )
+                        bonus = int(amount_tokens * 0.25) if not prior else 0
+                        total = amount_tokens + bonus
+                        await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
+                        amount = (session.amount_total or 0) / 100
+                        await conn.execute(
+                            "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
+                            "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
+                            user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
+                        )
+                        background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
+                        background_tasks.add_task(
+                            send_topup_receipt_email,
+                            email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
+                        )
 
     # ── invoice.paid — monthly wallet refill on every renewal ──────────
     elif etype == "invoice.paid":
@@ -1029,45 +1053,51 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
 async def _do_monthly_refill(conn, user_id, tier, ent, invoice_id, period_start, period_end):
     """Credit monthly PUT+AIC. Deduped by invoice_id — safe to call on webhook retry."""
-    # Check dedup table
-    try:
+    if not invoice_id:
+        logger.error("Monthly refill refused: missing invoice_id user=%s", user_id)
+        return False
+
+    put_amount = int(getattr(ent, "put_monthly", 0) or 0)
+    aic_amount = int(getattr(ent, "aic_monthly", 0) or 0)
+
+    async with conn.transaction():
         existing = await conn.fetchrow(
-            "SELECT invoice_id FROM stripe_invoice_log WHERE invoice_id = $1", invoice_id
+            "SELECT invoice_id FROM stripe_invoice_log WHERE invoice_id = $1 FOR UPDATE",
+            invoice_id,
         )
         if existing:
             logger.info(f"Monthly refill already processed for {invoice_id}, skipping.")
             return False
-    except Exception:
-        pass  # Table may not exist yet — proceed, credit_wallet is idempotent enough
 
-    put_amount = ent.put_monthly
-    aic_amount = ent.aic_monthly
-
-    if put_amount > 0:
-        await conn.execute(
-            "UPDATE wallets SET put_balance = put_balance + $1, updated_at = NOW() WHERE user_id = $2",
-            put_amount, user_id
-        )
-        await ledger_entry(conn, user_id, "put", put_amount, "monthly_refill",
-                           stripe_event_id=invoice_id)
-
-    if aic_amount > 0:
-        await conn.execute(
-            "UPDATE wallets SET aic_balance = aic_balance + $1, updated_at = NOW() WHERE user_id = $2",
-            aic_amount, user_id
-        )
-        await ledger_entry(conn, user_id, "aic", aic_amount, "monthly_refill",
-                           stripe_event_id=invoice_id)
-
-    try:
-        await conn.execute("""
+        inserted = await conn.fetchval(
+            """
             INSERT INTO stripe_invoice_log
                 (invoice_id, user_id, tier_slug, put_credited, aic_credited, period_start, period_end)
             VALUES ($1,$2,$3,$4,$5,$6,$7)
             ON CONFLICT (invoice_id) DO NOTHING
-        """, invoice_id, user_id, tier, put_amount, aic_amount, period_start, period_end)
-    except Exception:
-        pass  # Non-critical — dedup log insert failure doesn't break billing
+            RETURNING invoice_id
+            """,
+            invoice_id, user_id, tier, put_amount, aic_amount, period_start, period_end,
+        )
+        if not inserted:
+            logger.info(f"Monthly refill race lost for {invoice_id}, skipping.")
+            return False
+
+        if put_amount > 0:
+            await conn.execute(
+                "UPDATE wallets SET put_balance = put_balance + $1, updated_at = NOW() WHERE user_id = $2",
+                put_amount, user_id
+            )
+            await ledger_entry(conn, user_id, "put", put_amount, "monthly_refill",
+                               stripe_event_id=invoice_id)
+
+        if aic_amount > 0:
+            await conn.execute(
+                "UPDATE wallets SET aic_balance = aic_balance + $1, updated_at = NOW() WHERE user_id = $2",
+                aic_amount, user_id
+            )
+            await ledger_entry(conn, user_id, "aic", aic_amount, "monthly_refill",
+                               stripe_event_id=invoice_id)
 
     logger.info(f"Monthly refill: user={user_id} tier={tier} +{put_amount} PUT +{aic_amount} AIC invoice={invoice_id}")
     return True

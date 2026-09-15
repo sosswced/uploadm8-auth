@@ -800,26 +800,29 @@ async def recover_stuck_ready_to_publish(
                 ERROR_STUCK_READY_TO_PUBLISH,
                 "Publishing stalled.",
             )
-            await mark_schedule_incomplete_failed(
+            marked = await mark_schedule_incomplete_failed(
                 conn,
                 upload_id,
                 detail=detail,
                 error_code=ERROR_STUCK_READY_TO_PUBLISH,
             )
-            await loud_upload_schedule_failure(
-                upload_id,
-                user_id,
-                reason=detail,
-                schedule_mode=mode,
-                db_pool=db_pool,
-            )
-            stats["failed"] += 1
-            logger.warning(
-                "[%s] ready_to_publish → failed %s (overdue %.0fm)",
-                upload_id,
-                ERROR_STUCK_READY_TO_PUBLISH,
-                age_minutes,
-            )
+            if marked:
+                await loud_upload_schedule_failure(
+                    upload_id,
+                    user_id,
+                    reason=detail,
+                    schedule_mode=mode,
+                    db_pool=db_pool,
+                )
+                stats["failed"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish → failed %s (overdue %.0fm)",
+                    upload_id,
+                    ERROR_STUCK_READY_TO_PUBLISH,
+                    age_minutes,
+                )
+            else:
+                stats["skipped"] += 1
             continue
 
         # Never redispatch when nothing is due — deferred publish would no-op,

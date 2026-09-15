@@ -23,10 +23,32 @@ from core.config import (
     JWT_AUDIENCE,
     ACCESS_TOKEN_MINUTES,
     REFRESH_TOKEN_DAYS,
+    REFRESH_TOKEN_DAYS_ADMIN,
+    REFRESH_TOKEN_DAYS_SESSION,
 )
 from core.helpers import _now_utc, _sha256_hex
 
 logger = logging.getLogger("uploadm8-api")
+
+
+def refresh_ttl_days(
+    *,
+    remember: bool = True,
+    role: Optional[str] = None,
+    tier: Optional[str] = None,
+) -> int:
+    """
+    Meta-like session policy:
+    - remember=True (default): REFRESH_TOKEN_DAYS (30)
+    - remember=False (café / shared machine): REFRESH_TOKEN_DAYS_SESSION (1)
+    - admin / master_admin: capped at REFRESH_TOKEN_DAYS_ADMIN (7)
+    """
+    days = REFRESH_TOKEN_DAYS if remember else REFRESH_TOKEN_DAYS_SESSION
+    role_l = str(role or "").strip().lower()
+    tier_l = str(tier or "").strip().lower()
+    if role_l in ("admin", "master_admin") or tier_l == "master_admin":
+        days = min(int(days), int(REFRESH_TOKEN_DAYS_ADMIN))
+    return max(1, int(days))
 
 def parse_enc_keys():
     if not TOKEN_ENC_KEYS:
@@ -83,21 +105,32 @@ def verify_access_jwt(token: str) -> Optional[str]:
         logger.warning(f"JWT verification failed: {e}")
         return None
 
-async def create_refresh_token(conn, user_id: str) -> str:
+async def create_refresh_token(conn, user_id: str, *, days: Optional[int] = None, expires_at=None) -> str:
     token = secrets.token_urlsafe(64)
-    await conn.execute("INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)", user_id, _sha256_hex(token), _now_utc() + timedelta(days=REFRESH_TOKEN_DAYS))
+    if expires_at is None:
+        ttl_days = int(days) if days is not None else int(REFRESH_TOKEN_DAYS)
+        expires_at = _now_utc() + timedelta(days=max(1, ttl_days))
+    await conn.execute(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+        user_id,
+        _sha256_hex(token),
+        expires_at,
+    )
     return token
 
 async def rotate_refresh_token(conn, old_token: str):
     h = _sha256_hex(old_token)
-    row = await conn.fetchrow("SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash=$1", h)
+    row = await conn.fetchrow(
+        "SELECT id, user_id, expires_at, revoked_at, created_at FROM refresh_tokens WHERE token_hash=$1",
+        h,
+    )
     if not row: raise HTTPException(401, "Invalid")
     if row["revoked_at"]:
         await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", row["user_id"])
         raise HTTPException(401, "Reuse detected")
     if row["expires_at"] < _now_utc(): raise HTTPException(401, "Expired")
     u = await conn.fetchrow(
-        "SELECT email_verified, status FROM users WHERE id = $1",
+        "SELECT email_verified, status, role, subscription_tier FROM users WHERE id = $1",
         row["user_id"],
     )
     if not u or u["status"] == "banned":
@@ -115,4 +148,22 @@ async def rotate_refresh_token(conn, old_token: str):
             },
         )
     await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1", row["id"])
-    return create_access_jwt(str(row["user_id"])), await create_refresh_token(conn, row["user_id"])
+    role_cap_days = refresh_ttl_days(
+        remember=True,
+        role=u.get("role"),
+        tier=u.get("subscription_tier"),
+    )
+    now = _now_utc()
+    created = row.get("created_at") or now
+    lifetime = row["expires_at"] - created
+    # Short café sessions (Remember me off): do not slide past the original absolute expiry.
+    session_bound = timedelta(days=int(REFRESH_TOKEN_DAYS_SESSION) + 1)
+    if lifetime <= session_bound:
+        new_expires = row["expires_at"]
+    else:
+        new_expires = now + timedelta(days=role_cap_days)
+    if new_expires <= now:
+        raise HTTPException(401, "Expired")
+    new_refresh = await create_refresh_token(conn, row["user_id"], expires_at=new_expires)
+    refresh_max_age = max(60, int((new_expires - now).total_seconds()))
+    return create_access_jwt(str(row["user_id"])), new_refresh, refresh_max_age

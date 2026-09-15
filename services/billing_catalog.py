@@ -271,6 +271,48 @@ def _merge_topup_entry(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str,
     return merged
 
 
+def _topup_entry_from_patch(patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a standalone TOPUP_PRODUCTS row from a catalog overlay (new SKUs)."""
+    wallet = str(patch.get("wallet") or "").lower().strip()
+    if wallet not in ("put", "aic", "bundle"):
+        return None
+    price_raw = patch.get("price_usd", patch.get("price"))
+    try:
+        price = float(price_raw) if price_raw is not None else 0.0
+    except (TypeError, ValueError):
+        price = 0.0
+    out: Dict[str, Any] = {"wallet": wallet, "price": price, "price_usd": price}
+    if wallet == "bundle":
+        try:
+            out["put"] = int(patch.get("put") or 0)
+            out["aic"] = int(patch.get("aic") or 0)
+        except (TypeError, ValueError):
+            return None
+        if out["put"] <= 0 and out["aic"] <= 0:
+            return None
+        return out
+    try:
+        out["amount"] = int(patch.get("amount") or 0)
+    except (TypeError, ValueError):
+        return None
+    if out["amount"] <= 0:
+        return None
+    return out
+
+
+def _apply_topup_overlays(merged: Dict[str, Dict[str, Any]], overlay: Dict[str, Any]) -> None:
+    for lk, patch in (overlay or {}).items():
+        if not isinstance(patch, dict):
+            continue
+        key = str(lk)
+        if key in merged:
+            merged[key] = _merge_topup_entry(merged[key], patch)
+            continue
+        built = _topup_entry_from_patch(patch)
+        if built:
+            merged[key] = built
+
+
 def merge_topup_products_with_overrides(
     overrides: Optional[Dict[str, Dict[str, Any]]],
 ) -> Dict[str, Dict[str, Any]]:
@@ -314,9 +356,7 @@ def effective_topup_products() -> Dict[str, Dict[str, Any]]:
     cat = core.state.catalog_pricing_cache.get("topup_overlay") or {}
     bill = core.state.billing_catalog_cache.get("topup_overrides") or {}
     merged = copy.deepcopy(TOPUP_PRODUCTS)
-    for lk, patch in cat.items():
-        if lk in merged and isinstance(patch, dict):
-            merged[lk] = _merge_topup_entry(merged[lk], patch)
+    _apply_topup_overlays(merged, cat)
     for lk, patch in bill.items():
         if lk in merged and isinstance(patch, dict):
             merged[lk] = _merge_topup_entry(merged[lk], patch)
@@ -327,9 +367,7 @@ def topup_products_before_billing_overrides() -> Dict[str, Dict[str, Any]]:
     """``TOPUP_PRODUCTS`` merged with catalog overlay only (no billing DB topup_overrides)."""
     cat = core.state.catalog_pricing_cache.get("topup_overlay") or {}
     merged = copy.deepcopy(TOPUP_PRODUCTS)
-    for lk, patch in cat.items():
-        if lk in merged and isinstance(patch, dict):
-            merged[lk] = _merge_topup_entry(merged[lk], patch)
+    _apply_topup_overlays(merged, cat)
     return merged
 
 

@@ -16,8 +16,51 @@ from typing import Any, Dict, List, Optional
 
 _SLUG_SAFE = re.compile(r"[^a-z0-9_.-]+", re.I)
 
-# Omitted from strategy_key hash so tag sets do not explode daily rollup buckets.
-_ATTRIBUTION_HASH_EXCLUDE = frozenset({"captured_at", "hashtag_slugs_used"})
+# Omitted from strategy_key hash so tag sets / pack free-text / per-video scores
+# do not explode packaging buckets. Snapshot still stores these for ML features.
+# Pack flags stay on the snapshot for content_success features (coarse only).
+_ATTRIBUTION_HASH_EXCLUDE = frozenset(
+    {
+        "captured_at",
+        "hashtag_slugs_used",
+        "pack_present",
+        "pack_tl_status",
+        "pack_needs_deep_teacher",
+        "pack_hero_class",
+        "identity_subject",
+        # Per-upload identity / continuous scores must not fork style/persona rollups
+        "identity_domain_tag",
+        "identity_domain_confidence",
+        "identity_hero_fact_class",
+        "identity_headline_class",
+        "identity_confidence",
+        "identity_novel_content",
+        "studio_variant_ctr_score",
+        "studio_pikzels_main_score",
+        "studio_persona_kind",
+        # Runtime thumbnail outcomes (prefs already captured as tsm/trp)
+        "thumbnail_selection_method",
+        "thumbnail_render_method",
+        "thumbnail_engine_mode",
+        "thumbnail_category",
+        # M8 policy remaps of the UI knobs — cs/ct/cv are the user-facing truth
+        "effective_style",
+        "effective_tone",
+        "effective_persona",
+    }
+)
+
+# Fields that define user-facing packaging identity (Smart Insights / coach).
+_PACKAGING_IDENTITY_FIELDS = (
+    "caption_style",
+    "caption_tone",
+    "caption_voice",
+    "m8_engine",
+    "thumbnail_selection_mode",
+    "thumbnail_render_pipeline",
+    "styled_thumbnails",
+    "ai_hashtags_enabled",
+)
 
 
 def collect_hashtag_slugs_for_attribution(ctx: Any) -> List[str]:
@@ -278,29 +321,61 @@ def build_content_attribution_snapshot(
             "identity_subject": str(identity.get("subject") or "")[:140],
         }
     )
+    # P3: coarse AV pack flags only (never free text in strategy_key — excluded above).
+    try:
+        from services.av_read_soft_bias import coarse_pack_flags
+
+        pack_flags = coarse_pack_flags(output_artifacts)
+        snap.update(
+            {
+                "pack_present": int(pack_flags.get("pack_present") or 0),
+                "pack_tl_status": str(pack_flags.get("pack_tl_status") or "na")[:16],
+                "pack_needs_deep_teacher": int(pack_flags.get("pack_needs_deep_teacher") or 0),
+                # hero class enum only — excluded from strategy_key hash
+                "pack_hero_class": str(pack_flags.get("pack_hero_class") or "")[:32],
+            }
+        )
+    except Exception:
+        snap.update(
+            {
+                "pack_present": 0,
+                "pack_tl_status": "na",
+                "pack_needs_deep_teacher": 0,
+                "pack_hero_class": "",
+            }
+        )
     return snap
 
 
 def content_attribution_strategy_key(snap: Dict[str, Any]) -> str:
     """
-    Stable rollup key: human-readable segments + short hash for disambiguation.
+    Stable rollup key: human-readable packaging segments + short hash.
+
+    Hash payload excludes per-video identity/scores and M8 effective remaps so
+    Surprise-mix style/tone/voice combinations can accumulate across uploads.
     Keep length within 480 chars for varchar columns.
     """
     payload = {k: v for k, v in sorted(snap.items()) if k not in _ATTRIBUTION_HASH_EXCLUDE}
     sig = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+    # Prefer user-facing selection mode / render pipeline over runtime methods
+    # (tsel/trend) so identical prefs do not fork when frame-pick outcomes differ.
+    tsm = _slug_segment(snap.get("thumbnail_selection_mode") or "ai")
+    trp = _slug_segment(snap.get("thumbnail_render_pipeline") or "auto")
     parts: List[str] = [
         "v1",
         f"cs={_slug_segment(snap.get('caption_style'))}",
         f"ct={_slug_segment(snap.get('caption_tone'))}",
         f"cv={_slug_segment(snap.get('caption_voice'))}",
         f"m8={'1' if snap.get('m8_engine') else '0'}",
-        f"es={_slug_segment(snap.get('effective_style'))}",
-        f"et={_slug_segment(snap.get('effective_tone'))}",
-        f"ep={_slug_segment(snap.get('effective_persona'))}",
-        f"tsm={_slug_segment(snap.get('thumbnail_selection_mode'))}",
-        f"trp={_slug_segment(snap.get('thumbnail_render_pipeline'))}",
-        f"tsel={_slug_segment(snap.get('thumbnail_selection_method'))}",
-        f"trend={_slug_segment(snap.get('thumbnail_render_method'))}",
+        # Legacy es/et/ep/tsel/trend slots kept as na so parsers stay stable;
+        # packaging identity uses cs/ct/cv + tsm/trp (not per-video remaps).
+        "es=na",
+        "et=na",
+        "ep=na",
+        f"tsm={tsm}",
+        f"trp={trp}",
+        f"tsel={tsm}",
+        f"trend={trp}",
         f"sty={'1' if snap.get('styled_thumbnails') else '0'}",
         f"ah={'1' if snap.get('ai_hashtags_enabled') else '0'}",
         f"hc={int(snap.get('ai_hashtag_count') or 0)}",
@@ -310,6 +385,30 @@ def content_attribution_strategy_key(snap: Dict[str, Any]) -> str:
     ]
     key = "|".join(parts)
     return key[:480]
+
+
+def packaging_identity_key(strategy_key: str) -> str:
+    """
+    Coarse identity for Smart Insights: merge fragmented strategy_keys that share
+    the same user-facing packaging (style/tone/voice + thumb/hashtag toggles).
+    """
+    parsed = parse_content_attribution_key(strategy_key or "")
+    if not parsed:
+        return ""
+    return packaging_identity_from_parsed(parsed)
+
+
+def packaging_identity_from_parsed(parsed: Dict[str, Any]) -> str:
+    if not isinstance(parsed, dict) or not parsed:
+        return ""
+    bits: List[str] = []
+    for field in _PACKAGING_IDENTITY_FIELDS:
+        val = parsed.get(field)
+        if field in ("m8_engine", "styled_thumbnails", "ai_hashtags_enabled"):
+            bits.append(f"{field}={'1' if val else '0'}")
+        else:
+            bits.append(f"{field}={_slug_segment(val) if val not in (None, '') else 'na'}")
+    return "|".join(bits)
 
 
 def parse_content_attribution_key(strategy_key: str) -> Dict[str, Any]:

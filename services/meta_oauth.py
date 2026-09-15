@@ -111,11 +111,15 @@ META_PERMISSION_ALLOWED_USAGE: Dict[str, Dict[str, str]] = {
     },
     "read_insights": {
         "official_allowed_usage": "Integrate Facebook's app, page or domain insights into your own analytics tools.",
-        "we_use": "Show Page video insights (views, reactions, comments, shares) in the owner's Analytics dashboard.",
+        "we_use": (
+            "Show Page video and Reels insights (plays, 3-second views, reactions, comments, shares) "
+            "in the owner's Analytics dashboard."
+        ),
         "we_do_not": "Selling insights, sharing them with other customers, or ads optimization.",
         "app_review_notes": (
-            "1) Functionality: Analytics for Facebook Page video performance.\n"
-            "2) Integration: GET /{video-id}?fields=insights.metric(total_video_views,...) for videos on the connected Page.\n"
+            "1) Functionality: Analytics for Facebook Page video and Reels performance.\n"
+            "2) Integration: GET /{video-id}/video_insights (blue_reels_play_count, "
+            "fb_reels_total_plays, total_video_views) and embedded insights.metric(total_video_views,...).\n"
             "3) End-user value: Compare Facebook performance with other platforms in one dashboard.\n"
             "Allowed usage match: integrate Page insights into our analytics tool for the Page owner."
         ),
@@ -254,6 +258,13 @@ FACEBOOK_GRAPH_PERMISSION_PROOF: List[Dict[str, str]] = [
         "path": "/{video-id}?fields=insights.metric(total_video_views,...)",
         "purpose": "Page video view and engagement totals",
         "caller": "routers.analytics._fetch_facebook_metrics",
+    },
+    {
+        "permission": "read_insights",
+        "method": "GET",
+        "path": "/{video-id}/video_insights?metric=blue_reels_play_count,fb_reels_total_plays,total_video_views",
+        "purpose": "Facebook Reels play counts (native Facebook views) plus 3-second views",
+        "caller": "services.meta_graph_metrics.fetch_facebook_video_engagement",
     },
     {
         "permission": "pages_read_engagement",
@@ -457,14 +468,19 @@ def meta_facebook_oauth_scope() -> str:
     return _SCOPES_FACEBOOK_FULL
 
 
-def meta_oauth_auth_type() -> str:
+def meta_oauth_auth_type(*, soft_reconnect: bool = False) -> str:
     """Facebook Login dialog flags.
 
-    ``reauthenticate`` forces a fresh login (multi-account).
+    ``reauthenticate`` forces a fresh login (multi-account / new connect).
     ``rerequest`` re-prompts declined *and* newly added permissions — required after
     App Review so reconnect actually grants ``pages_manage_posts`` instead of
     silently reusing the old ``publish_video`` grant.
+
+    Soft reconnect uses ``rerequest`` only so an existing Facebook session can
+    Continue-as / grant access without a blank sign-in form.
     """
+    if soft_reconnect:
+        return "rerequest"
     return "reauthenticate,rerequest"
 
 

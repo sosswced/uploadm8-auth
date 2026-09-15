@@ -46,6 +46,7 @@ from services.retry_policy import (
 from services.upload_funnel import emit_upload_funnel_event
 from services.upload.status import CANCELLABLE_STATUSES
 from stages.entitlements import get_entitlements_for_tier
+from services.workspace import resolve_billing_user_id
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -134,8 +135,9 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         )
         try:
             async with core.state.db_pool.acquire() as conn:
-                await refund_tokens(conn, str(user["id"]), put_cost, aic_cost, upload_id)
-                await conn.execute("DELETE FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
+                bill_id = resolve_billing_user_id(user)
+                await refund_tokens(conn, bill_id, put_cost, aic_cost, upload_id)
+                await conn.execute("DELETE FROM uploads WHERE id = $1 AND user_id = $2", upload_id, bill_id)
         except Exception as re:
             logger.error("presign rollback failed upload_id=%s: %s", upload_id, re, exc_info=True)
         raise HTTPException(
@@ -200,7 +202,8 @@ async def complete_upload(
         pass
 
     async with core.state.db_pool.acquire() as conn:
-        tx = await complete_upload_transaction(conn, upload_id, str(user["id"]), body)
+        bill_id = resolve_billing_user_id(user)
+        tx = await complete_upload_transaction(conn, upload_id, bill_id, body)
 
     new_status = tx["new_status"]
     schedule_mode = tx["schedule_mode"]
@@ -231,7 +234,7 @@ async def complete_upload(
     if schedule_mode not in ("scheduled", "smart"):
         job_data = {
             "upload_id": upload_id,
-            "user_id": str(user["id"]),
+            "user_id": bill_id,
             "preferences": user_prefs,
             "plan_features": {
                 "ai": ent.can_ai,
@@ -267,7 +270,7 @@ async def complete_upload(
         background_tasks.add_task(
             inline_rescue_if_stuck,
             upload_id,
-            str(user["id"]),
+            bill_id,
             user_prefs or {},
             ent,
         )
@@ -320,6 +323,7 @@ async def requeue_upload(
     from services.upload.status import is_requeueable_upload
 
     async with acquire_db(core.state.db_pool) as conn:
+        bill_id = resolve_billing_user_id(user)
         upload = await conn.fetchrow(
             """
             SELECT id, user_id, status, r2_key, error_code, schedule_mode,
@@ -327,7 +331,7 @@ async def requeue_upload(
             FROM uploads WHERE id = $1 AND user_id = $2
             """,
             upload_id,
-            user["id"],
+            bill_id,
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
@@ -394,10 +398,11 @@ async def reprepare_upload(upload_id: str, user: dict = Depends(get_current_user
     Generate a fresh presigned R2 URL for an upload stuck in pending state.
     """
     async with core.state.db_pool.acquire() as conn:
+        bill_id = resolve_billing_user_id(user)
         upload = await conn.fetchrow(
             "SELECT id, r2_key, filename, status, telemetry_r2_key FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
-            user["id"],
+            bill_id,
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
@@ -431,10 +436,11 @@ async def reprepare_upload(upload_id: str, user: dict = Depends(get_current_user
 @router.post("/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     async with core.state.db_pool.acquire() as conn:
+        bill_id = resolve_billing_user_id(user)
         upload = await conn.fetchrow(
             "SELECT put_reserved, aic_reserved, status, r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
-            user["id"],
+            bill_id,
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
@@ -476,7 +482,7 @@ async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(g
             "UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1",
             upload_id,
         )
-        await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
+        await refund_tokens(conn, bill_id, upload["put_reserved"], upload["aic_reserved"], upload_id)
         await clear_cancel_signal(core.state.redis_client, upload_id)
         await log_system_event(
             conn,
@@ -509,16 +515,23 @@ async def retry_upload(
     user: dict = Depends(get_current_user),
 ):
     """Re-queue a failed / cancelled / partial upload for processing."""
-    user_id_str = str(user["id"])
+    actor_id = str(user["id"])
+    bill_id = resolve_billing_user_id(user)
 
     redis = core.state.redis_client
     lock_key = f"upload_retry_lock:{upload_id}"
     if redis is not None:
         try:
-            acquired = await redis.set(lock_key, user_id_str, nx=True, ex=RETRY_IDEMPOTENCY_TTL_SEC)
+            acquired = await redis.set(lock_key, actor_id, nx=True, ex=RETRY_IDEMPOTENCY_TTL_SEC)
         except Exception as e:
             logger.warning(f"retry idempotency lock unavailable for {upload_id}: {e}")
-            acquired = True
+            raise HTTPException(
+                503,
+                {
+                    "code": "retry_lock_unavailable",
+                    "message": "Retry lock unavailable — try again shortly.",
+                },
+            )
         if not acquired:
             return {"status": "already_queued", "upload_id": upload_id}
 
@@ -526,7 +539,7 @@ async def retry_upload(
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
-            user["id"],
+            bill_id,
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
@@ -614,7 +627,7 @@ async def retry_upload(
 
             new_artifacts = bump_retry_metadata(
                 existing_artifacts,
-                actor_user_id=user_id_str,
+                actor_user_id=actor_id,
                 prior_error_code=upload.get("error_code") or "OVERDUE_READY",
                 mode="republish",
                 retry_platforms=None,
@@ -636,7 +649,7 @@ async def retry_upload(
                 RETURNING id
                 """,
                 upload_id,
-                user["id"],
+                bill_id,
                 json.dumps(new_artifacts),
             )
             if not nudged:
@@ -644,7 +657,7 @@ async def retry_upload(
 
             await log_system_event(
                 conn,
-                user_id=user_id_str,
+                user_id=actor_id,
                 action="UPLOAD_REPUBLISH_REQUESTED",
                 event_category="UPLOAD",
                 resource_type="upload",
@@ -675,12 +688,12 @@ async def retry_upload(
                     RETURNING id
                     """,
                     upload_id,
-                    user["id"],
+                    bill_id,
                 )
                 if claimed:
                     pub_job = {
                         "upload_id": upload_id,
-                        "user_id": user_id_str,
+                        "user_id": bill_id,
                         "action": "republish",
                         "priority_class": ent.priority_class,
                     }
@@ -702,7 +715,7 @@ async def retry_upload(
                         WHERE id = $1 AND user_id = $2 AND status = 'processing'
                         """,
                         upload_id,
-                        user["id"],
+                        bill_id,
                     )
 
             return {
@@ -760,7 +773,7 @@ async def retry_upload(
 
         new_artifacts = bump_retry_metadata(
             existing_artifacts,
-            actor_user_id=user_id_str,
+            actor_user_id=actor_id,
             prior_error_code=upload.get("error_code"),
             mode=retry_mode,
             retry_platforms=retry_subset,
@@ -781,15 +794,15 @@ async def retry_upload(
             WHERE id = $1 AND user_id = $2
             """,
             upload_id,
-            user["id"],
+            bill_id,
             json.dumps(new_artifacts),
         )
 
-        user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+        user_prefs = await get_user_prefs_for_upload(conn, bill_id)
 
         await log_system_event(
             conn,
-            user_id=user_id_str,
+            user_id=actor_id,
             action="UPLOAD_RETRIED",
             event_category="UPLOAD",
             resource_type="upload",
@@ -811,7 +824,7 @@ async def retry_upload(
 
     job_data: Dict = {
         "upload_id": upload_id,
-        "user_id": user_id_str,
+        "user_id": bill_id,
         "preferences": user_prefs,
         "plan_features": {
             "ai": ent.can_ai,
@@ -843,7 +856,7 @@ async def retry_upload(
                 WHERE id = $1 AND user_id = $2
                 """,
                 upload_id,
-                user_id_str,
+                bill_id,
             )
         logger.error("[%s] enqueue_job failed after retry — marked failed ENQUEUE_FAILED", upload_id)
         raise HTTPException(

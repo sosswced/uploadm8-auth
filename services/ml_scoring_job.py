@@ -142,31 +142,71 @@ def aggregate_quality_score_rows(upload_rows: List[Any]) -> List[Dict[str, Any]]
     return [_finalize_row(k, b) for k, b in buckets.items()]
 
 
-async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180) -> int:
+async def recompute_quality_scores(
+    pool: asyncpg.Pool,
+    lookback_days: int = 180,
+    *,
+    user_id: Any = None,
+) -> int:
     """
     Recompute daily quality score rows from uploads + platform_results + attribution keys.
-    Returns number of rows inserted/updated (best effort).
+
+    When ``user_id`` is set, only that user's lookback window is rewritten (used after
+    Analytics sync so Smart Insights ranked strategies stay fresh without a full fleet job).
+    Returns number of rows present in the recomputed window (best effort).
     """
     lookback_days = max(7, min(int(lookback_days or 180), 3650))
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            DELETE FROM upload_quality_scores_daily
-             WHERE day >= (CURRENT_DATE - ($1::int || ' days')::interval)::date
-            """,
-            lookback_days,
-        )
+    uid = None
+    if user_id is not None:
+        try:
+            import uuid as _uuid
 
-        upload_rows = await conn.fetch(
-            """
-            SELECT user_id, created_at, platforms, views, likes, comments, shares,
-                   platform_results, output_artifacts
-              FROM uploads
-             WHERE created_at >= (NOW() - ($1::int || ' days')::interval)
-               AND status IN ('completed', 'succeeded', 'partial')
-            """,
-            lookback_days,
-        )
+            uid = user_id if isinstance(user_id, _uuid.UUID) else _uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            logger.warning("[ml-scoring] invalid user_id for scoped recompute: %s", user_id)
+            return 0
+
+    async with pool.acquire() as conn:
+        if uid is not None:
+            await conn.execute(
+                """
+                DELETE FROM upload_quality_scores_daily
+                 WHERE user_id = $1::uuid
+                   AND day >= (CURRENT_DATE - ($2::int || ' days')::interval)::date
+                """,
+                uid,
+                lookback_days,
+            )
+            upload_rows = await conn.fetch(
+                """
+                SELECT user_id, created_at, platforms, views, likes, comments, shares,
+                       platform_results, output_artifacts
+                  FROM uploads
+                 WHERE user_id = $1::uuid
+                   AND created_at >= (NOW() - ($2::int || ' days')::interval)
+                   AND status IN ('completed', 'succeeded', 'partial')
+                """,
+                uid,
+                lookback_days,
+            )
+        else:
+            await conn.execute(
+                """
+                DELETE FROM upload_quality_scores_daily
+                 WHERE day >= (CURRENT_DATE - ($1::int || ' days')::interval)::date
+                """,
+                lookback_days,
+            )
+            upload_rows = await conn.fetch(
+                """
+                SELECT user_id, created_at, platforms, views, likes, comments, shares,
+                       platform_results, output_artifacts
+                  FROM uploads
+                 WHERE created_at >= (NOW() - ($1::int || ' days')::interval)
+                   AND status IN ('completed', 'succeeded', 'partial')
+                """,
+                lookback_days,
+            )
 
         finalized = aggregate_quality_score_rows(list(upload_rows or []))
         if finalized:
@@ -209,15 +249,75 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                 ],
             )
 
-        n = await conn.fetchval(
-            """
-            SELECT COUNT(*)::int
-              FROM upload_quality_scores_daily
-             WHERE day >= (CURRENT_DATE - ($1::int || ' days')::interval)::date
-            """,
+        if uid is not None:
+            n = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                  FROM upload_quality_scores_daily
+                 WHERE user_id = $1::uuid
+                   AND day >= (CURRENT_DATE - ($2::int || ' days')::interval)::date
+                """,
+                uid,
+                lookback_days,
+            )
+        else:
+            n = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                  FROM upload_quality_scores_daily
+                 WHERE day >= (CURRENT_DATE - ($1::int || ' days')::interval)::date
+                """,
+                lookback_days,
+            )
+        return int(n or 0)
+
+
+async def recompute_quality_scores_for_user(
+    pool: asyncpg.Pool,
+    user_id: Any,
+    lookback_days: int = 120,
+) -> int:
+    """User-scoped wrapper used after Analytics sync → Smart Insights freshness."""
+    return await recompute_quality_scores(pool, lookback_days=lookback_days, user_id=user_id)
+
+
+async def maybe_recompute_quality_after_analytics_sync(
+    pool: Any,
+    user_id: Any,
+    *,
+    lookback_days: int = 120,
+) -> Optional[int]:
+    """
+    Best-effort quality rollup refresh after engagement sync.
+
+    Fail-soft: never raises into the Analytics sync path. Disabled when
+    ``UM8_ML_ENGINE_RUN_QUALITY_SCORING`` is false (same gate as the ML engine).
+    """
+    if pool is None or user_id is None:
+        return None
+    try:
+        from services.ml_engine_config import get_ml_engine_config
+
+        if not get_ml_engine_config().run_quality_scoring:
+            return None
+    except Exception:
+        pass
+    try:
+        n = await recompute_quality_scores_for_user(pool, user_id, lookback_days=lookback_days)
+        logger.info(
+            "[ml-scoring] post-analytics recompute user=%s rows=%s lookback=%s",
+            str(user_id)[:8],
+            n,
             lookback_days,
         )
-        return int(n or 0)
+        return n
+    except Exception as e:
+        logger.warning(
+            "[ml-scoring] post-analytics recompute failed user=%s: %s",
+            str(user_id)[:8],
+            e,
+        )
+        return None
 
 
 async def run_ml_scoring_cycle(

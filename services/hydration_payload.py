@@ -136,11 +136,17 @@ def build_hydration_payload(
     # Do not re-merge raw ``dashcam_osd_context.max_speed_mph`` here — it can be 0 while the
     # pool already resolved a Vision-OCR peak, which previously made ``evidence.osd`` disagree
     # with ``hydration_report`` / story text.
+    # Publishable peak (high) wins; else surface scrub/consensus candidate (medium HUD/OCR)
+    # so evidence.osd never reads as empty when OCR/OSD actually saw a peak.
     canon_mph = float(pool.max_speed_mph or 0)
+    if canon_mph <= 0:
+        canon_mph = float(getattr(pool, "scrub_speed_mph", 0) or 0)
     canon_avg = float(pool.avg_speed_mph or 0)
+    src_raw = str(pool.speed_source or "")
+    src_label = src_raw.split(":", 1)[0].strip() or None
     osd: Dict[str, Any] = {
         "max_speed_mph": canon_mph if canon_mph > 0 else None,
-        "speed_source": (pool.speed_source or None) if canon_mph > 0 else None,
+        "speed_source": src_label if canon_mph > 0 else None,
         "driver_name": pool.driver_name or (osd_ctx.get("driver_name") if isinstance(osd_ctx, dict) else None),
         "first_seen": first_seen or None,
         "avg_speed_mph": (canon_avg if canon_avg > 0 else None)

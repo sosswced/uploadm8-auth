@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -79,7 +80,8 @@ def _clamp_nonneg(n: int) -> int:
         return _MAX_METRIC
     return x
 
-# Must match GET /api/analytics ``minutes_map`` in ``routers/analytics``.
+# Must match GET /api/analytics ``_RANGE_PRESETS_MINUTES`` / growth_intelligence.RANGE_MINUTES.
+# ``6m`` = 180 days (259200 min), not ~182.5d.
 ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
     "30m": 30,
     "1h": 60,
@@ -89,7 +91,7 @@ ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
     "7d": 10080,
     "30d": 43200,
     "90d": 129600,
-    "6m": 262800,
+    "6m": 259200,
     "365d": 525600,
     "1y": 525600,
 }
@@ -98,18 +100,63 @@ ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
 # Engagement rollups still treat ``all`` as truly unbounded (window_start=None).
 ALL_TIME_FLOOR_UTC = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
+# UI bare-day and alias keys → canonical analytics presets.
+_ANALYTICS_RANGE_ALIASES: Dict[str, str] = {
+    "7": "7d",
+    "7d": "7d",
+    "30": "30d",
+    "30d": "30d",
+    "90": "90d",
+    "90d": "90d",
+    "6m": "6m",
+    "365": "1y",
+    "365d": "1y",
+    "1y": "1y",
+    "year": "1y",
+    "all": "all",
+}
+
+
+def normalize_analytics_range_key(range_key: Optional[str]) -> str:
+    """
+    Map UI/API aliases onto canonical presets used by ANALYTICS_RANGE_MINUTES.
+    Preserves custom ``Nd`` (1–3650). Unknown non-Nd keys resolve to ``30d``.
+    """
+    rk = (range_key or "30d").strip().lower()
+    if rk in _ANALYTICS_RANGE_ALIASES:
+        return _ANALYTICS_RANGE_ALIASES[rk]
+    if rk in ANALYTICS_RANGE_MINUTES:
+        return rk
+    m = re.fullmatch(r"(\d{1,4})d", rk)
+    if m:
+        days = max(1, min(int(m.group(1)), 3650))
+        return f"{days}d"
+    return "30d"
+
+
+def _minutes_for_analytics_range_key(range_key: str) -> int:
+    """Resolve preset or custom ``Nd`` to minutes; unknown → 30d."""
+    rk = normalize_analytics_range_key(range_key)
+    if rk in ANALYTICS_RANGE_MINUTES:
+        return int(ANALYTICS_RANGE_MINUTES[rk])
+    m = re.fullmatch(r"(\d{1,4})d", rk)
+    if m:
+        return int(m.group(1)) * 24 * 60
+    return 43200
+
 
 def engagement_time_window_for_analytics_range(
     range_key: str, *, now: datetime
 ) -> Tuple[Optional[datetime], Optional[datetime]]:
     """
-    Half-open UTC window [start, end_exclusive) for analytics range presets.
-    ``end_exclusive`` is ``now`` (UTC). Unbounded ``all`` → (None, None).
+    Half-open UTC window [start, end_exclusive) for analytics range presets
+    and custom ``Nd`` keys. ``end_exclusive`` is ``now`` (UTC).
+    Unbounded ``all`` → (None, None).
     """
-    rk = (range_key or "30d").strip().lower()
+    rk = normalize_analytics_range_key(range_key)
     if rk == "all":
         return None, None
-    minutes = int(ANALYTICS_RANGE_MINUTES.get(rk, 43200))
+    minutes = _minutes_for_analytics_range_key(rk)
     end = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
     if end.tzinfo != timezone.utc:
         end = end.astimezone(timezone.utc)
@@ -129,6 +176,22 @@ def sql_since_for_analytics_range(range_key: str, *, now: Optional[datetime] = N
         n = n.astimezone(timezone.utc)
     start, _ = engagement_time_window_for_analytics_range(range_key, now=n)
     return start if start is not None else ALL_TIME_FLOOR_UTC
+
+
+def sql_until_exclusive_for_analytics_range(
+    range_key: str, *, now: Optional[datetime] = None
+) -> Optional[datetime]:
+    """
+    Exclusive upper bound for half-open Trill/analytics SQL (``created_at < until``).
+    ``all`` → None (no upper cap beyond product data).
+    """
+    n = now or datetime.now(timezone.utc)
+    if n.tzinfo is None:
+        n = n.replace(tzinfo=timezone.utc)
+    elif n.tzinfo != timezone.utc:
+        n = n.astimezone(timezone.utc)
+    _, end = engagement_time_window_for_analytics_range(range_key, now=n)
+    return end
 
 
 def engagement_time_window_for_overview_days(days: int, *, now: datetime) -> Tuple[datetime, datetime]:
@@ -177,6 +240,25 @@ def _pick_int(d: dict, *keys: str) -> int:
     return 0
 
 
+def _pick_int_max(d: dict, *keys: str) -> int:
+    """Max across aliases so a stored views=0 does not hide play/view counts."""
+    best = 0
+    for k in keys:
+        if k not in d or d[k] is None:
+            continue
+        try:
+            v = d[k]
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, float):
+                best = max(best, _clamp_nonneg(int(round(v))))
+            else:
+                best = max(best, _clamp_nonneg(int(v)))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
 def _vec_max(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
     return {k: _clamp_nonneg(max(int(a.get(k) or 0), int(b.get(k) or 0))) for k in _ENG_KEYS}
 
@@ -217,7 +299,23 @@ def _metrics_from_pr_entry(e: dict) -> Dict[str, int]:
     if plat == "facebook":
         likes_keys = ("reactions", "reaction_count", "likes", "like_count", "likeCount")
     return {
-        "views": _clamp_nonneg(_pick_int(e, "views", "view_count", "play_count", "playCount", "video_views", "impressions")),
+        "views": _clamp_nonneg(
+            _pick_int_max(
+                e,
+                "views",
+                "view_count",
+                "video_view_count",
+                "play_count",
+                "playCount",
+                "plays",
+                "video_views",
+                "total_views",
+                "crossposted_views",
+                "fb_reels_total_plays",
+                "blue_reels_play_count",
+                "impressions",
+            )
+        ),
         "likes": _clamp_nonneg(_pick_int(e, *likes_keys)),
         "comments": _clamp_nonneg(_pick_int(e, "comments", "comment_count", "commentCount")),
         "shares": _clamp_nonneg(_pick_int(e, "shares", "share_count", "shareCount")),

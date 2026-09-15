@@ -64,6 +64,32 @@ _PROSE_BETTER_THAN_BUILDING: frozenset[str] = frozenset(
 _PROSE_MIN_DURATION_S = 2.0
 _PROSE_BUILDING_MIN_DURATION_S = 8.0
 
+# High information-gain environment tags only (never #tree / #outdoors / #plant).
+# At most 0–2 of these may enter evidence hashtags when the scene actually matches.
+RARE_ENV_HASHTAG_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "snowfall",
+        "snowstorm",
+        "blizzard",
+        "rainstorm",
+        "downpour",
+        "hail",
+        "icestorm",
+        "fogbank",
+        "cherryblossoms",
+        "cherryblossom",
+        "autumnleaves",
+        "fallfoliage",
+        "wildfire",
+        "lightning",
+        # Specific place/env (never coarse tree/outdoors/forest taxonomy).
+        "ferry",
+        "tideflat",
+        "tideflats",
+        "beach",
+    }
+)
+
 # Slugs (alphanumeric, lower) for labels we never want as hashtag evidence.
 GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
     {
@@ -140,6 +166,24 @@ GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
         "automobile",
         "driving",
         "drive",
+        # Vehicle class / taxonomy filler (never discovery tags)
+        "sedan",
+        "familycar",
+        "compactcar",
+        "citycar",
+        "performancecar",
+        "personalluxurycar",
+        "luxurycar",
+        "sportscar",
+        "hatchback",
+        "coupe",
+        "convertible",
+        "minivan",
+        "suv",
+        "crossover",
+        "pickup",
+        "truck",
+        "van",
         "boat",
         "ship",
         "watercraft",
@@ -241,6 +285,9 @@ GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
         "vibes",
         "vibe",
         "mood",
+        "chill",
+        "chillvibes",
+        "relaxed",
         "ambiance",
         "ambience",
         "ambient",
@@ -736,6 +783,64 @@ _BEAUTY_LABEL_MARKERS = (
 def vision_label_slug(raw: Any) -> str:
     """Normalize a Vision label to a lowercase alphanumeric slug."""
     return re.sub(r"[^A-Za-z0-9]+", "", str(raw or "")).lower()
+
+
+def rare_env_hashtag_bodies(*sources: Any, limit: int = 2) -> List[str]:
+    """Return ≤``limit`` allowlisted environment discovery tags from evidence.
+
+    Coarse labels (tree/outdoors/plant) never pass — only high-gain slugs in
+    ``RARE_ENV_HASHTAG_ALLOWLIST``. Used under strong geo+music without reopening
+    the full Vision label flood.
+    """
+    out: List[str] = []
+    seen: set[str] = set()
+    for src in sources:
+        if src is None:
+            continue
+        if isinstance(src, (list, tuple, set, frozenset)):
+            items = list(src)
+        elif isinstance(src, dict):
+            items = list(src.values())
+        else:
+            items = [src]
+        for item in items:
+            if isinstance(item, dict):
+                item = item.get("description") or item.get("name") or item.get("label") or ""
+            slug = vision_label_slug(item)
+            if not slug or slug in seen:
+                continue
+            if slug not in RARE_ENV_HASHTAG_ALLOWLIST:
+                # Soft synonym map for common YAMNet / OCR phrases.
+                low = str(item or "").lower()
+                mapped = ""
+                if "snow" in low and ("fall" in low or "storm" in low or "heavy" in low):
+                    mapped = "snowfall"
+                elif "blizzard" in low:
+                    mapped = "blizzard"
+                elif "downpour" in low or ("heavy" in low and "rain" in low):
+                    mapped = "downpour"
+                elif "rainstorm" in low or "thunderstorm" in low:
+                    mapped = "rainstorm"
+                elif "cherry" in low and "blossom" in low:
+                    mapped = "cherryblossoms"
+                elif "hail" in low:
+                    mapped = "hail"
+                elif "lightning" in low:
+                    mapped = "lightning"
+                elif "ferry" in low:
+                    mapped = "ferry"
+                elif "tide" in low and "flat" in low:
+                    mapped = "tideflat"
+                elif re.search(r"\bbeach\b", low) and "parking" not in low:
+                    mapped = "beach"
+                if not mapped or mapped in seen:
+                    continue
+                slug = mapped
+            seen.add(slug)
+            out.append(slug)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def is_generic_vision_label(raw: Any, *, min_specific_len: int = 4) -> bool:

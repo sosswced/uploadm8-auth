@@ -20,8 +20,9 @@ SPEED_UNIT_RE = re.compile(
 )
 
 # Lat/lon pair — never a speed source.
+# Degree glyph optional, but do not absorb bare whitespace after lon (would steal " 46MPH").
 _LATLON_PAIR_RE = re.compile(
-    r"(?i)[+\-]?\d{1,2}\.\d{2,7}\s*[°ºo*]?\s+[+\-]?\d{1,3}\.\d{2,7}\s*[°ºo*]?"
+    r"(?i)[+\-]?\d{1,2}\.\d{2,7}(?:\s*[°ºo*])?\s+[+\-]?\d{1,3}\.\d{2,7}(?:\s*[°ºo*])?"
 )
 
 # Truncated / OCR-damaged lon after a lat (minus + 2–3 digits, optional °, no mph).
@@ -47,8 +48,9 @@ _HAS_SPEED_UNIT_RE = re.compile(
 )
 
 # Decimal coordinate token (lat or lon fragment) — digits before the point.
+# Same degree-glyph rule: only consume whitespace when a °-family glyph follows.
 _COORD_DECIMAL_RE = re.compile(
-    r"(?i)([+\-\u2010-\u2015]?)(\d{1,3})\.(\d{2,7})\s*[°ºo*]?"
+    r"(?i)([+\-\u2010-\u2015]?)(\d{1,3})\.(\d{2,7})(?:\s*[°ºo*])?"
 )
 
 

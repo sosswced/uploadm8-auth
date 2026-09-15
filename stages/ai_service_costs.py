@@ -71,6 +71,8 @@ SERVICE_PREF_KEYS: Dict[str, str] = {
     "video_intelligence": "aiServiceVideoAnalyzer",
     "twelvelabs": "aiServiceSceneUnderstanding",
     "dashcam_osd": "aiServiceDashcamOSD",
+    # Consent-only (no SERVICE_WEIGHTS / AIC) — opt-in AV training pack retention.
+    "recognition_training": "aiServiceRecognitionTraining",
 }
 
 # ``user_preferences`` column names persisted by save_user_content_preferences.

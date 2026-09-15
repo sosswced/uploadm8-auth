@@ -66,6 +66,21 @@ def build_platform_token_row_list(token_rows: Any, decrypt_fn: Any) -> Dict[str,
     return out
 
 
+def _dedupe_token_pairs(pairs: List[Tuple[str, dict]]) -> List[Tuple[str, dict]]:
+    """Prefer first occurrence; identity by token_row_id when set, else id(token dict)."""
+    out: List[Tuple[str, dict]] = []
+    seen: set[str] = set()
+    for tid, tok in pairs:
+        if not tok:
+            continue
+        key = str(tid).strip() if tid else f"obj:{id(tok)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((str(tid) if tid else "", tok))
+    return out
+
+
 def resolve_token_candidates_with_row_ids(
     pr: Dict[str, Any],
     token_map_by_id: Dict[str, dict],
@@ -75,30 +90,39 @@ def resolve_token_candidates_with_row_ids(
 ) -> List[Tuple[str, dict]]:
     """
     Return (platform_tokens.id, decrypted_token) pairs for one platform_results entry.
-    Prefer explicit token_row_id, then (platform, account_id), then all tokens for platform.
+
+    Order: explicit token_row_id (if still live), then (platform, account_id), then all
+    live tokens for the platform. Never exclusive-bind to a live-but-wrong row after
+    reconnect / account_id rewrite — callers try until a platform API returns metrics.
     """
     plat = str(pr.get("platform") or "").lower()
+    ordered: List[Tuple[str, dict]] = []
 
     tid = pr.get("token_row_id") or pr.get("token_id")
     if tid:
         tok = token_map_by_id.get(str(tid))
         if tok:
-            return [(str(tid), tok)]
+            ordered.append((str(tid), tok))
 
     aid = pr.get("account_id")
     if aid is not None and str(aid).strip() != "":
         a = str(aid).strip()
         pair = plat_account_row_map.get((plat, a))
         if pair:
-            return [pair]
-        tok = token_map_by_plat_account.get((plat, a))
-        if tok:
-            return [("", tok)]
-        tok = token_map_by_id.get(a)
-        if tok:
-            return [("", tok)]
+            ordered.append(pair)
+        else:
+            tok = token_map_by_plat_account.get((plat, a))
+            if tok:
+                ordered.append(("", tok))
+            else:
+                tok = token_map_by_id.get(a)
+                if tok:
+                    ordered.append(("", tok))
 
-    return platform_token_rows.get(plat) or []
+    for pair in platform_token_rows.get(plat) or []:
+        ordered.append(pair)
+
+    return _dedupe_token_pairs(ordered)
 
 
 def resolve_token_candidates_for_platform_result(
@@ -113,8 +137,8 @@ def resolve_token_candidates_for_platform_result(
     """
     Return decrypted token candidates for one `platform_results` entry.
 
-    If the entry includes `token_row_id`/`token_id` or `account_id`, return the single matching token.
-    Otherwise, return *all* active tokens for that platform (caller may try them in order).
+    Prefer token_row_id / account_id matches first, then other active tokens for that
+    platform so a stale exclusive bind after reconnect cannot block sync.
     """
     if plat_account_row_map is not None and platform_token_rows is not None:
         pairs = resolve_token_candidates_with_row_ids(
@@ -123,25 +147,40 @@ def resolve_token_candidates_for_platform_result(
         return [p[1] for p in pairs if p[1]]
 
     plat = str(pr.get("platform") or "").lower()
+    ordered: List[dict] = []
 
     tid = pr.get("token_row_id") or pr.get("token_id")
     if tid:
         tok = token_map_by_id.get(str(tid))
         if tok:
-            return [tok]
+            ordered.append(tok)
 
     aid = pr.get("account_id")
     if aid is not None and str(aid).strip() != "":
         a = str(aid).strip()
         tok = token_map_by_plat_account.get((plat, a))
         if tok:
-            return [tok]
-        tok = token_map_by_id.get(a)
-        if tok:
-            return [tok]
+            ordered.append(tok)
+        else:
+            tok = token_map_by_id.get(a)
+            if tok:
+                ordered.append(tok)
 
-    # Legacy/ambiguous rows: try all active tokens for that platform.
-    return _as_token_list(token_map_by_platform.get(plat))
+    for tok in _as_token_list(token_map_by_platform.get(plat)):
+        ordered.append(tok)
+
+    # Deduplicate by object identity (legacy path stores one dict per platform key).
+    out: List[dict] = []
+    seen: set[int] = set()
+    for tok in ordered:
+        if not tok:
+            continue
+        i = id(tok)
+        if i in seen:
+            continue
+        seen.add(i)
+        out.append(tok)
+    return out
 
 
 def build_plat_account_token_map(token_rows, decrypt_fn) -> Dict[Tuple[str, str], dict]:

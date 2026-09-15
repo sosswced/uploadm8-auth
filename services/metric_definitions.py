@@ -76,17 +76,21 @@ ADMIN_KPI_PROVIDER_COSTS_NOTE = (
 )
 
 CATALOG_AGGREGATE_USER_ENGAGEMENT = (
-    "Tenant-wide SUM over platform_content_items with optional filters (period, platform, source, account). "
-    "Per-video metrics use GREATEST(catalog, linked uploads row) when the upload targets a single matching "
-    "platform — same spirit as GET /api/catalog/content. "
+    "Tenant-wide SUM of platform_content_items.views/likes/comments/shares with optional filters "
+    "(period, platform, source, account). Uploads are joined only for COALESCE(published_at, completed_at, created_at) "
+    "time filtering — metrics are not merged from uploads or platform_results. "
     "Unlike GET /api/analytics headline, this is not compute_canonical_engagement_rollup "
-    "(no merge with successful platform_results JSON dedupe); external-only catalog rows are included. "
+    "(no successful platform_results JSON dedupe); external-only catalog rows are included. "
+    "Meta list ingest often leaves views=0 while likes>0; catalog sync enriches those rows "
+    "(META_PCI_ENRICH_CAP, prefer engagement-without-views, concurrency META_PCI_ENRICH_CONCURRENCY). "
+    "YouTube shares stay 0 (Data API has no shareCount). "
+    "Response may include pci_likes_without_views and has_more_pages health hints. "
     "See engagement_crosswalk on GET /api/analytics and this response."
 )
 
 
 # Optional: bump when changing keys or meaning of definitions (clients may log/compare).
-CANONICAL_DEFINITIONS_VERSION = 1
+CANONICAL_DEFINITIONS_VERSION = 2
 
 
 def _base() -> Dict[str, Any]:
@@ -111,15 +115,15 @@ def engagement_crosswalk() -> Dict[str, Any]:
         "catalog_aggregate": {
             "api": "GET /api/catalog/aggregate",
             "fields": "views, likes, comments, shares",
-            "computation": "services.catalog_sync.get_catalog_aggregate (SQL over pci + uploads join)",
+            "computation": "services.catalog_sync.get_catalog_aggregate (PCI-only SUM; uploads join for timestamp only)",
             "scope": "single user_id; optional period/days/start-end, platform, source, account_id",
             "time_basis": (
                 "Per-row COALESCE(pci.published_at, u.completed_at, u.created_at) inside the selected "
                 "rolling or explicit UTC window — differs from headline filters (see canonical_headline.time_basis)."
             ),
             "vs_canonical": (
-                "Different row membership and merge rules than headline; includes external catalog-only rows; "
-                "does not apply platform_results JSON dedupe path."
+                "Different row membership than headline; includes external catalog-only rows; "
+                "sums pci.views/likes/comments/shares only (no platform_results merge)."
             ),
         },
         "live_aggregate": {
@@ -127,6 +131,11 @@ def engagement_crosswalk() -> Dict[str, Any]:
             "field": "live_aggregate",
             "source": "platform_metrics_cache",
             "vs_canonical": "Account poll snapshot only — not summed into headline (see response kpi_sources).",
+            "meta_ingest": (
+                "IG/FB account polls use services.meta_graph_metrics fetch_*_engagement "
+                "(insights + object-field max-merge). Writers live in "
+                "services.upload_analytics_sync (GREATEST columns + max-merge platform_results + PCI)."
+            ),
         },
         "admin_global_upload_sum": {
             "api": "GET /api/admin/kpis",

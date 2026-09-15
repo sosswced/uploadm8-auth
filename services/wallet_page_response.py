@@ -9,6 +9,7 @@ from typing import Any, Mapping, Tuple
 
 from fastapi import HTTPException
 
+from core.db_pool import acquire_db
 from core.helpers import get_plan
 from core.user_columns import USERS_WALLET_COLUMNS, users_select_sql
 from core.wallet import get_wallet as get_wallet_core
@@ -26,7 +27,7 @@ async def fetch_me_wallet_endpoint_data(
     (auth gates), wallet row, and ledger — avoids a second checkout after
     ``get_current_user_readonly`` (Sentry: consecutive queries / duplicate unlock spans).
     """
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         user_row = await conn.fetchrow(users_select_sql(USERS_WALLET_COLUMNS), user_id)
         if not user_row:
             raise HTTPException(status_code=401, detail="User not found")

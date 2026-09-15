@@ -2261,6 +2261,34 @@ async def run_migrations(db_pool):
                   WHERE tier_slug = 'agency'
                     AND product_kind = 'subscription';
             """),
+            # Opt-in AV recognition training pack consent (no AIC).
+            (1107, """
+                ALTER TABLE user_preferences
+                    ADD COLUMN IF NOT EXISTS ai_service_recognition_training BOOLEAN DEFAULT FALSE;
+            """),
+            # Opt-in dashcam OSD burn (Drive Insights) — mirror of users.preferences JSON.
+            (1110, """
+                ALTER TABLE user_preferences
+                    ADD COLUMN IF NOT EXISTS ai_service_dashcam_osd BOOLEAN DEFAULT FALSE;
+            """),
+            # PCI Meta enrich: views=0 backlog scan by account (likes-without-views priority).
+            (1108, """
+                CREATE INDEX IF NOT EXISTS idx_pci_user_plat_acct_views0
+                    ON platform_content_items (user_id, platform, account_id, published_at DESC)
+                    WHERE COALESCE(views, 0) = 0;
+            """),
+            # Google login_hint for YouTube soft reconnect (email from openid/userinfo).
+            (1109, """
+                ALTER TABLE platform_tokens
+                    ADD COLUMN IF NOT EXISTS oauth_login_hint VARCHAR(320);
+            """),
+            # Free-tier daily PUT/AIC drip counters (must match GET /api/wallet daily_topup).
+            (1111, """
+                ALTER TABLE wallets
+                    ADD COLUMN IF NOT EXISTS subscription_drip_month VARCHAR(7),
+                    ADD COLUMN IF NOT EXISTS put_drip_granted INT NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS aic_drip_granted INT NOT NULL DEFAULT 0;
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

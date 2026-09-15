@@ -82,10 +82,14 @@ def set_auth_cookies(
     access_token: str,
     refresh_token: str,
     request: Optional[Request] = None,
+    *,
+    refresh_max_age: Optional[int] = None,
 ) -> None:
     """Attach HttpOnly cookies. JSON body may still include tokens for non-browser clients."""
     max_access = int(ACCESS_TOKEN_MINUTES * 60)
-    max_refresh = int(REFRESH_TOKEN_DAYS * 86400)
+    max_refresh = int(refresh_max_age) if refresh_max_age is not None else int(REFRESH_TOKEN_DAYS * 86400)
+    if max_refresh < 60:
+        max_refresh = 60
     common = _cookie_common(request)
     response.set_cookie(AUTH_ACCESS_COOKIE, access_token, max_age=max_access, **common)
     response.set_cookie(AUTH_REFRESH_COOKIE, refresh_token, max_age=max_refresh, **common)

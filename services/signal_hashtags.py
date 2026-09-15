@@ -55,6 +55,9 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from core.helpers import (
     expand_geo_runon_hashtag,
+    extract_highway_route_tokens,
+    is_instructional_road_sign,
+    music_track_hashtag_bodies,
     normalize_hashtag_bodies,
     sanitize_hashtag_body,
     split_hashtag_source_phrases,
@@ -64,6 +67,7 @@ from core.vision_labels import (
     is_generic_vision_label,
     is_invented_person_hashtag,
     is_junk_hashtag_body,
+    rare_env_hashtag_bodies,
     road_hashtag_tokens,
     vision_label_slug,
 )
@@ -109,9 +113,9 @@ _US_STATE_ABBR: Dict[str, str] = {
     "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
 }
 
-# Trill bucket → tag set (mirrors stages.telemetry_stage.get_trill_modifiers,
-# but exposed here so we can apply them deterministically to every platform's
-# hashtag list rather than relying on the legacy title modifier path).
+    # Trill bucket → caption weave only (not discovery hashtags).
+    # Kept for reference / tests that import the map; build_signal_hashtags
+    # no longer injects these lifestyle tags.
 _TRILL_TAGS: Dict[str, List[str]] = {
     "gloryBoy": ["GloryBoyTour", "TrillScore100", "SendIt", "DashCam", "CarLife"],
     "euphoric": ["Euphoric", "TrillScore", "SpeedDemon", "DashCam"],
@@ -120,16 +124,25 @@ _TRILL_TAGS: Dict[str, List[str]] = {
     "chill":    ["TrillScore", "CruiseControl", "DashCam"],
 }
 
-# Highway / road keywords we recognize from Vision OCR (burned road signs,
-# mile markers, exit boards, etc.). Hits get a short `highway` tag plus the
-# matched route slug when it looks like one (e.g. "I15", "US101", "SR2").
-_HIGHWAY_PATTERNS = (
-    re.compile(r"\b(I[-\s]?\d{1,3})\b", re.IGNORECASE),                   # interstate
-    re.compile(r"\b(US[-\s]?\d{1,3})\b", re.IGNORECASE),                  # US route
-    re.compile(r"\b(SR[-\s]?\d{1,3})\b", re.IGNORECASE),                  # state route
-    re.compile(r"\b(HWY[-\s]?\d{1,3})\b", re.IGNORECASE),                 # generic hwy
-    re.compile(r"\b(ROUTE[-\s]?\d{1,3})\b", re.IGNORECASE),               # route N
-)
+# Evidence-class weights for final truncation (higher survives max_extra first).
+_TAG_CLASS_WEIGHT = {
+    "landmark": 100,
+    "place_sign": 95,
+    "road": 90,
+    "route": 88,
+    "business": 85,
+    "city": 80,
+    "state": 75,
+    "padus": 72,
+    "music_artist": 70,
+    "music_genre": 55,
+    "music_title": 50,
+    "logo": 45,
+    "env": 40,
+    "trill": 35,
+    "speed": 30,
+    "other": 20,
+}
 
 # Speed bucketing thresholds (mph). Captures driving intensity even when no
 # Trill score was computed (e.g. .map missing AND OSD backfill below ML thresh).
@@ -151,7 +164,21 @@ def _slug(raw: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> str:
     return sanitize_hashtag_body(str(raw or ""), max_len=max_len)
 
 
-def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> None:
+def _tag_weight(body: str, *, tag_class: str = "other") -> int:
+    w = int(_TAG_CLASS_WEIGHT.get(tag_class, _TAG_CLASS_WEIGHT["other"]))
+    # Prefer longer specific place slugs over short crumbs when class ties.
+    return w * 100 + min(len(body), 40)
+
+
+def _push(
+    tags: List[str],
+    seen: set,
+    candidate: Any,
+    *,
+    max_len: int = HASHTAG_BODY_MAX_LEN,
+    tag_class: str = "other",
+    weights: Optional[Dict[str, int]] = None,
+) -> None:
     """Append candidate slug(s) if non-empty, not duplicate, not blocklisted.
 
     Multi-entity sources (``Artist|Artist``, ``City, ST``) and geo run-ons are
@@ -164,8 +191,22 @@ def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = HASHTAG_
                 continue
             if is_junk_hashtag_body(body):
                 continue
+            if is_instructional_road_sign(phrase) or is_instructional_road_sign(body):
+                continue
             seen.add(body)
             tags.append(body)
+            if weights is not None:
+                weights[body] = max(weights.get(body, 0), _tag_weight(body, tag_class=tag_class))
+
+
+def _rank_by_weight(tags: List[str], weights: Dict[str, int], *, max_extra: int) -> List[str]:
+    """Stable class-weight sort so geo/route/artist beat weak leftovers under max_extra."""
+    if len(tags) <= max_extra:
+        return tags
+    indexed = list(enumerate(tags))
+    indexed.sort(key=lambda it: (-int(weights.get(it[1], 0)), it[0]))
+    keep = {t for _, t in indexed[:max_extra]}
+    return [t for t in tags if t in keep][:max_extra]
 
 
 def _state_abbr(state: Optional[str], country: Optional[str]) -> Optional[str]:
@@ -200,49 +241,142 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
       5. Geo city                        (e.g. ``losangeles``)
       6. Geo state                       (e.g. ``california``) — never city+abbr
       7. PADUS unit / public-lands hint  (protected area name or ``publiclands``)
-      8. Highway hits parsed from OCR    (e.g. ``i15``)
+      8. Highway hits parsed from OCR    (e.g. ``i15``, ``181south``)
       9. Vision logos / brands           (when prominent on screen)
-     10. Trill bucket tags               (driving energy from telemetry)
-     11. Speed-bucket tags               (max_speed_mph thresholds)
+     10. Speed-bucket tags               (max_speed_mph thresholds)
     """
     tags: List[str] = []
     seen: set = set()
+    weights: Dict[str, int] = {}
 
     # Cap individual buckets so one signal can't crowd out the others.
-    def _take(items: Iterable[Any], n: int, *, max_len: int = HASHTAG_BODY_MAX_LEN) -> None:
+    def _take(
+        items: Iterable[Any],
+        n: int,
+        *,
+        max_len: int = HASHTAG_BODY_MAX_LEN,
+        tag_class: str = "other",
+    ) -> None:
         added = 0
         for item in items:
             if added >= n:
                 break
             before = len(tags)
-            _push(tags, seen, item, max_len=max_len)
+            _push(tags, seen, item, max_len=max_len, tag_class=tag_class, weights=weights)
             if len(tags) > before:
                 added += 1
+
+    pack_subject = ""
+    subject_token_overlap = None  # type: ignore
+    pack: Dict[str, Any] = {}
+    try:
+        from core.publish_pack import get_publish_pack, subject_token_overlap as _sto
+
+        subject_token_overlap = _sto
+        pack = get_publish_pack(ctx) or {}
+        pack_subject = str(pack.get("subject") or "")
+    except Exception:
+        pack = {}
+        subject_token_overlap = None  # type: ignore
+
+    def _logo_allowed(desc: Any) -> bool:
+        text = str(desc or "").strip()
+        if not text:
+            return False
+        slug = sanitize_hashtag_body(text)
+        ambient = {
+            "uhaul",
+            "uhaulinternational",
+            "jordankuwaitbank",
+            "kuwaitbank",
+            "realunited",
+            "klankosova",
+            "klankoso",
+            "maersk",
+            "fedex",
+            "ups",
+            "dhl",
+            "walmart",
+            "costco",
+            "shell",
+            "chevron",
+        }
+        if slug in ambient or is_junk_hashtag_body(slug):
+            return False
+        if re.search(r"(?i)\b(?:freight|logistics|u[\-\s]?haul)\b", text):
+            return False
+        # Local credit unions are useful place signals; ban mega/national banks only.
+        if re.search(r"(?i)\bcredit\s+union\b", text):
+            pass
+        elif re.search(
+            r"(?i)\b(?:chase|wells\s*fargo|bank\s*of\s*america|citibank|capital\s*one)\b",
+            text,
+        ):
+            return False
+        elif re.search(r"(?i)\bbank\b", text) and len(text.split()) < 2:
+            return False
+        elif re.search(r"(?i)\b(?:jordan|kuwait).*\bbank\b|\bbank\b.*(?:jordan|kuwait)", text):
+            return False
+        try:
+            from services.hydration_enforcer import _is_ambient_logo
+
+            if _is_ambient_logo(text):
+                return False
+        except Exception:
+            pass
+        if pack_subject and subject_token_overlap is not None:
+            return bool(subject_token_overlap(text, pack_subject))
+        # Without a pack, keep legacy behavior but still drop ambient brands.
+        return True
+
+    def _vi_logo_duration_ok_local(lg: dict) -> bool:
+        try:
+            start = float(lg.get("start_s") or 0.0)
+            end = float(lg.get("end_s") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return end > start and (end - start) >= 1.5
+
+    for seed in list(pack.get("hashtag_seeds") or [])[:8]:
+        if _logo_allowed(seed):
+            _push(tags, seen, seed, tag_class="landmark", weights=weights)
 
     # ── Vision: landmarks ────────────────────────────────────────────────
     vc = (ctx.vision_context or {}) if isinstance(ctx.vision_context, dict) else {}
     landmark_names = list(vc.get("landmark_names") or [])
-    _take(landmark_names, 4)
+    _take(landmark_names, 4, tag_class="landmark")
 
     # ── Welcome to / Entering roadside signs (Vision OCR + VI text) ─────
     try:
         from services.scene_fusion import collect_place_signs
 
         for sign in collect_place_signs(ctx)[:2]:
-            _push(tags, seen, sign)
+            _push(tags, seen, sign, tag_class="place_sign", weights=weights)
     except Exception:
         pass
 
     # ── ACR music identification ─────────────────────────────────────────
-    # Keep this high priority: artist/track tags are exact catalogue signals and
-    # can otherwise be crowded out by geo/vision-heavy dashcam clips.
+    # Artist (+ short track / genre). Long smashed track titles are dropped.
     ac = (ctx.audio_context or {}) if isinstance(ctx.audio_context, dict) else {}
-    # Flake-tolerant: ACR often sets artist/title but forgets music_detected.
     if ac.get("music_detected") or ac.get("music_artist") or ac.get("music_title"):
-        artist = ac.get("music_artist") or ""
-        title = ac.get("music_title") or ""
-        _push(tags, seen, artist)
-        _push(tags, seen, title)
+        artist_raw = str(ac.get("music_artist") or "")
+        title_raw = str(ac.get("music_title") or "")
+        genre_raw = str(ac.get("music_genre") or ac.get("genre") or "")
+        artist_slug = sanitize_hashtag_body(artist_raw)
+        genre_primary = re.split(r"[/|,;]", genre_raw)[0].strip().replace("&", "")
+        genre_slug = sanitize_hashtag_body(genre_primary)
+        for body in music_track_hashtag_bodies(artist_raw, title_raw, genre_raw):
+            if body in seen or body in _BLOCKED_META or is_junk_hashtag_body(body):
+                continue
+            if body == artist_slug:
+                cls = "music_artist"
+            elif genre_slug and body == genre_slug:
+                cls = "music_genre"
+            else:
+                cls = "music_title"
+            seen.add(body)
+            tags.append(body)
+            weights[body] = max(weights.get(body, 0), _tag_weight(body, tag_class=cls))
 
     # ── Geo (telemetry / OSD backfill, after reverse-geocode) ────────────
     tel = ctx.telemetry or ctx.telemetry_data
@@ -250,47 +384,67 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
         road = getattr(tel, "location_road", None)
         city = getattr(tel, "location_city", None)
         state = getattr(tel, "location_state", None)
-        country = getattr(tel, "location_country", None)
         gaz_place = getattr(tel, "gazetteer_place_name", None)
         for tok in road_hashtag_tokens(road):
-            _push(tags, seen, tok)
+            _push(tags, seen, tok, tag_class="road", weights=weights)
         if gaz_place:
             gz_body = _slug(gaz_place)
             city_body = _slug(city or "")
             if not city_body or gz_body != city_body:
-                _push(tags, seen, gaz_place)
+                _push(tags, seen, gaz_place, tag_class="city", weights=weights)
         # Separate discovery tags only — never city+CA / city+NV run-ons.
-        _push(tags, seen, city)
-        _push(tags, seen, state)
+        _push(tags, seen, city, tag_class="city", weights=weights)
+        _push(tags, seen, state, tag_class="state", weights=weights)
         start_disp = getattr(tel, "location_start_display", None)
         if start_disp:
             # "Las Vegas, NV" → #lasvegas #nevada via split_hashtag_source_phrases.
-            _push(tags, seen, start_disp)
+            _push(tags, seen, start_disp, tag_class="city", weights=weights)
         pun = getattr(tel, "padus_unit_name", None)
         if pun:
-            _push(tags, seen, pun)
+            _push(tags, seen, pun, tag_class="padus", weights=weights)
         elif getattr(tel, "near_padus", False):
-            _push(tags, seen, "publiclands")
+            _push(tags, seen, "publiclands", tag_class="padus", weights=weights)
 
-    # ── Highway hits parsed from Vision OCR ──────────────────────────────
-    # Truncate OCR text so regex matching stays fast even on dense text-heavy frames.
+    # ── Highway route hits from Vision OCR (never roadside businesses) ───
     ocr_text = ((vc.get("ocr_text") or "") if isinstance(vc, dict) else "")[:4000]
-    hwy_hits: List[str] = []
-    for pat in _HIGHWAY_PATTERNS:
-        for m in pat.findall(ocr_text):
-            hwy_hits.append(str(m))
-    _take(hwy_hits, 2)
+    _take(extract_highway_route_tokens(ocr_text, limit=4), 3, tag_class="route")
+    # Local business boards (Salal Credit Union, etc.) stay caption-prose only.
 
     # ── Vision: logos (brands visible on screen) ─────────────────────────
-    _take(list(vc.get("logo_names") or []), 3)
+    # Prefer durable VI logos; Vision still-shot logos only when not ambient freight.
+    try:
+        from services.hydration_enforcer import (
+            _is_ambient_logo,
+            _logo_ok_for_hashtag,
+        )
+    except Exception:
+        _is_ambient_logo = lambda _t: False  # type: ignore
+        _logo_ok_for_hashtag = lambda _t, **_k: bool(str(_t or "").strip())  # type: ignore
 
-    # ── Video Intelligence logos + selective on-screen text ──────────────
-    # Never slugify raw HUD lines (speed/GPS/timestamps) into hashtags.
+    durable_logos: List[str] = []
     vi = getattr(ctx, "video_intelligence", None) or getattr(ctx, "video_intelligence_context", None) or {}
     if isinstance(vi, dict):
-        for lg in list(vi.get("logos") or [])[:4]:
-            if isinstance(lg, dict) and lg.get("description"):
-                _push(tags, seen, lg["description"])
+        for lg in list(vi.get("logos") or [])[:8]:
+            if not isinstance(lg, dict) or not lg.get("description"):
+                continue
+            if not _vi_logo_duration_ok_local(lg):
+                continue
+            conf = lg.get("confidence")
+            try:
+                conf_f = float(conf) if conf is not None else None
+            except (TypeError, ValueError):
+                conf_f = None
+            desc = str(lg["description"])
+            if _logo_ok_for_hashtag(desc, confidence=conf_f) and _logo_allowed(desc):
+                durable_logos.append(desc)
+    for name in list(vc.get("logo_names") or [])[:4]:
+        if _logo_ok_for_hashtag(name) and not _is_ambient_logo(name) and _logo_allowed(name):
+            durable_logos.append(str(name))
+    _take(durable_logos, 2, tag_class="logo")
+
+    # ── Video Intelligence selective on-screen text ──────────────────────
+    # Never slugify raw HUD lines (speed/GPS/timestamps) into hashtags.
+    if isinstance(vi, dict):
         ost = list(vi.get("on_screen_text") or [])
         for row in sorted(
             ost,
@@ -300,14 +454,13 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
                 txt = str(row.get("text") or "").strip()
             else:
                 txt = str(row).strip()
-            if not txt or len(txt) < 3 or len(txt) > 28:
+            if not txt or len(txt) < 3 or len(txt) > 40:
                 continue
-            # Prefer highway tokens from the line; skip digit-heavy HUD dumps.
-            hwy_from_line: List[str] = []
-            for pat in _HIGHWAY_PATTERNS:
-                hwy_from_line.extend(str(m) for m in pat.findall(txt))
+            if is_instructional_road_sign(txt):
+                continue
+            hwy_from_line = extract_highway_route_tokens(txt, limit=2)
             if hwy_from_line:
-                _take(hwy_from_line, 1)
+                _take(hwy_from_line, 1, tag_class="route")
                 continue
             if re.search(r"\d", txt):
                 continue
@@ -315,13 +468,18 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
                 continue
             if re.search(r"(?i)\b(?:mph|escort|blackvue|viofo|gps|am|pm)\b", txt):
                 continue
-            _push(tags, seen, vision_label_slug(txt)[:36] or txt[:36])
+            if _is_ambient_logo(txt):
+                continue
+            _push(
+                tags,
+                seen,
+                vision_label_slug(txt)[:36] or txt[:36],
+                tag_class="other",
+                weights=weights,
+            )
 
-    # ── Trill score bucket (driving energy) ──────────────────────────────
-    tr = ctx.trill or ctx.trill_score
-    bucket = (getattr(tr, "bucket", "") if tr else "") or ""
-    if bucket in _TRILL_TAGS:
-        _take(_TRILL_TAGS[bucket], 3)
+    # Trill bucket is caption-weave only — never mint CruiseControl / chill
+    # lifestyle discovery tags from the energy score.
 
     # ── Speed-bucket tags (works even with no Trill score) ───────────────
     # High-confidence publishable peak only — HUD-only medium must not mint
@@ -335,23 +493,34 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
         max_speed = 0.0
     for thresh, sb_tags in _SPEED_BUCKETS:
         if max_speed >= thresh:
-            _take(sb_tags, 2)
+            _take(sb_tags, 2, tag_class="speed")
             break
 
-    if len(tags) > max_extra:
-        tags = tags[:max_extra]
+    # 0–2 rare environment tags (snowfall, ferry, …) even when geo+music are strong.
+    try:
+        plants: List[Any] = []
+        yamnet_top = ""
+        ac_env = (ctx.audio_context or {}) if isinstance(ctx.audio_context, dict) else {}
+        yamnet_top = str(ac_env.get("yamnet_top") or ac_env.get("top_label") or "")
+        vu = getattr(ctx, "video_understanding", None) or {}
+        if isinstance(vu, dict):
+            plants = list((vu.get("recognition_entities") or {}).get("plants") or [])[:6]
+        vision_labels = list(vc.get("labels") or vc.get("label_names") or [])[:12]
+        for body in rare_env_hashtag_bodies(yamnet_top, vision_labels, plants, limit=2):
+            _push(tags, seen, body, tag_class="env", weights=weights)
+    except Exception:
+        pass
+
     try:
         from core.upload_domain_plan import discovery_hashtags_for_upload
 
         for tag in discovery_hashtags_for_upload(ctx, limit=max_extra):
-            _push(tags, seen, tag)
-            if len(tags) >= max_extra:
-                break
+            if not _logo_allowed(tag):
+                continue
+            _push(tags, seen, tag, tag_class="other", weights=weights)
     except Exception:
         pass
-    if len(tags) > max_extra:
-        tags = tags[:max_extra]
-    return tags
+    return _rank_by_weight(tags, weights, max_extra=max_extra)
 
 
 def _unsquash_delimited_sources(tags: List[str], sources: Iterable[Any]) -> List[str]:

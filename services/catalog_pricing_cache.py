@@ -122,27 +122,32 @@ async def load_catalog_pricing_cache(conn: asyncpg.Connection) -> None:
         )
         for row in tops:
             lk = row["lookup_key"]
-            if not lk or lk not in TOPUP_PRODUCTS:
+            if not lk:
                 continue
-            base = TOPUP_PRODUCTS[lk]
+            base = TOPUP_PRODUCTS.get(lk) or {}
             price = _optional_float(row.get("price_usd"))
             amt = _optional_int(row.get("token_amount"))
             put_m = _optional_int(row.get("put_monthly"))
             aic_m = _optional_int(row.get("aic_monthly"))
-            w = row.get("wallet")
+            w = str(row.get("wallet") or base.get("wallet") or "").lower().strip()
             patch: Dict[str, Any] = {}
             if price is not None:
                 patch["price"] = price
                 patch["price_usd"] = price
-            if (base.get("wallet") or "") == "bundle":
+            if w == "bundle" or (base.get("wallet") or "") == "bundle":
                 if put_m is not None:
                     patch["put"] = put_m
                 if aic_m is not None:
                     patch["aic"] = aic_m
+                patch["wallet"] = "bundle"
             elif amt is not None:
                 patch["amount"] = amt
-            if w:
-                patch["wallet"] = str(w).lower().strip()
+                if w in ("put", "aic"):
+                    patch["wallet"] = w
+                elif base.get("wallet") in ("put", "aic"):
+                    patch["wallet"] = str(base["wallet"])
+            elif w in ("put", "aic", "bundle"):
+                patch["wallet"] = w
             if patch:
                 topup_overlay[str(lk)] = patch
     except Exception as exc:

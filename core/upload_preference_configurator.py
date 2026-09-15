@@ -31,6 +31,7 @@ PREF_LABELS: Dict[str, str] = {
     "aiHashtagsEnabled": "AI-generated hashtags",
     "aiServiceTelemetry": "Telemetry insights (.map file)",
     "aiServiceDashcamOSD": "Dashcam OSD reader",
+    "aiServiceRecognitionTraining": "Improve Smart recognition",
     "aiServiceAudioSignals": "Audio event detection",
     "aiServiceMusicDetection": "Music detection",
     "aiServiceAudioSummary": "Audio content summary",
@@ -217,6 +218,7 @@ FREE_TIER_OPT_IN_KEYS: FrozenSet[str] = frozenset(
         "aiServiceSceneUnderstanding",
         "aiServiceFrameInspector",
         "aiServiceVideoAnalyzer",
+        "aiServiceRecognitionTraining",
         "trillEnabled",
         "autoThumbnails",
     }

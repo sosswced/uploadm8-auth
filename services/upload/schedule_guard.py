@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from core.scheduling import calculate_smart_schedule, get_existing_scheduled_days
 from services.smart_schedule_insights import calculate_smart_schedule_data_driven
-from services.upload.r2_storage_guard import ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE
+from services.upload.r2_storage_guard import ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE, ERROR_TELEMETRY_UPLOAD_MISSING, TELEMETRY_UPLOAD_MISSING_MESSAGE
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -49,6 +49,7 @@ UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
         "Reconnect accounts or edit the upload targets, then retry."
     ),
     ERROR_SOURCE_NOT_IN_R2: SOURCE_NOT_IN_R2_MESSAGE,
+    ERROR_TELEMETRY_UPLOAD_MISSING: TELEMETRY_UPLOAD_MISSING_MESSAGE,
     "ENQUEUE_FAILED": (
         "Upload saved but the processing queue was unavailable. We will retry automatically."
     ),
@@ -599,9 +600,10 @@ async def mark_schedule_incomplete_failed(
     *,
     detail: str,
     error_code: str = ERROR_SCHEDULE_INCOMPLETE,
-) -> None:
+) -> bool:
+    """Mark upload failed. Returns True when a non-terminal row was updated."""
     code = (error_code or ERROR_SCHEDULE_INCOMPLETE).strip().upper() or ERROR_SCHEDULE_INCOMPLETE
-    await conn.execute(
+    status = await conn.execute(
         """
         UPDATE uploads
         SET status = 'failed',
@@ -615,6 +617,11 @@ async def mark_schedule_incomplete_failed(
         code,
         detail[:4000],
     )
+    try:
+        # asyncpg: "UPDATE N"
+        return int(str(status).split()[-1]) > 0
+    except (TypeError, ValueError, IndexError):
+        return bool(status)
 
 
 async def bootstrap_repair_user_schedules(

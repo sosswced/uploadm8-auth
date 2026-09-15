@@ -50,8 +50,10 @@ from services.meta_oauth import (
     meta_oauth_auth_type,
     meta_oauth_mode,
 )
+from services.meta_oauth_connect import RECONNECT_WRONG_ACCOUNT_MSG
 from services.platform_oauth_refresh import OAUTH_RECONNECT_RESET_SQL
 from services.workspace import require_can_manage_platforms, resolve_billing_user_id
+from services.youtube_oauth_hint import fetch_google_oauth_email, normalize_oauth_login_hint
 from stages.entitlements import can_user_connect_platform
 
 logger = logging.getLogger("uploadm8-api")
@@ -69,10 +71,12 @@ async def oauth_start(
 ):
     """Start OAuth flow for a platform.
 
-    Provider URLs are built so the user always sees an explicit auth/consent step
-    (not a silent bind to whoever is already signed in on that browser). TikTok:
-    ``disable_auto_auth=1``; Google: ``prompt`` includes ``login``; Meta:
-    ``auth_type=reauthenticate,rerequest`` and a per-request ``auth_nonce``.
+    New connect: always force an explicit auth/consent step so browser cookies from a
+    previous platform login do not silently bind the last account.
+
+    Reconnect (default): soft "give access" / consent for the existing browser session.
+    Identity is still enforced in the callback via ``reconnect_expected_provider_account_id``.
+    Pass ``force_login=1`` on reconnect only when the user needs a hard account switch.
     """
     if platform not in OAUTH_CONFIG:
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -92,7 +96,7 @@ async def oauth_start(
         async with core.state.db_pool.acquire() as conn:
             reconnect_target = await conn.fetchrow(
                 """
-                SELECT id, account_id
+                SELECT id, account_id, account_username, account_name, oauth_login_hint
                 FROM platform_tokens
                 WHERE id = $1
                   AND user_id = $2
@@ -105,6 +109,23 @@ async def oauth_start(
             )
         if not reconnect_target:
             raise HTTPException(404, "Reconnect target account not found")
+
+    # New connects always force a fresh chooser. Soft reconnect skips the blank sign-in
+    # box when a provider session already exists; callback still fail-closes on identity.
+    is_reconnect = reconnect_target is not None
+    force_fresh = force_login or not is_reconnect
+    soft_reconnect = is_reconnect and not force_fresh
+
+    login_hint = None
+    if is_reconnect:
+        login_hint = normalize_oauth_login_hint(reconnect_target.get("oauth_login_hint"))
+        if not login_hint:
+            hint_raw = (
+                str(reconnect_target.get("account_username") or "").strip()
+                or str(reconnect_target.get("account_name") or "").strip()
+            )
+            # Fallback: rare cases where username was stored as an email.
+            login_hint = normalize_oauth_login_hint(hint_raw)
 
     tiktok_code_verifier: str | None = None
     if platform == "tiktok":
@@ -127,9 +148,9 @@ async def oauth_start(
     redirect_uri = get_oauth_redirect_uri(platform)
 
     if platform == "tiktok":
-        # TikTok Login Kit: disable_auto_auth=0 skips the auth/consent UI when the browser
-        # already has a valid TikTok session — every OAuth then returns the same account
-        # (breaks multi-account / "add another" flows). Always show the auth page.
+        # TikTok Login Kit: disable_auto_auth=0 skips auth UI when a TikTok session exists.
+        # New connect must use 1 so multi-account / "add another" is not cookie-bound.
+        # Soft reconnect uses 0 so the same logged-in TikTok account can grant access.
         # See https://developers.tiktok.com/doc/login-kit-web (disable_auto_auth).
         params = {
             "client_key": TIKTOK_CLIENT_KEY,
@@ -139,36 +160,51 @@ async def oauth_start(
             "state": state,
             "code_challenge": tiktok_code_challenge,
             "code_challenge_method": "S256",
-            "disable_auto_auth": 1,
+            "disable_auto_auth": 0 if soft_reconnect else 1,
         }
-        if force_login:
+        if force_fresh:
             params["prompt"] = "login"
     elif platform == "youtube":
-        # Google OAuth: without `login`, a single Google session can still authorize silently.
-        # `select_account` + `consent` + `login` shows the picker and requires sign-in again
-        # so "Add another channel" is not stuck on the default browser account.
-        params = {
-            "client_id": YOUTUBE_CLIENT_ID,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": config["scope"],
-            "state": state,
-            "access_type": "offline",
-            "prompt": "select_account consent login",
-        }
+        # New connect: select_account + login clears cookie-bound Google sessions.
+        # Soft reconnect: consent only (give access) for the current Google session.
+        if soft_reconnect:
+            params = {
+                "client_id": YOUTUBE_CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": config["scope"],
+                "state": state,
+                "access_type": "offline",
+                "prompt": "consent",
+            }
+            if login_hint:
+                params["login_hint"] = login_hint
+        else:
+            params = {
+                "client_id": YOUTUBE_CLIENT_ID,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": config["scope"],
+                "state": state,
+                "access_type": "offline",
+                "prompt": "select_account consent login",
+            }
     elif platform == "instagram":
-        # Meta Login: `reauthenticate` forces a fresh Facebook login (multi-account).
-        # `rerequest` re-prompts declined *and* newly approved permissions (e.g. pages_manage_posts
-        # after App Review). `auth_nonce` avoids a cached silent dialog on repeat popups.
+        # Meta Login: `reauthenticate` forces a fresh Facebook login (multi-account / new).
+        # Soft reconnect: `rerequest` only → Continue-as / grant permissions.
+        # `auth_nonce` only on forced-fresh so soft reconnect can reuse the FB session.
         params = {
             "client_id": INSTAGRAM_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "scope": meta_instagram_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": meta_oauth_auth_type(),
-            "auth_nonce": secrets.token_hex(12),
+            "auth_type": meta_oauth_auth_type(soft_reconnect=soft_reconnect),
         }
+        if force_fresh:
+            params["auth_nonce"] = secrets.token_hex(12)
+        if login_hint:
+            params["login_hint"] = login_hint
     elif platform == "facebook":
         params = {
             "client_id": FACEBOOK_CLIENT_ID,
@@ -176,9 +212,12 @@ async def oauth_start(
             "scope": meta_facebook_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": meta_oauth_auth_type(),
-            "auth_nonce": secrets.token_hex(12),
+            "auth_type": meta_oauth_auth_type(soft_reconnect=soft_reconnect),
         }
+        if force_fresh:
+            params["auth_nonce"] = secrets.token_hex(12)
+        if login_hint:
+            params["login_hint"] = login_hint
     
     auth_url = f"{config['auth_url']}?{urlencode(params)}"
     return {"auth_url": auth_url, "state": state}
@@ -301,6 +340,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
             # Exchange code for tokens based on platform
             token_payload = {}
             meta_llt_ok = False
+            oauth_login_hint = None
             if platform == "tiktok":
                 from services.tiktok_api import (
                     fetch_tiktok_user_profile_for_oauth,
@@ -384,6 +424,9 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 })
                 token_data = token_response.json()
                 access_token = token_data.get("access_token")
+
+                # Google account email → oauth_login_hint for soft reconnect prefill.
+                oauth_login_hint = await fetch_google_oauth_email(client, access_token)
                 
                 # Get channel info
                 user_response = await client.get(
@@ -630,6 +673,20 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
             token_blob = encrypt_blob(blob_payload)
             
             async with core.state.db_pool.acquire() as conn:
+                reconnect_row_id = state_data.get("reconnect_account_id")
+                reconnect_expected_provider_id = state_data.get(
+                    "reconnect_expected_provider_account_id"
+                )
+                # Fail closed before any UPDATE: cookie spill must not refresh a
+                # different already-connected row when the user clicked Reconnect.
+                if reconnect_row_id and reconnect_expected_provider_id:
+                    if str(reconnect_expected_provider_id) != str(account_id):
+                        return popup_response(
+                            False,
+                            platform,
+                            RECONNECT_WRONG_ACCOUNT_MSG,
+                        )
+
                 # Check if account already connected
                 existing = await conn.fetchrow(
                     "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
@@ -637,23 +694,22 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 )
 
                 if existing:
+                    if reconnect_row_id and str(existing["id"]) != str(reconnect_row_id):
+                        return popup_response(
+                            False,
+                            platform,
+                            RECONNECT_WRONG_ACCOUNT_MSG,
+                        )
                     await conn.execute(f"""
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
                         account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW(),
+                        oauth_login_hint = COALESCE($6, oauth_login_hint),
                         {OAUTH_RECONNECT_RESET_SQL}
                         WHERE id = $5
-                    """, token_blob, account_name, account_username, account_avatar, existing["id"])
+                    """, token_blob, account_name, account_username, account_avatar, existing["id"], oauth_login_hint)
                     connect_action = "PLATFORM_RECONNECTED"
                 else:
-                    reconnect_row_id = state_data.get("reconnect_account_id")
-                    reconnect_expected_provider_id = state_data.get("reconnect_expected_provider_account_id")
                     if reconnect_row_id:
-                        if reconnect_expected_provider_id and str(reconnect_expected_provider_id) != str(account_id):
-                            return popup_response(
-                                False,
-                                platform,
-                                "You authenticated a different account. Please sign in to the same account you selected for reconnect.",
-                            )
                         await conn.execute(
                             f"""
                             UPDATE platform_tokens
@@ -664,6 +720,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                                 account_id = $5,
                                 updated_at = NOW(),
                                 last_oauth_reconnect_at = NOW(),
+                                oauth_login_hint = COALESCE($9, oauth_login_hint),
                                 {OAUTH_RECONNECT_RESET_SQL}
                             WHERE id = $6
                               AND user_id = $7
@@ -677,6 +734,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                             reconnect_row_id,
                             user_id,
                             platform,
+                            oauth_login_hint,
                         )
                         connect_action = "PLATFORM_RECONNECTED"
                         await log_system_event(
@@ -718,9 +776,12 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                             reason,
                         )
                     await conn.execute("""
-                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob, last_oauth_reconnect_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-                    """, user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
+                        INSERT INTO platform_tokens (
+                            user_id, platform, account_id, account_name, account_username,
+                            account_avatar, token_blob, last_oauth_reconnect_at, oauth_login_hint
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, token_blob, oauth_login_hint)
                     connect_action = "PLATFORM_CONNECTED"
 
                 await log_system_event(conn, user_id=str(user_id), action=connect_action,

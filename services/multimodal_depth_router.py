@@ -219,13 +219,41 @@ def route_multimodal_depth(ctx: Any) -> Dict[str, Any]:
         reasons.append(f"niche_needs_depth:{kind}")
 
     reason = ";".join(reasons)
-    return {
+    out = {
         "clip_kind": kind if kind in _CLIP_KINDS else "general",
         "force_twelvelabs": bool(force),
         "vision_weak": bool(vision_weak),
         "reason": reason,
         "reasons": reasons,
+        "av_read_skip_tl": False,
     }
+
+    # P6: optional distill soft-skip — FAIL CLOSED unless kill-switch explicitly on.
+    # Default AV_READ_DEPTH_SKIP_TL=0 keeps full ladder. Fusion remains mandatory if VU empty.
+    try:
+        from services.av_read_runtime_flags import flag_enabled as _av_flag
+
+        _skip_tl_gate = _av_flag("AV_READ_DEPTH_SKIP_TL")
+    except Exception:
+        _skip_tl_gate = _env_bool("AV_READ_DEPTH_SKIP_TL", False)
+    if _skip_tl_gate and not force:
+        try:
+            from services.av_read_distill_infer import maybe_skip_twelvelabs
+
+            decision = maybe_skip_twelvelabs(ctx)
+            if decision.get("skip_tl") and float(decision.get("confidence") or 0) >= 0.85:
+                out["force_twelvelabs"] = False
+                out["av_read_skip_tl"] = True
+                out["reasons"] = list(out["reasons"]) + [
+                    f"av_read_skip_tl:conf={decision.get('confidence')}"
+                ]
+                out["reason"] = ";".join(out["reasons"])
+            else:
+                out["reasons"] = list(out["reasons"]) + ["av_read_skip_denied_fail_closed"]
+        except Exception as e:
+            out["reasons"] = list(out["reasons"]) + [f"av_read_skip_error:{str(e)[:80]}"]
+            # Fail closed: leave force as computed above
+    return out
 
 
 def apply_depth_route_to_ctx(ctx: Any, route: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -242,6 +270,7 @@ def apply_depth_route_to_ctx(ctx: Any, route: Optional[Dict[str, Any]] = None) -
         us["forceTwelveLabs"] = True
         us["force_twelvelabs"] = True
         ctx.user_settings = us
+    setattr(ctx, "av_read_skip_tl", bool(route.get("av_read_skip_tl")))
     return route
 
 

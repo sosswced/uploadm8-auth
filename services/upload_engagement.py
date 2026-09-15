@@ -161,10 +161,24 @@ def per_platform_upload_metrics(row: Any) -> List[Dict[str, Any]]:
 
 
 def strategy_key_from_artifacts(output_artifacts: Any) -> str:
-    """Match ml_scoring_job SQL attribution key for quality daily rows."""
+    """Match ml_scoring_job SQL attribution key for quality daily rows.
+
+    Prefer recomputing from ``content_attribution_v1`` so historical uploads
+    pick up packaging-stable keys (style/tone/voice) after hash/exclude fixes.
+    """
     oa = safe_json(output_artifacts, {})
     if not isinstance(oa, dict):
         oa = {}
+    snap_raw = oa.get("content_attribution_v1")
+    if snap_raw:
+        snap = safe_json(snap_raw, None) if not isinstance(snap_raw, dict) else snap_raw
+        if isinstance(snap, dict) and snap:
+            try:
+                from core.content_attribution import content_attribution_strategy_key
+
+                return content_attribution_strategy_key(snap)
+            except Exception:
+                pass
     key = str(oa.get("content_attribution_key") or "").strip()
     if key:
         return key

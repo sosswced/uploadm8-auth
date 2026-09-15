@@ -8,10 +8,16 @@ from core.r2 import r2_object_head_status
 
 ERROR_SOURCE_NOT_IN_R2 = "SOURCE_NOT_IN_R2"
 ERROR_STORAGE_CHECK_UNAVAILABLE = "STORAGE_CHECK_UNAVAILABLE"
+ERROR_TELEMETRY_UPLOAD_MISSING = "telemetry_upload_missing"
 
 SOURCE_NOT_IN_R2_MESSAGE = (
     "The video file did not finish uploading to storage. "
     "Re-upload the file, then complete the upload again."
+)
+
+TELEMETRY_UPLOAD_MISSING_MESSAGE = (
+    "A companion .map was expected but is missing from storage. "
+    "Re-upload the .map (same basename as the video), then complete again."
 )
 
 R2HeadStatus = Literal["present", "missing", "unknown"]

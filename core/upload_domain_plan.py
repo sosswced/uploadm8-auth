@@ -366,6 +366,46 @@ def discovery_hashtags_for_upload(ctx: Any, *, limit: int = 15) -> List[str]:
     domain = detect_planned_domain(ctx)
     teams = [str(t).strip() for t in ((ident or {}).get("sports_teams") or []) if str(t).strip()]
     stadiums = [str(s).strip() for s in ((ident or {}).get("stadiums") or []) if str(s).strip()]
+
+    # Drop fleeting roadside/brand logos misclassified as sports teams (U-Haul, banks, …).
+    try:
+        from services.hydration_enforcer import _is_ambient_logo
+        from core.helpers import sanitize_hashtag_body as _shb
+
+        _ambient_slugs = {
+            "uhaul",
+            "uhaulinternational",
+            "jordankuwaitbank",
+            "kuwaitbank",
+            "realunited",
+            "klankosova",
+            "klankoso",
+            "maersk",
+            "fedex",
+            "ups",
+            "dhl",
+            "walmart",
+            "costco",
+            "shell",
+            "chevron",
+        }
+
+        def _team_ok(name: str) -> bool:
+            slug = _shb(name) or ""
+            if slug in _ambient_slugs:
+                return False
+            try:
+                if _is_ambient_logo(name):
+                    return False
+            except Exception:
+                pass
+            return True
+
+        teams = [t for t in teams if _team_ok(t)]
+        stadiums = [s for s in stadiums if _team_ok(s)]
+    except Exception:
+        pass
+
     if not sport and domain != "sports" and not teams and not stadiums:
         return []
 

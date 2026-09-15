@@ -136,6 +136,28 @@ def _should_drop_openai_quota_log(event: dict[str, Any]) -> bool:
     return False
 
 
+def _should_drop_platform_metrics_transport_log(event: dict[str, Any]) -> bool:
+    """Drop refresh-all httpx disconnect spam (UPLOADM8-BB) — fail-soft metrics."""
+    le = event.get("logentry") or {}
+    parts = [str(event.get("message") or "")]
+    if isinstance(le, dict):
+        parts.extend([str(le.get("message") or ""), str(le.get("formatted") or "")])
+    blob = " ".join(parts).lower()
+    if "metrics" not in blob:
+        return False
+    if "transient transport" in blob:
+        return True
+    return any(
+        n in blob
+        for n in (
+            "server disconnected",
+            "without sending a response",
+            "remoteprotocolerror",
+            "connection reset",
+            "connection aborted",
+        )
+    ) and ("metrics error" in blob or "metrics transient" in blob)
+
 def _should_drop_uvicorn_lifespan_shutdown_event(event: dict[str, Any]) -> bool:
     """
     Uvicorn logs ``CancelledError`` / ``KeyboardInterrupt`` from the lifespan ASGI
@@ -278,6 +300,8 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str
         if _should_drop_pipeline_control_flow(event, hint):
             return None
         if _should_drop_openai_quota_log(event):
+            return None
+        if _should_drop_platform_metrics_transport_log(event):
             return None
         if _should_drop_async_shutdown_noise(event, hint):
             return None

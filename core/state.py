@@ -47,6 +47,13 @@ admin_settings_cache: Dict[str, Any] = {
         "updated_at": None,
         "updated_by": None,
     },
+    # AV-read operator one-button (see services/av_read_runtime_flags.py). Default off.
+    "av_read_operator_bundle_v1": {
+        "enabled": False,
+        "all": True,
+        "flags": {},
+        "floors_ack": False,
+    },
 }
 
 # Master-admin catalog overrides (merged with stages/entitlements TIER_CONFIG + TOPUP_PRODUCTS).

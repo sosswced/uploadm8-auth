@@ -201,13 +201,19 @@ def dedupe_platform_result_entries(items: list) -> list:
 
 
 def _platform_items_already_enriched(items: list) -> bool:
+    """True when identity *and* avatar are present — skip token merge.
+
+    Names without ``account_avatar`` must still merge from ``platform_tokens``
+    so Queue/Dashboard chips can show profile photos (not letter fallbacks).
+    """
     if not items:
         return True
     successful = [e for e in items if isinstance(e, dict) and e.get("success") is not False]
     return bool(
         successful
         and all(
-            e.get("account_username") or e.get("account_name") or e.get("account_id")
+            (e.get("account_username") or e.get("account_name") or e.get("account_id"))
+            and str(e.get("account_avatar") or "").strip()
             for e in successful
         )
     )
@@ -392,7 +398,8 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
     """PATCH fields: title, caption, hashtags, schedule, platforms, writing mix."""
     upload = await conn.fetchrow(
         """
-        SELECT id, status, platforms, schedule_metadata, scheduled_time, user_preferences
+        SELECT id, status, platforms, schedule_metadata, scheduled_time,
+               user_preferences, output_artifacts
         FROM uploads WHERE id = $1 AND user_id = $2
         """,
         upload_id,
@@ -408,30 +415,67 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
     params: List[Any] = [upload_id, user_id]
     param_count = 2
     applied: Dict[str, Any] = {}
+    artifacts_patch: Optional[Dict[str, Any]] = None
 
     if update_data.title is not None:
+        title = str(update_data.title).strip()
         param_count += 1
         updates.append(f"{_safe_col('title', cols)} = ${param_count}")
-        params.append(update_data.title)
-        applied["title"] = update_data.title
+        params.append(title)
+        param_count += 1
+        updates.append(f"{_safe_col('ai_generated_title', cols)} = ${param_count}")
+        params.append(title)
+        applied["title"] = title
 
     if update_data.caption is not None:
+        caption = str(update_data.caption).strip()
         param_count += 1
         updates.append(f"{_safe_col('caption', cols)} = ${param_count}")
-        params.append(update_data.caption)
-        applied["caption"] = update_data.caption
+        params.append(caption)
+        param_count += 1
+        updates.append(f"{_safe_col('ai_generated_caption', cols)} = ${param_count}")
+        params.append(caption)
+        applied["caption"] = caption
 
     if update_data.hashtags is not None:
+        tags = list(update_data.hashtags or [])
         param_count += 1
         updates.append(f"{_safe_col('hashtags', cols)} = ${param_count}")
-        params.append(update_data.hashtags)
-        applied["hashtags"] = update_data.hashtags
+        params.append(tags)
+        param_count += 1
+        updates.append(f"{_safe_col('ai_generated_hashtags', cols)} = ${param_count}")
+        params.append(tags)
+        applied["hashtags"] = tags
+        # User edit replaces AI/M8 tag variants so reopen + publish match the form.
+        artifacts_patch = coerce_jsonb_dict(upload.get("output_artifacts"))
+        artifacts_patch["m8_platform_hashtags"] = {}
 
-    if update_data.scheduled_time is not None:
+    mode_raw = (update_data.schedule_mode or "").strip().lower() if update_data.schedule_mode else ""
+    if mode_raw and mode_raw not in ("immediate", "scheduled", "smart"):
+        raise HTTPException(400, "schedule_mode must be immediate, scheduled, or smart")
+
+    # Publish Now: force immediate mode and due-now timestamp unless smart_schedule wins later.
+    if mode_raw == "immediate":
+        due = update_data.scheduled_time or _now_utc()
+        param_count += 1
+        updates.append(f"{_safe_col('scheduled_time', cols)} = ${param_count}")
+        params.append(due)
+        param_count += 1
+        updates.append(f"{_safe_col('schedule_mode', cols)} = ${param_count}")
+        params.append("immediate")
+        applied["scheduled_time"] = due.isoformat()
+        applied["schedule_mode"] = "immediate"
+    elif update_data.scheduled_time is not None:
         param_count += 1
         updates.append(f"{_safe_col('scheduled_time', cols)} = ${param_count}")
         params.append(update_data.scheduled_time)
         applied["scheduled_time"] = update_data.scheduled_time.isoformat()
+        # Moving off smart slots when the user picks a single datetime.
+        if mode_raw != "smart" and update_data.smart_schedule is None:
+            param_count += 1
+            updates.append(f"{_safe_col('schedule_mode', cols)} = ${param_count}")
+            params.append(mode_raw or "scheduled")
+            applied["schedule_mode"] = mode_raw or "scheduled"
 
     platforms_for_smart = list(upload["platforms"] or [])
     if update_data.platforms is not None:
@@ -456,6 +500,7 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
         updates.append(f"{_safe_col('schedule_mode', cols)} = ${param_count}")
         params.append("smart")
         applied["smart_schedule"] = metadata
+        applied["schedule_mode"] = "smart"
 
     if update_data.vehicle_make_id is not None or update_data.vehicle_model_id is not None:
         vm_id = update_data.vehicle_make_id
@@ -496,6 +541,11 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
         updates.append(f"{_safe_col('user_preferences', cols)} = ${param_count}::jsonb")
         params.append(json.dumps(merged))
         applied["writing_mix"] = mix
+
+    if artifacts_patch is not None:
+        param_count += 1
+        updates.append(f"{_safe_col('output_artifacts', cols)} = ${param_count}::jsonb")
+        params.append(json.dumps(artifacts_patch))
 
     if not updates:
         raise HTTPException(400, "No updates provided")

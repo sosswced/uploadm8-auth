@@ -84,6 +84,22 @@ def _pick_int(d: Dict[str, Any], *keys: str) -> int:
     return 0
 
 
+def _pick_int_max(d: Dict[str, Any], *keys: str) -> int:
+    """Max across aliases so views=0 does not hide play_count / video_views."""
+    best = 0
+    for k in keys:
+        if k not in d or d[k] is None:
+            continue
+        v = d[k]
+        if isinstance(v, bool):
+            continue
+        try:
+            best = max(best, max(0, int(round(float(v)))))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
 def entry_successful(e: Dict[str, Any]) -> bool:
     if e.get("success") is True:
         return True
@@ -95,7 +111,21 @@ def entry_metrics(e: Dict[str, Any], platform: str) -> Dict[str, int]:
     if platform == "facebook":
         likes_keys = ("reactions", "reaction_count", "likes", "like_count", "likeCount")
     return {
-        "views": _pick_int(e, "views", "view_count", "play_count", "playCount", "video_views", "impressions"),
+        "views": _pick_int_max(
+            e,
+            "views",
+            "view_count",
+            "video_view_count",
+            "play_count",
+            "playCount",
+            "plays",
+            "video_views",
+            "total_views",
+            "crossposted_views",
+            "fb_reels_total_plays",
+            "blue_reels_play_count",
+            "impressions",
+        ),
         "likes": _pick_int(e, *likes_keys),
         "comments": _pick_int(e, "comments", "comment_count", "commentCount"),
         "shares": _pick_int(e, "shares", "share_count", "shareCount"),
@@ -161,10 +191,35 @@ def _evidence_density_features(output_artifacts: Any, row: Dict[str, Any]) -> Di
         or str(_as_dict(oa.get("audio_context")).get("transcript") or "")
         or str(hr.get("transcript_phrase") or "")
     )
+    pack = _as_dict(oa.get("av_training_pack_v1"))
+    try:
+        from services.av_read_soft_bias import coarse_pack_flags
+
+        flags = coarse_pack_flags(oa)
+    except Exception:
+        flags = {
+            "pack_present": 1 if pack else 0,
+            "pack_tl_status": str(pack.get("tl_status") or "") or "na",
+            "pack_needs_deep_teacher": 1 if pack.get("needs_deep_teacher") else 0,
+        }
+    try:
+        kf_count = int(pack.get("keyframe_count") or 0)
+    except (TypeError, ValueError):
+        kf_count = 0
+    tl_status = str(flags.get("pack_tl_status") or "") or None
+    if tl_status in {"", "na"}:
+        tl_status = None
+    pack_present = int(flags.get("pack_present") or 0)
+    needs_deep = flags.get("pack_needs_deep_teacher")
     return {
         "grounding_score": grounding_score,
         "evidence_lane_count": int(lanes),
         "transcript_chars": len(transcript.strip()),
+        "pack_present": pack_present,
+        "pack_keyframe_count": kf_count,
+        "pack_tl_status": tl_status,
+        "pack_needs_deep_teacher": 1 if needs_deep else (0 if pack_present else None),
+        "pack_hero_class": str(flags.get("pack_hero_class") or "") or None,
     }
 
 

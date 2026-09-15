@@ -261,6 +261,7 @@ class PlatformResult:
     # Step A (accepted)
     platform_video_id: Optional[str] = None
     platform_url: Optional[str] = None
+    shortcode: Optional[str] = None
     publish_id: Optional[str] = None
 
     # Account identity — set by publish_stage so we always know which platform_tokens row was used
@@ -604,19 +605,24 @@ class JobContext:
 
         from core.vision_labels import HASHTAG_BODY_MAX_LEN, is_junk_hashtag_body
 
-        # ── Merge with ledger reserve (FactLedger / evidence AI tags first) ─
-        # Always/platform can otherwise fill maxHashtags and starve music/geo/vehicle.
+        # ── Merge: Always first (user intent), then ledger reserve, then rest ─
+        # Always must never be starved by AI/evidence under maxHashtags.
         base = coerce_hashtag_list(self.hashtags)
         ai = coerce_hashtag_list(self.ai_hashtags)
 
         try:
-            raw_cap = us.get("maxHashtags")
-            if raw_cap is None:
-                raw_cap = us.get("max_hashtags")
-            cap = int(raw_cap) if raw_cap is not None and str(raw_cap).strip() != "" else 50
-        except (TypeError, ValueError):
-            cap = 50
-        cap = max(1, min(cap, 50))
+            from core.hashtag_prefs import resolve_hashtag_ceiling
+
+            cap = resolve_hashtag_ceiling(us)
+        except Exception:
+            try:
+                raw_cap = us.get("maxHashtags")
+                if raw_cap is None:
+                    raw_cap = us.get("max_hashtags")
+                cap = int(raw_cap) if raw_cap is not None and str(raw_cap).strip() != "" else 50
+            except (TypeError, ValueError):
+                cap = 50
+            cap = max(1, min(cap, 50))
         reserve_n = min(8, cap)
 
         reserved_bodies: List[str] = []
@@ -651,13 +657,8 @@ class JobContext:
                                 slug = slug or ""
                         if slug:
                             reserved_bodies.append(slug)
-                # Hydration already padded ai/m8 ledger-first — keep those early.
-                for src in list(m8_tags)[:reserve_n] + list(ai)[:reserve_n]:
-                    reserved_bodies.extend(
-                        normalize_hashtag_bodies(
-                            [str(src)], max_len=HASHTAG_BODY_MAX_LEN
-                        )
-                    )
+                # Do not pad m8/ai into reserved — that starves upload/base tags under a tight cap.
+                # Ledger fact slugs above already claim early slots when present.
         except Exception:
             reserved_bodies = []
 
@@ -678,11 +679,21 @@ class JobContext:
         seen: set = set()
         merged: List[str] = []
 
+        # Always first — never junk-gate user Always tags.
+        for tag in always_tags:
+            for body in normalize_hashtag_bodies([str(tag)], max_len=HASHTAG_BODY_MAX_LEN):
+                if not body or body in seen or body in blocked_set:
+                    continue
+                seen.add(body)
+                merged.append(f"#{body}")
+
         for body in reserved_clean:
+            if body in seen or body in blocked_set:
+                continue
             seen.add(body)
             merged.append(f"#{body}")
 
-        for tag in always_tags + platform_tags + base + m8_tags + ai:
+        for tag in platform_tags + base + m8_tags + ai:
             for body in normalize_hashtag_bodies([str(tag)], max_len=HASHTAG_BODY_MAX_LEN):
                 if not body or body in seen or body in blocked_set:
                     continue

@@ -31,7 +31,8 @@ async def my_connection_readiness(
     if core.state.db_pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
-    bill_id = await resolve_billing_user_id(user)
+    # resolve_billing_user_id is sync (returns str); awaiting it 500s the Platforms page.
+    bill_id = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
         return await connection_readiness_report(
             conn, user_id=str(bill_id), detail_limit=int(detail_limit)

@@ -67,7 +67,13 @@ async def trigger_catalog_sync(
 
 @router.get("/api/catalog/sync-status")
 async def get_catalog_sync_status(user: dict = Depends(_session_user)):
-    """Return per-token sync state (platform, status, last_synced_at, cursor, counts)."""
+    """
+    Per-token sync state plus tenant PCI health.
+
+    Shape: ``{ tokens, pci_likes_without_views, has_more_pages }``.
+    Legacy clients that expect a bare array should read ``tokens``.
+    """
+    uid = user["id"]
     async with core.state.db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -78,9 +84,32 @@ async def get_catalog_sync_status(user: dict = Depends(_session_user)):
             WHERE s.user_id = $1
             ORDER BY s.last_synced_at DESC NULLS LAST
             """,
-            user["id"],
+            uid,
         )
-    return [
+        health = await conn.fetchrow(
+            """
+            SELECT
+              (
+                SELECT COUNT(*)::int FROM platform_content_items
+                 WHERE user_id = $1::uuid
+                   AND lower(platform) IN ('instagram', 'facebook')
+                   AND COALESCE(views, 0) = 0
+                   AND (
+                     COALESCE(likes, 0) > 0
+                     OR COALESCE(comments, 0) > 0
+                     OR COALESCE(shares, 0) > 0
+                   )
+              ) AS pci_likes_without_views,
+              (
+                SELECT EXISTS(
+                  SELECT 1 FROM platform_content_sync_state
+                   WHERE user_id = $1::uuid AND next_cursor IS NOT NULL
+                )
+              ) AS has_more_pages
+            """,
+            uid,
+        )
+    tokens = [
         {
             "platform": r["platform"],
             "account_id": r["account_id"],
@@ -93,6 +122,11 @@ async def get_catalog_sync_status(user: dict = Depends(_session_user)):
         }
         for r in rows
     ]
+    return {
+        "tokens": tokens,
+        "pci_likes_without_views": int(health["pci_likes_without_views"] or 0) if health else 0,
+        "has_more_pages": bool(health["has_more_pages"]) if health else False,
+    }
 
 
 @router.get("/api/catalog/content")

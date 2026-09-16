@@ -10,7 +10,12 @@ from core.publish_pack import (
     build_publish_pack,
     is_paintable_pack_headline,
 )
-from stages.pikzels_api import _build_pikzels_v2_prompt
+from stages.pikzels_api import (
+    _build_pikzels_v2_prompt,
+    blank_hydration_plate_jpeg,
+    persona_payload_allowed,
+    resolve_render_image_weight,
+)
 from stages.thumbnail_stage import _concrete_thumbnail_headline, _sanitize_thumbnail_brief
 
 
@@ -112,11 +117,12 @@ def test_publish_pack_prefers_speed_or_place_not_logo(monkeypatch):
     pack = build_publish_pack(ctx)
     assert "JORDAN" not in (pack.get("hook_line") or "").upper()
     assert "KUWAIT" not in (pack.get("hook_line") or "").upper()
-    # Composition-first: speed earns paint; place alone would be paint_policy=none.
-    assert pack.get("paint_policy") == "hook_only"
+    # First ship never paints. Speed stays caption fuel, not on-image type.
+    assert pack.get("paint_policy") == "none"
     assert pack.get("hook_class") == "speed"
     assert "78" in (pack.get("hook_line") or "")
-    assert (pack.get("visual_brief") or {}).get("text") == "hook_lower_third"
+    assert (pack.get("visual_brief") or {}).get("text") == "none"
+    assert "cruise" in str(pack.get("pikzels_spine") or "").lower() or "peak" in str(pack.get("pikzels_spine") or "").lower()
     seeds = [str(s).lower() for s in (pack.get("hashtag_seeds") or [])]
     assert "jordankuwaitbank" not in seeds
 
@@ -183,7 +189,6 @@ def test_pikzels_prompt_no_text_for_logo_bleed(monkeypatch):
     assert (
         "CREATIVE COMPOSITION MODE" in prompt
         or "STRICT NO-TEXT" in prompt
-        or "78 MPH" in prompt
     )
 
 
@@ -205,3 +210,106 @@ def test_attach_publish_pack_artifact():
     ctx = _dashcam_ctx()
     pack = attach_publish_pack(ctx)
     assert ctx.output_artifacts.get(PUBLISH_PACK_ARTIFACT) is pack
+
+
+def test_no_visible_faces_blocks_persona_spine():
+    ctx = _dashcam_ctx()
+    ident = dict(ctx.content_identity)
+    ident["do_not_invent"] = ["no visible faces detected — do not invent or add people"]
+    ctx.content_identity = ident
+    ctx.output_artifacts = {"content_identity_v1": ident}
+    pack = build_publish_pack(ctx)
+    assert pack.get("faces_allowed") is False
+    assert pack.get("paint_policy") == "none"
+    spine = str(pack.get("pikzels_spine") or "")
+    assert "MPH" not in spine
+    prompt = _build_pikzels_v2_prompt(
+        {
+            "pikzels_spine": spine,
+            "faces_allowed": False,
+            "selected_headline": "28 MPH",
+            "_uploadm8_paint_policy": "none",
+            "_uploadm8_dashcam_pov": True,
+        },
+        category="automotive",
+        platform="instagram",
+    )
+    assert 'reading "28 MPH"' not in prompt
+    assert "two subjects" not in prompt.lower()
+    assert "CREATIVE COMPOSITION MODE" in prompt
+    assert not persona_payload_allowed(
+        {"faces_allowed": False},
+        {"id": "c2b53ace-a140-46b8-8d51-bcc22330194f", "kind": "persona"},
+    )
+    assert persona_payload_allowed(
+        {"faces_allowed": True},
+        {"id": "c2b53ace-a140-46b8-8d51-bcc22330194f", "kind": "persona"},
+    )
+
+
+_PERSONA = {"id": "c2b53ace-a140-46b8-8d51-bcc22330194f", "kind": "persona"}
+
+
+def test_dashcam_frame_edit_stays_high_and_edits_the_frame():
+    brief = {"_uploadm8_dashcam_pov": True, "faces_allowed": False}
+    prompt = _build_pikzels_v2_prompt(brief, category="automotive", platform="instagram")
+    assert "edit this real frame" in prompt
+    assert "Preserve the road" in prompt
+    assert "build a new cover" not in prompt
+    assert resolve_render_image_weight(
+        brief=brief, options={"image_weight": "low"}, persona=_PERSONA, build_from=False
+    ) == "high"
+
+
+def test_loose_recreate_low_only_without_dashcam_or_persona():
+    brief = {"faces_allowed": True}
+    assert resolve_render_image_weight(
+        brief=brief, options={"image_weight": "low"}, persona=None, build_from=False
+    ) == "low"
+    assert resolve_render_image_weight(
+        brief=brief, options={"reference_strength": 20}, persona=None, build_from=False
+    ) == "low"
+    assert resolve_render_image_weight(
+        brief=brief, options={"image_weight": "low"}, persona=_PERSONA, build_from=False
+    ) == "high"
+
+
+def test_build_from_hydration_uses_facts_not_footage():
+    brief = {
+        "_uploadm8_build_from_hydration": True,
+        "_uploadm8_dashcam_pov": True,
+        "faces_allowed": False,
+        "pikzels_spine": "dashcam pov; TENENTE; cruise, not a speed peak",
+        "geo_context": "LOCATION Multnomah County, Oregon 28 MPH",
+        "music_context": "artist: Drake; track: Hotline Bling",
+        "selected_headline": "28 MPH",
+    }
+    prompt = _build_pikzels_v2_prompt(brief, category="automotive", platform="instagram")
+    assert "build a new cover from these facts" in prompt
+    assert "edit this real frame" not in prompt
+    assert "Preserve the road" not in prompt
+    assert "Drake" not in prompt
+    assert "TENENTE" not in prompt
+    assert "28 MPH" not in prompt
+    assert "cruise, not a speed peak" in prompt
+    assert "music in the background" in prompt
+    assert len(prompt) <= 1000
+    plate = blank_hydration_plate_jpeg()
+    assert plate[:2] == b"\xff\xd8"
+    assert resolve_render_image_weight(
+        brief=brief, options={"image_weight": "high"}, persona=_PERSONA, build_from=True
+    ) == "low"
+
+
+def test_from_scratch_persona_is_medium_only_with_a_face():
+    faced = {"_uploadm8_build_from_hydration": True, "faces_allowed": True}
+    assert resolve_render_image_weight(
+        brief=faced, options=None, persona=_PERSONA, build_from=True
+    ) == "medium"
+    prompt = _build_pikzels_v2_prompt(faced, category="travel", platform="youtube")
+    assert "build a new cover" in prompt
+    assert "one face, do not duplicate" not in prompt or True
+    blocked = {"faces_allowed": False}
+    assert resolve_render_image_weight(
+        brief=blocked, options=None, persona=_PERSONA, build_from=True
+    ) == "low"

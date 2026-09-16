@@ -158,9 +158,71 @@ def fit_pikzels_prompt_to_budget(prompt: str, cap: Optional[int] = None) -> str:
     return s
 
 
+def persona_payload_allowed(brief: Any, persona: Any) -> bool:
+    """Persona UUID only when the frame actually has a face."""
+    if not isinstance(persona, dict) or not persona:
+        return False
+    if not str(persona.get("id") or persona.get("pikzonality_id") or "").strip():
+        return False
+    if isinstance(brief, dict):
+        if brief.get("faces_allowed") is False or brief.get("_uploadm8_faces_allowed") is False:
+            return False
+    return True
+
+
+def blank_hydration_plate_jpeg() -> bytes:
+    """Neutral plate so /v2/thumbnail/image can build without copying the footage."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (64, 36), (28, 28, 28)).save(buf, format="JPEG", quality=70)
+    return buf.getvalue()
+
+
+def resolve_render_image_weight(
+    *,
+    brief: Any,
+    options: Any,
+    persona: Any,
+    build_from: bool,
+) -> str:
+    """Two levels. Do not mix them. Dashcam stays high unless from-scratch is explicit."""
+    brief = brief if isinstance(brief, dict) else {}
+    if build_from:
+        return "medium" if persona_payload_allowed(brief, persona) else "low"
+    if brief.get("_uploadm8_dashcam_pov"):
+        return "high"
+    user_low = False
+    if isinstance(options, dict):
+        ow = str(options.get("image_weight") or "").strip().lower()
+        if ow == "low":
+            user_low = True
+        else:
+            rs = options.get("reference_strength")
+            if isinstance(rs, (int, float)):
+                try:
+                    user_low = int(rs) <= 34
+                except (TypeError, ValueError):
+                    user_low = False
+    has_persona = bool(
+        isinstance(persona, dict)
+        and str(persona.get("id") or persona.get("pikzonality_id") or "").strip()
+    )
+    if user_low and not has_persona:
+        return "low"
+    if isinstance(options, dict):
+        ow = str(options.get("image_weight") or "").strip().lower()
+        if ow in ("medium", "high"):
+            return ow
+    return "high"
+
+
 def clamp_pikzels_image_prompt(prompt: str) -> str:
     """Final guard before POST — abbreviate and never exceed Pikzels API hard limit."""
     return fit_pikzels_prompt_to_budget(str(prompt or "").strip())
+
 
 # Internal-only brief notes that must never block hydration or consume prompt budget.
 _THUMB_NOTES_PLACEHOLDERS = frozenset({"No AI — evidence-based brief", "Fallback brief"})
@@ -433,31 +495,58 @@ def _build_pikzels_v2_prompt(
             # Fail closed: never paint place/logo banners if pack gate unavailable.
             return bool(re.search(r"\b\d{1,3}\s*mph\b", h, re.IGNORECASE))
 
-    painting = _headline_is_concrete(headline)
-    if painting:
-        parts.append(
-            f'Render exactly one short speed hook reading "{headline[:30]}" in large bold '
-            "display typography in the lower third. NO OTHER text, banners, LOCATION labels, "
-            "or business names anywhere else on the image."
+    # One contract. Opening is always the same shape. Hydration is the next sentence.
+    painting = False
+    faces_ok = not (
+        isinstance(brief, dict)
+        and (
+            brief.get("faces_allowed") is False
+            or brief.get("_uploadm8_faces_allowed") is False
         )
+    )
+    build_from = bool(isinstance(brief, dict) and brief.get("_uploadm8_build_from_hydration"))
+    if build_from:
+        opening = (
+            "CREATIVE COMPOSITION MODE: build a new cover from these facts, stay accurate, "
+            "no typography, do not invent people, places, or brands."
+        )
+        if not faces_ok:
+            opening += " Do not add faces, rivalry, or reaction shots."
     else:
-        # Keep this preamble compact — Pikzels caps prompts ~1000 chars; fidelity + hydration
-        # cues must survive fit_pikzels_prompt_to_budget.
-        parts.append(
-            "CREATIVE COMPOSITION MODE: AI-heavy, fun, energetic, authentic thumbnail of THIS "
-            "frame — realistic and accurate; do not invent people/places/brands. Hydration cues "
-            "are mood/energy only. STRICT NO-TEXT: no letters, captions, LOCATION banners, "
-            "business OCR, filenames, or clickbait (UNBELIEVABLE MOMENTS, EVENT MOMENTS, "
-            "MUST WATCH, WATCH THIS, EPIC MOMENT)."
+        opening = (
+            "CREATIVE COMPOSITION MODE: edit this real frame, stay accurate, no typography, "
+            "persona only as likeness when a face exists."
         )
+        if dashcam_pov:
+            opening += " Preserve the road."
+            if not faces_ok:
+                opening += " Do not add faces, rivalry, or reaction shots."
+        elif not faces_ok:
+            opening += " Do not invent people or faces."
+    opening += (
+        " STRICT NO-TEXT: no letters, LOCATION banners, "
+        "or giant digits (UNBELIEVABLE MOMENTS, EVENT MOMENTS, MUST WATCH, WATCH THIS)."
+    )
+    parts.append(opening)
+    if build_from:
+        from core.publish_pack import brand_safe_scene_spine
 
-    if dashcam_pov:
-        parts.append(_DASHCAM_POV_FIDELITY_GUARD)
+        spine = brand_safe_scene_spine(brief if isinstance(brief, dict) else {})
+    else:
+        spine = str(brief.get("pikzels_spine") or brief.get("_uploadm8_pikzels_spine") or "").strip()
+        if not spine:
+            story = str(brief.get("hydration_story") or "").strip()
+            geo_line = str(brief.get("geo_context") or "").strip()
+            spine = story or geo_line
+            spine = re.sub(r"(?i)\b\d{1,3}\s*mph\b", "motion", spine)
+            spine = re.sub(r"(?i)\blocation\b", "", spine)
+    if spine and not re.search(r"(?i)\b(?:img_\d+|filename)\b", spine):
+        parts.append("Scene direction (do NOT render as text): " + spine[:220])
 
     prioritized: List[str] = []
 
     hp = hydration_payload if isinstance(hydration_payload, dict) else None
-    if hp:
+    if hp and not build_from:
         ev = hp.get("evidence") if isinstance(hp.get("evidence"), dict) else {}
         geo = ev.get("geo") if isinstance(ev.get("geo"), dict) else {}
         road = str(geo.get("road") or "").strip()
@@ -494,9 +583,15 @@ def _build_pikzels_v2_prompt(
         msm = osd.get("max_speed_mph")
         if msm is not None:
             try:
-                osd_parts.append(f"spd {float(msm):.0f}mph")
+                v = float(msm)
+                if v >= 50:
+                    osd_parts.append("peak effort")
+                elif v >= 10:
+                    osd_parts.append("cruise energy")
+                else:
+                    osd_parts.append("steady energy")
             except (TypeError, ValueError):
-                osd_parts.append(f"spd {msm}mph")
+                osd_parts.append("motion energy")
         # Driver names invite short OCR-style stamps (e.g. TENENTE) — only when painting MPH.
         if painting:
             dn = str(osd.get("driver_name") or "").strip()
@@ -509,190 +604,41 @@ def _build_pikzels_v2_prompt(
             prioritized.append("OSD: " + "; ".join(osd_parts)[:160])
 
         mus = ev.get("music") if isinstance(ev.get("music"), dict) else {}
-        ma, mt = str(mus.get("artist") or "").strip(), str(mus.get("title") or "").strip()
-        if ma or mt:
-            music_line = " — ".join(p for p in (ma, mt) if p)[:140]
-            if painting:
-                prioritized.append("Music: " + music_line)
-            else:
-                prioritized.append(
-                    "Audio energy (composition only, do NOT render song/artist as text): "
-                    + music_line
-                )
+        if str(mus.get("artist") or "").strip() or str(mus.get("title") or "").strip():
+            prioritized.append("Audio energy (composition only, do NOT render song or artist as text): music in the background")
 
         # Skip raw speech/lyrics in image prompts — often trip Pikzels content 400s
         # and do not help dashcam composition (music artist/title above is enough).
 
+        # OCR, logos, driver names, song titles, and Trill labels stay caption fuel.
         vis = ev.get("vision") if isinstance(ev.get("vision"), dict) else {}
         vlabels = vis.get("labels") if isinstance(vis.get("labels"), list) else []
         if vlabels:
             prioritized.append(
-                "Vis: " + ", ".join(str(x) for x in vlabels[:8])[:160]
-            )
-        # OCR/logo lines invite business plaster (MSC, Jordan Kuwait Bank) — never in
-        # composition-first prompts; only when we are already painting a speed hook.
-        voc = str(vis.get("ocr") or "").strip()[:100]
-        if voc and painting:
-            prioritized.append(f"OCR: {voc}")
-
-        tri = ev.get("trill") if isinstance(ev.get("trill"), dict) else {}
-        tbuck = str(tri.get("bucket") or "").strip()
-        tsco = tri.get("score")
-        if tbuck or tsco is not None:
-            if tsco is not None:
-                try:
-                    prioritized.append(
-                        f"Trill: bkt {tbuck} sc {float(tsco):.0f}"[:80] if tbuck else f"Trill: sc {float(tsco):.0f}"[:40]
-                    )
-                except (TypeError, ValueError):
-                    if tbuck:
-                        prioritized.append(f"Trill: {tbuck}"[:60])
-            elif tbuck:
-                prioritized.append(f"Trill: {tbuck}"[:60])
-
-        cfs = str(hp.get("fusion_summary") or "").strip()
-        if cfs:
-            if painting:
-                prioritized.append("Fusion: " + cfs[:280])
-            else:
-                prioritized.append(
-                    "Fusion vibe (composition only, do NOT render brands/names as text): "
-                    + cfs[:200]
-                )
-
-        hstory = str(hp.get("hydration_story") or "").strip()
-        if hstory and not is_empty_hydration_story_fallback(hstory):
-            if painting:
-                prioritized.append("Story: " + hstory[:220])
-            else:
-                prioritized.append(
-                    "Story vibe (composition only, do NOT render as text): "
-                    + hstory[:180]
-                )
-
-        anch = str(hp.get("anchor_phrase") or "").strip()
-        if anch:
-            prioritized.append(f"Anchor: {anch[:120]}")
-
-        sigs = hp.get("signal_hashtags")
-        if isinstance(sigs, list) and sigs:
-            prioritized.append(
-                "Tags: " + ", ".join(str(x) for x in sigs[:8])[:120]
+                "Vis (do not render as text): " + ", ".join(str(x) for x in vlabels[:6])[:120]
             )
 
-    fusion = str(brief.get("fusion_summary") or "").strip()
-    if fusion and not any(p.startswith("Fusion") for p in prioritized):
-        if painting:
-            prioritized.append(f"Fusion: {fusion[:280]}")
-        else:
-            prioritized.append(
-                "Fusion vibe (composition only, do NOT render brands/names as text): "
-                + fusion[:200]
-            )
+    # Caption, layout names, OCR, and song titles are other bosses. Do not append them.
+    fusion = ""
+    hydration_story_slice = ""
 
-    hydration_story_slice = str(brief.get("hydration_story") or "").strip()
-    if (
-        hydration_story_slice
-        and not is_empty_hydration_story_fallback(hydration_story_slice)
-        and len(fusion) < 120
-        and not any(p.startswith("Story") for p in prioritized)
-    ):
-        if painting:
-            prioritized.append(f"Story: {hydration_story_slice[:220]}")
-        else:
-            prioritized.append(
-                "Story vibe (composition only, do NOT render as text): "
-                + hydration_story_slice[:180]
-            )
-
-    text_brief = str(brief.get("pikzels_text_brief") or brief.get("engine_text_brief") or "").strip()
-    if text_brief:
-        prioritized.append(f"Brief: {text_brief[:240]}")
-
-    default_strategy = brief.get("default_strategy")
-    if isinstance(default_strategy, dict) and default_strategy:
-        ds_bits: List[str] = []
-        if default_strategy.get("layout_name") or default_strategy.get("layout_pattern"):
-            ds_bits.append(
-                f"{str(default_strategy.get('layout_name') or '').strip()} {str(default_strategy.get('layout_pattern') or '').strip()}".strip()
-            )
-        if default_strategy.get("audience_niche"):
-            ds_bits.append(f"audience {str(default_strategy.get('audience_niche')).replace('_', ' ')}")
-        if default_strategy.get("competitor_gap_mode"):
-            ds_bits.append("differentiated competitor-gap variant")
-        if ds_bits:
-            prioritized.append(
-                "User-selected default thumbnail strategy: "
-                + "; ".join(ds_bits)[:360]
-                + ". Keep this layout family consistent while adapting content to this upload's evidence."
-            )
-
-    notes = str(brief.get("notes") or "").strip()
-    if notes and notes not in _THUMB_NOTES_PLACEHOLDERS and len(notes) <= 220:
-        prioritized.append(notes)
-
-    geo_context = str(brief.get("geo_context") or "").strip()
+    geo_context = "" if build_from else str(brief.get("geo_context") or "").strip()
     if geo_context and not any(
         p.startswith("Geo:") or p.startswith("Scene vibe") for p in prioritized
     ):
-        if painting:
-            prioritized.append(f"Geo: {geo_context[:200]}")
-        else:
-            prioritized.append(
-                "Scene vibe (composition only, do NOT render as text): "
-                + geo_context[:160]
-            )
+        prioritized.append(
+            "Scene vibe (composition only, do NOT render as text): "
+            + geo_context[:160]
+        )
 
-    osd_context = str(brief.get("osd_context") or "").strip()
-    if osd_context and not any(p.startswith("OSD:") for p in prioritized):
-        prioritized.append(f"OSD: {osd_context[:160]}")
+    music_context = "" if build_from else str(brief.get("music_context") or "").strip()
+    if music_context and not any(p.startswith("Audio energy") for p in prioritized):
+        prioritized.append(
+            "Audio energy (composition only, do NOT render song or artist as text): music in the background"
+        )
 
-    trill_context = str(brief.get("trill_context") or "").strip()
-    if trill_context and not any(p.startswith("Trill:") for p in prioritized):
-        prioritized.append(f"Trill: {trill_context[:120]}")
-
-    music_context = str(brief.get("music_context") or "").strip()
-    if music_context and not any(
-        p.startswith("Music:") or p.startswith("Audio energy") for p in prioritized
-    ):
-        if painting:
-            prioritized.append(f"Music: {music_context[:140]}")
-        else:
-            prioritized.append(
-                "Audio energy (composition only, do NOT render song/artist as text): "
-                + music_context[:140]
-            )
-
-    # speech_context intentionally omitted from image prompts (content-filter / lyric noise).
-
-    signal_hashtags = str(brief.get("signal_hashtags") or "").strip()
-    if signal_hashtags and not any(p.startswith("Tags:") for p in prioritized):
-        prioritized.append(f"Tags: {signal_hashtags[:120]}")
-
+    # Hashtags, badges, and lower-thirds are caption voices. Do not append them.
     styling: List[str] = []
-    # Badge/direction props invite extra on-image words — only when painting MPH.
-    if not dashcam_pov and painting:
-        badge_text = str(brief.get("badge_text") or "").strip()
-        badge_style = str(brief.get("badge_style") or "").strip().lower()
-        if badge_text:
-            if badge_style:
-                styling.append(f'a {badge_style} circular badge with the word "{badge_text[:14]}"')
-            else:
-                styling.append(f'a circular badge with the word "{badge_text[:14]}"')
-
-        direction = str(brief.get("directional_element") or "").strip().lower()
-        if direction and direction not in ("none", "null"):
-            styling.append(f"a bold {direction} directional element pointing at the subject")
-
-        props = brief.get("props") or []
-        if isinstance(props, list):
-            clean_props = [str(p).strip() for p in props if isinstance(p, (str, int, float)) and str(p).strip()]
-            if clean_props:
-                styling.append(f"props: {', '.join(clean_props[:5])}")
-
-        emotion = str(brief.get("emotion_cue") or "").strip().lower()
-        if emotion:
-            styling.append(_EMOTION_HINTS.get(emotion, f"{emotion} facial expression"))
 
     color_mood = str(brief.get("color_mood") or "").strip().lower()
     if color_mood:
@@ -700,9 +646,7 @@ def _build_pikzels_v2_prompt(
 
     plat_color = str(platform_color or "").strip()
     if plat_color:
-        styling.append(
-            f"platform badge and corner indicator use solid color {plat_color}"
-        )
+        styling.append(f"color grade toward {plat_color}")
     accent = str(accent_color or "").strip()
     if accent:
         styling.append(
@@ -716,11 +660,12 @@ def _build_pikzels_v2_prompt(
     canvas_hint = "16:9 YT" if (platform or "").lower() == "youtube" else "9:16 vert, safe crop"
     tail.append(canvas_hint)
 
-    if dashcam_pov:
+    if build_from:
+        tail.append("New composition from the scene facts only; no footage copy")
+    elif dashcam_pov:
         tail.append("Natural cinematic grade on existing scene only; no new subjects")
     else:
         tail.append("Ground on supplied frame; match visible content")
-        tail.append("YT thumb style: hi contrast, sharp subj, dramatic light — composition not caption banners")
 
     ordered = parts + prioritized + styling + tail
     prompt = ". ".join(p for p in ordered if p)
@@ -982,15 +927,24 @@ async def render_thumbnail_with_studio_renderer(
                     pass
                 return False
 
-    try:
-        frame_bytes = _jpeg_bytes_for_pikzels_frame(base_frame_path)
-    except (OSError, PermissionError, ValueError) as e:
-        logger.warning("[thumb-renderer] failed preparing source frame for Pikzels: %s", e)
-        return False
-    if not frame_bytes:
-        logger.warning("[thumb-renderer] source frame is empty: %s", base_frame_path)
-        return False
-    frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
+    build_from = bool(isinstance(brief, dict) and brief.get("_uploadm8_build_from_hydration"))
+    frame_b64 = ""
+    if build_from:
+        try:
+            frame_b64 = base64.b64encode(blank_hydration_plate_jpeg()).decode("ascii")
+        except Exception as e:
+            logger.warning("[thumb-renderer] blank plate failed: %s", e)
+            return False
+    else:
+        try:
+            frame_bytes = _jpeg_bytes_for_pikzels_frame(base_frame_path)
+        except (OSError, PermissionError, ValueError) as e:
+            logger.warning("[thumb-renderer] failed preparing source frame for Pikzels: %s", e)
+            return False
+        if not frame_bytes:
+            logger.warning("[thumb-renderer] source frame is empty: %s", base_frame_path)
+            return False
+        frame_b64 = base64.b64encode(frame_bytes).decode("ascii")
 
     plat = (platform or "").strip().lower()
     fmt = _PLATFORM_FORMAT.get(plat, "16:9")
@@ -1019,29 +973,22 @@ async def render_thumbnail_with_studio_renderer(
         accent_color=color_map.get("accent"),
     )
 
-    iw = "medium"
-    explicit_weight = False
-    if isinstance(options, dict):
-        ow = str(options.get("image_weight") or "").strip().lower()
-        if ow in ("low", "medium", "high"):
-            iw = ow
-            explicit_weight = True
-        else:
-            rs = options.get("reference_strength")
-            if isinstance(rs, (int, float)):
-                try:
-                    iw = closeness_to_pikzels_image_weight(int(rs))
-                    explicit_weight = True
-                except (TypeError, ValueError):
-                    pass
-    has_persona = bool(
-        isinstance(persona, dict)
-        and str(persona.get("id") or persona.get("pikzonality_id") or "").strip()
+    iw = resolve_render_image_weight(
+        brief=brief,
+        options=options,
+        persona=persona,
+        build_from=build_from,
     )
-    if isinstance(brief, dict) and brief.get("_uploadm8_dashcam_pov"):
-        iw = "high"
-    elif not explicit_weight and not has_persona:
-        iw = "high"
+    explicit_weight = True
+    if not build_from and not (isinstance(brief, dict) and brief.get("_uploadm8_dashcam_pov")):
+        if not (
+            isinstance(options, dict)
+            and (
+                str(options.get("image_weight") or "").strip().lower() in ("low", "medium", "high")
+                or isinstance(options.get("reference_strength"), (int, float))
+            )
+        ):
+            explicit_weight = False
 
     payload: Dict[str, Any] = {
         "prompt": prompt,
@@ -1064,17 +1011,19 @@ async def render_thumbnail_with_studio_renderer(
         structured = brief.get("_uploadm8_strategy_structured") if isinstance(
             brief.get("_uploadm8_strategy_structured"), dict
         ) else {}
-    if structured:
+    if structured and not build_from and not (isinstance(brief, dict) and brief.get("_uploadm8_dashcam_pov")):
         bits = []
-        fk = str(structured.get("format_key") or "").strip()
-        lp = str(structured.get("layout_pattern") or structured.get("layout_name") or "").strip()
-        if fk:
-            bits.append(f"layout format {fk}")
+        from core.publish_pack import scrub_studio_layout_text
+
+        lp = scrub_studio_layout_text(
+            structured.get("layout_pattern") or structured.get("layout_name") or "",
+            dashcam=False,
+        )
         if lp:
-            bits.append(f"composition {lp.replace('_', ' ')}")
+            bits.append(f"grade {lp}")
         emo = str(structured.get("emotion") or "").strip()
-        if emo:
-            bits.append(f"{emo} emotion")
+        if emo and emo.lower() not in {"shock", "rage"}:
+            bits.append(f"{emo} energy")
         if bits:
             payload["prompt"] = clamp_pikzels_image_prompt(
                 f"{payload['prompt']}. " + "; ".join(bits)
@@ -1108,6 +1057,8 @@ async def render_thumbnail_with_studio_renderer(
     if strip_support_for_persona:
         _sup_ref = ""
 
+    if build_from:
+        _sup_ref = ""
     if _sup_ref.startswith("https://") and _model_lc in ("pkz_4", "pkz_4_5"):
         payload["support_image_url"] = _sup_ref[:2000]
         logger.info(
@@ -1122,7 +1073,7 @@ async def render_thumbnail_with_studio_renderer(
             upload_id,
         )
 
-    if isinstance(persona, dict) and persona:
+    if persona_payload_allowed(brief, persona):
         pid = str(persona.get("id") or persona.get("pikzonality_id") or "").strip()
         if pid:
             try:
@@ -1163,21 +1114,13 @@ async def render_thumbnail_with_studio_renderer(
     if isinstance(options, dict) and options:
         style_hint = str(options.get("style_hint") or "").strip()
 
-    if persona_uuid_set and isinstance(options, dict) and options:
-        ps = options.get("persona_strength")
-        if isinstance(ps, (int, float)):
-            try:
-                psv = max(0, min(100, int(ps)))
-            except (TypeError, ValueError):
-                psv = 70
-            if psv >= 67:
-                hint = "Strong match to the creator persona reference face and style."
-            elif psv <= 33:
-                hint = "Light persona influence; keep composition bold but subtle on the face."
-            else:
-                hint = "Balanced use of the creator persona reference."
-            merged = f"{payload['prompt']}. {hint}".strip()
-            payload["prompt"] = merged[:_PIKZELS_IMAGE_PROMPT_MAX]
+    if persona_uuid_set:
+        payload["image_weight"] = "medium" if build_from else "high"
+        likeness = "likeness only, one face, do not duplicate"
+        if likeness not in str(payload.get("prompt") or ""):
+            payload["prompt"] = clamp_pikzels_image_prompt(
+                f"{payload.get('prompt') or ''}. {likeness}"
+            )
     elif style_uuid_set:
         payload["prompt"] = (
             f"{payload['prompt']}. Follow the selected Pikzels style reference while preserving the source frame subject.".strip()[
@@ -1191,6 +1134,13 @@ async def render_thumbnail_with_studio_renderer(
         )
 
     # Append visual style last and reserve budget so truncation does not drop it.
+    if style_hint:
+        from core.publish_pack import scrub_studio_layout_text
+
+        style_hint = scrub_studio_layout_text(
+            style_hint,
+            dashcam=bool(isinstance(brief, dict) and brief.get("_uploadm8_dashcam_pov")),
+        )
     if style_hint:
         suffix = f". Visual style: {style_hint[:180]}"
         base = str(payload.get("prompt") or "")

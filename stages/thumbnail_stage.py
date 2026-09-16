@@ -576,6 +576,10 @@ def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], 
     # Composition-first default: never imply hook_only when pack omitted policy.
     out["_uploadm8_paint_policy"] = paint_policy or "none"
     out["_uploadm8_hook_class"] = str(pack.get("hook_class") or "")[:32]
+    out["_uploadm8_pikzels_spine"] = str(pack.get("pikzels_spine") or "")[:280]
+    out["pikzels_spine"] = out["_uploadm8_pikzels_spine"]
+    out["faces_allowed"] = bool(pack.get("faces_allowed", True))
+    out["_uploadm8_faces_allowed"] = out["faces_allowed"]
     if pack.get("hook_line"):
         out["selected_headline"] = pack.get("hook_line")
 
@@ -1187,14 +1191,8 @@ def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict
     strategy = _thumbnail_default_strategy(us)
     if strategy:
         parts: List[str] = []
-        if strategy.get("layout_name") or strategy.get("layout_pattern"):
-            parts.append(
-                f"{str(strategy.get('layout_name') or '').strip()} {str(strategy.get('layout_pattern') or '').strip()}".strip()
-            )
-        if strategy.get("audience_niche"):
-            parts.append(f"audience {str(strategy.get('audience_niche')).replace('_', ' ')}")
-        if strategy.get("competitor_gap_mode"):
-            parts.append("competitor-gap variation")
+        if strategy.get("contrast_profile"):
+            parts.append(str(strategy.get("contrast_profile")).replace("_", " ") + " contrast")
         if parts:
             merged_hint = "; ".join(parts)
             if opts.get("style_hint"):
@@ -1912,7 +1910,16 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         if pikzels_studio_eligible_for_styled_thumbnail(us, ctx.entitlements, require_auto_thumbnails=False):
             # Skip paid /v2/thumbnail/text by default — hydration + local brief is enough.
             # Set PIKZELS_TEXT_BRIEF_ON_UPLOAD=1 to restore the extra creative call.
-            if _upload_pikzels_text_brief_enabled():
+            from services.thumbnail_apply_mode import is_build_from_hydration
+
+            skip_text_brief = is_build_from_hydration(
+                us.get("thumbnail_apply_mode") or us.get("thumbnailApplyMode")
+            )
+            try:
+                skip_text_brief = skip_text_brief or float(best_score) < 0.02
+            except (TypeError, ValueError):
+                pass
+            if _upload_pikzels_text_brief_enabled() and not skip_text_brief:
                 text_brief = await generate_pikzels_text_brief(
                     source_title=ctx.get_thumbnail_brief_vars(category=category).get(
                         "effective_title"
@@ -1958,6 +1965,21 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             us.get("thumbnail_apply_mode") or us.get("thumbnailApplyMode")
             or (_thumbnail_default_strategy(us) or {}).get("apply_mode")
         )
+        from services.thumbnail_apply_mode import is_build_from_hydration
+
+        unusable_frame = False
+        try:
+            unusable_frame = float(best_score) < 0.02
+        except (TypeError, ValueError):
+            unusable_frame = False
+        if is_build_from_hydration(apply_mode_ui) or unusable_frame:
+            brief["_uploadm8_build_from_hydration"] = True
+            brief["_uploadm8_build_from_hydration_reason"] = (
+                "explicit" if is_build_from_hydration(apply_mode_ui) else "unusable_frame"
+            )
+            brief.pop("pikzels_text_brief", None)
+            brief.pop("engine_text_brief", None)
+            brief.pop("_uploadm8_pikzels_support_image_url", None)
         studio_render_report["thumbnail_apply_mode"] = apply_mode_ui
         studio_render_report["thumbnail_ref_persona_mode"] = resolve_ref_persona_mode(us)
         job_bind = str(us.get("thumbnail_source_job_id") or us.get("thumbnailSourceJobId") or "").strip()

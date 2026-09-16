@@ -152,7 +152,7 @@ class UploadInit(BaseModel):
     # Studio → upload apply bridge
     thumbnail_apply_mode: Optional[str] = Field(
         default=None,
-        description="fresh_generate | strategy_only | pinned_cover",
+        description="fresh_generate | strategy_only | pinned_cover | build_from_hydration",
         alias="thumbnailApplyMode",
     )
     thumbnail_ref_persona_mode: Optional[str] = Field(

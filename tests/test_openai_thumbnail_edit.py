@@ -65,7 +65,7 @@ def test_build_prompt_carries_hero_facts_and_do_not_invent():
     assert "do not add people" in prompt.lower()
 
 
-def test_build_prompt_paints_earned_speed_only():
+def test_build_prompt_does_not_paint_earned_speed():
     prompt = build_openai_edit_prompt(
         {
             "selected_headline": "78 MPH",
@@ -77,8 +77,8 @@ def test_build_prompt_paints_earned_speed_only():
         {"subject": "highway run", "hero_facts": [{"text": "78 MPH"}], "do_not_invent": []},
         platform="youtube",
     )
-    assert 'Add only the short speed hook "78 MPH"' in prompt
-    assert "Do NOT add any on-image text" not in prompt
+    assert 'Add only the short speed hook "78 MPH"' not in prompt
+    assert "Do NOT add any on-image text" in prompt
 
 
 def test_call_cap_is_two():

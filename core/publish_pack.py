@@ -8,7 +8,7 @@ OCR/logo headlines.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 PUBLISH_PACK_ARTIFACT = "publish_pack_v1"
 
@@ -20,6 +20,48 @@ _ON_IMAGE_PAINT_CLASSES = frozenset({"speed"})
 _NON_PAINT_CLASSES = frozenset({"logo", "on_screen_text"})
 
 _SPEED_PAINT_RE = re.compile(r"\b\d{1,3}\s*mph\b", re.IGNORECASE)
+_LAYOUT_BAN_RE = re.compile(
+    r"(?i)\b(?:two subjects|two faces|expressive faces|rivalry|reaction shot|"
+    r"shock(?:ed)? face|lower[- ]third|bottom text|stacked text|bold text|"
+    r"large bold|dual tension|text bias)\b"
+)
+
+
+def brand_safe_scene_spine(source: Mapping[str, Any]) -> str:
+    """From-scratch scene line: energy and route vibe only. No brands, songs, or digits."""
+    raw = str(source.get("pikzels_spine") or source.get("_uploadm8_pikzels_spine") or "")
+    low = raw.lower()
+    if "peak effort" in low:
+        energy = "peak effort"
+    elif "cruise" in low:
+        energy = "cruise, not a speed peak"
+    else:
+        energy = "steady"
+    geo = str(source.get("geo_context") or "").strip()
+    geo = re.sub(r"(?i)\blocation\b", "", geo)
+    geo = re.sub(r"(?i)\b\d{1,3}\s*mph\b", "", geo)
+    geo = re.sub(r"(?i)\b(?:bank|shipping|tenente|filename|img_\d+)\b", "", geo)
+    geo = re.sub(r"\s{2,}", " ", geo).strip(" ,.;")
+    bits = ["driving energy" if ("dashcam" in low or "driving" in low) else "scene"]
+    if geo and len(geo) > 2:
+        bits.append(geo[:80])
+    bits.append(energy)
+    if source.get("music_context") or "music" in low:
+        bits.append("music in the background")
+    return "; ".join(bits)[:220]
+
+
+def scrub_studio_layout_text(text: Any, *, dashcam: bool = False) -> str:
+    """Drop layout phrases that invent faces or demand banners. Crop/color may remain."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if dashcam or _LAYOUT_BAN_RE.search(raw):
+        if _LAYOUT_BAN_RE.search(raw) or re.search(r"(?i)\b(?:face|faces|subject|text)\b", raw):
+            return ""
+        raw = _LAYOUT_BAN_RE.sub("", raw)
+    raw = re.sub(r"\s{2,}", " ", raw).strip(" .;,")
+    return raw[:180]
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9']{2,}")
 _STOP = frozenset(
@@ -388,13 +430,8 @@ def build_publish_pack(ctx: Any) -> Dict[str, Any]:
     if hook and subject and hook_class == "logo":
         hook, hook_class = "", ""
 
-    # On-image: only earned MPH. Place/music remain caption/hashtag fuel with paint_policy=none.
-    if speed_hook and _SPEED_PAINT_RE.search(speed_hook):
-        paint_policy = "hook_only"
-        hook = speed_hook
-        hook_class = "speed"
-    else:
-        paint_policy = "none"
+    # First ship: never paint. Speed/place/music stay caption fuel only.
+    paint_policy = "none"
 
     caption_spine = str(hp.get("anchor_phrase") or "").strip()[:220]
     if not caption_spine and subject:
@@ -408,9 +445,39 @@ def build_publish_pack(ctx: Any) -> Dict[str, Any]:
         "moment": "hero_or_vi_keyframe" if (driving or dashcam) else "sharpest_frame",
         "composition": "preserve_pov" if dashcam else "styled_unique",
         # Place/music/logo never become lower-third banners — AI composition only.
-        "text": "hook_lower_third" if paint_policy == "hook_only" else "none",
+        "text": "none",
         "category": category or "general",
     }
+
+    faces_allowed = True
+    dni = identity.get("do_not_invent") if isinstance(identity.get("do_not_invent"), list) else []
+    for line in dni:
+        if "no visible faces" in str(line).lower():
+            faces_allowed = False
+            break
+    kind = "dashcam pov" if dashcam else ("driving" if driving else (category or "general"))
+    mph = 0.0
+    try:
+        from core.speed_consensus import publishable_peak_mph
+
+        mph = float(publishable_peak_mph(ctx) or 0)
+    except Exception:
+        mph = 0.0
+    if mph >= 50:
+        energy = "peak effort"
+    elif mph >= 10:
+        energy = "cruise, not a speed peak"
+    else:
+        energy = "steady"
+    audio = ""
+    if music_hook and hook_class == "music":
+        audio = "music present"
+    elif music_hook:
+        audio = "music in the background"
+    spine_bits = [kind, subject[:80] if subject else "", energy]
+    if audio:
+        spine_bits.append(audio)
+    pikzels_spine = "; ".join(b for b in spine_bits if b)[:280]
 
     pack: Dict[str, Any] = {
         "v": 1,
@@ -418,6 +485,8 @@ def build_publish_pack(ctx: Any) -> Dict[str, Any]:
         "hook_line": hook,
         "hook_class": hook_class,
         "caption_spine": caption_spine,
+        "pikzels_spine": pikzels_spine,
+        "faces_allowed": faces_allowed,
         "hashtag_seeds": seeds,
         "visual_brief": visual_brief,
         "paint_policy": paint_policy,
@@ -454,5 +523,7 @@ __all__ = [
     "headline_agrees_with_pack",
     "is_paintable_pack_headline",
     "prefer_pack_title_if_generic",
+    "brand_safe_scene_spine",
+    "scrub_studio_layout_text",
     "subject_token_overlap",
 ]

@@ -251,21 +251,23 @@ def test_pikzels_prompt_blocks_generic_headline_text():
         assert forbidden in prompt, f"prompt missing explicit ban on {forbidden!r}"
 
 
-def test_pikzels_prompt_concrete_headline_is_rendered_with_lockdown():
-    """Earned MPH hooks ARE painted; place names are not. Lock down other text."""
+def test_pikzels_prompt_speed_is_scene_not_paint():
+    """MPH is energy, never a reading-quote banner."""
     prompt = _build_pikzels_v2_prompt(
         {
             "selected_headline": "64 MPH",
-            "_uploadm8_paint_policy": "hook_only",
+            "_uploadm8_paint_policy": "none",
             "_uploadm8_hook_line": "64 MPH",
             "hook_line": "64 MPH",
             "_uploadm8_hook_class": "speed",
+            "pikzels_spine": "dashcam pov; Cruise with Honda near Multnomah County; cruise, not a speed peak",
         },
         category="automotive",
         platform="youtube",
     )
-    assert '"64 MPH"' in prompt
-    assert "NO OTHER text" in prompt or "Render NO OTHER text" in prompt
+    assert 'reading "64 MPH"' not in prompt
+    assert "CREATIVE COMPOSITION MODE" in prompt
+    assert "Cruise with Honda" in prompt
 
 
 def test_pikzels_prompt_place_banner_is_composition_not_paint():
@@ -299,8 +301,9 @@ def test_pikzels_prompt_includes_geo_music_signal_context():
 
     assert "Moab" in prompt
     assert "Arches National Park" in prompt
-    assert "Drake" in prompt
-    # Place/music are creative cues, not painted headlines.
+    assert "Drake" not in prompt
+    assert "Hotline" not in prompt
+    assert "music in the background" in prompt
     assert 'reading "MOAB FLOWERS"' not in prompt
 
 
@@ -319,8 +322,9 @@ def test_pikzels_prompt_includes_osd_and_trill_context():
         platform="youtube",
     )
 
-    assert "64" in prompt and ("mph" in prompt.lower() or "OSD:" in prompt)
-    assert "sendIt" in prompt
+    assert "persona only as likeness" in prompt
+    assert "64" not in prompt or "reading" not in prompt
+    assert "sendIt" not in prompt
 
 
 def test_pikzels_prompt_includes_whisper_speech_context():
@@ -336,7 +340,7 @@ def test_pikzels_prompt_includes_whisper_speech_context():
     )
 
     assert "Moab" in prompt
-    assert "These flowers finally bloomed" not in prompt
+    assert "bloomed" not in prompt.lower()
 
 
 def test_pikzels_prompt_includes_fusion_summary():
@@ -348,8 +352,9 @@ def test_pikzels_prompt_includes_fusion_summary():
         category="travel",
         platform="youtube",
     )
-    assert "Fusion" in prompt
-    assert "GPS corridor" in prompt
+    assert "Fusion" not in prompt
+    assert "GPS corridor" not in prompt
+    assert "CREATIVE COMPOSITION MODE" in prompt
 
 
 def test_pikzels_prompt_uses_compact_hydration_labels():
@@ -379,9 +384,8 @@ def test_pikzels_prompt_uses_compact_hydration_labels():
     )
     assert len(prompt) <= 1000
     assert "Moab" in prompt or "Scene vibe" in prompt
-    assert "OSD:" in prompt and "spd" in prompt
-    assert "Music:" in prompt or "Audio energy" in prompt
-    assert "Trill:" in prompt
+    assert "OSD:" in prompt and ("peak effort" in prompt.lower() or "cruise energy" in prompt.lower())
+    assert "music in the background" in prompt
     assert "Canonical geo" not in prompt
 
 
@@ -399,11 +403,11 @@ def test_pikzels_prompt_injects_hydration_payload_canonical():
         "anchor_phrase": "Sunset highway run.",
         "signal_hashtags": ["dashcam", "nevada"],
     }
-    # Speed paint: Geo/OSD/OCR/driver allowed alongside MPH hook.
+    # Speed/place/driver are scene, never painted type (no Walker stamp, no mph digits).
     prompt = _build_pikzels_v2_prompt(
         {
             "selected_headline": "64 MPH",
-            "_uploadm8_paint_policy": "hook_only",
+            "_uploadm8_paint_policy": "none",
             "_uploadm8_hook_line": "64 MPH",
             "hook_line": "64 MPH",
             "_uploadm8_hook_class": "speed",
@@ -413,13 +417,13 @@ def test_pikzels_prompt_injects_hydration_payload_canonical():
         hydration_payload=hp,
     )
     assert "Hwy 7" in prompt
-    assert "spd 73" in prompt.lower() or "73" in prompt
-    assert "Walker" in prompt
+    assert "cruise energy" in prompt.lower() or "peak effort" in prompt.lower()
+    assert "Walker" not in prompt
     # Speech phrases are omitted from Pikzels prompts (lyric / filter noise).
     assert "look at this" not in prompt.lower()
-    assert "spirited" in prompt
+    assert "spirited" not in prompt
     assert "canonical hydration_payload" not in prompt.lower()
-    assert "Narrative fused line" in prompt
+    assert "Narrative fused line" not in prompt
 
 
 def test_pikzels_prompt_category_fallback_headline_is_strict_no_text():
@@ -443,8 +447,9 @@ def test_pikzels_prompt_includes_hydration_story_when_fusion_thin():
         category="travel",
         platform="youtube",
     )
-    assert "Story" in prompt
+    assert "Scene direction" in prompt
     assert "Utah SR-128" in prompt
+    assert "Story:" not in prompt
 
 
 def test_minimal_regenerate_brief_strips_clickbait_title():
@@ -556,13 +561,15 @@ def test_default_thumbnail_strategy_feeds_upload_brief_and_style_hint():
     assert "default_strategy" in brief
     assert "Reaction Meme" in brief["notes"]
     prompt = _build_pikzels_v2_prompt(brief, category="comedy", platform="youtube")
-    assert "Layout: " in prompt
-    assert "Reaction Meme" in prompt
-    assert "Reaction Meme" in prompt
+    assert "Layout: " not in prompt
+    assert "Reaction Meme" not in prompt
+    assert "two expressive faces" not in prompt.lower()
+    assert "bold stacked text" not in prompt.lower()
 
     _persona, opts = _studio_persona_for_request(us)
-    assert "Reaction Meme" in opts["style_hint"]
-    assert "competitor-gap" in opts["style_hint"]
+    assert "very high contrast" in opts["style_hint"]
+    assert "Reaction Meme" not in opts["style_hint"]
+    assert "competitor-gap" not in opts["style_hint"]
 
 
 def test_studio_persona_auto_enabled_when_uuid_present_without_toggle():
@@ -842,10 +849,9 @@ def test_dashcam_pov_prompt_preserves_frame_fidelity():
     }
     prompt = _build_pikzels_v2_prompt(brief, category="general", platform="youtube")
     low = prompt.lower()
-    assert "dashcam pov fidelity" in low
-    # Softened: hard "do not add faces" conflicted with persona UUID payloads.
-    assert "preserve the real road" in low or "forward-facing" in low
-    assert "compass circles" in low or "neon compass" in low
+    assert "preserve the road" in low
+    assert "no typography" in low
+    assert "persona only as likeness" in low
     assert "directional element" not in low
     assert "facial expression" not in low
     assert "red and black" not in low

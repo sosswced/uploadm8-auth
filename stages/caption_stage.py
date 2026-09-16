@@ -528,6 +528,8 @@ def _build_publish_pack_context_block(ctx: JobContext) -> str:
         lines.append(f"  HOOK LINE: {str(pack.get('hook_line'))[:80]}")
     if pack.get("caption_spine"):
         lines.append(f"  CAPTION SPINE: {str(pack.get('caption_spine'))[:200]}")
+    if pack.get("pikzels_spine"):
+        lines.append(f"  COVER SPINE (same facts as the thumbnail): {str(pack.get('pikzels_spine'))[:220]}")
     seeds = pack.get("hashtag_seeds") or []
     if seeds:
         lines.append(f"  HASHTAG SEEDS: {', '.join(str(s) for s in seeds[:12])}")

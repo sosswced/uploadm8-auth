@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 # Public UX names + bridge aliases (cover_direct / support_image from Studio feedback).
-APPLY_MODES = ("fresh_generate", "strategy_only", "pinned_cover")
+APPLY_MODES = ("fresh_generate", "strategy_only", "pinned_cover", "build_from_hydration")
 REF_PERSONA_MODES = ("recreate_style", "face_brand", "both")
 
 _DEFAULT_APPLY = "fresh_generate"
@@ -35,9 +35,17 @@ def normalize_apply_mode(raw: Any) -> str:
         "pin": "pinned_cover",
         "cover": "pinned_cover",
         "cover_direct": "pinned_cover",
+        "from_scratch": "build_from_hydration",
+        "from_hydration": "build_from_hydration",
+        "hydration": "build_from_hydration",
     }
     s = aliases.get(s, s)
     return s if s in APPLY_MODES else _DEFAULT_APPLY
+
+
+def is_build_from_hydration(raw: Any) -> bool:
+    """Explicit from-scratch mode. Never inferred from dashcam, driving, or persona."""
+    return normalize_apply_mode(raw) == "build_from_hydration"
 
 
 def to_bridge_apply_mode(raw: Any) -> str:
@@ -45,7 +53,7 @@ def to_bridge_apply_mode(raw: Any) -> str:
     mode = normalize_apply_mode(raw)
     if mode == "pinned_cover":
         return "cover_direct"
-    if mode == "strategy_only":
+    if mode in ("strategy_only", "build_from_hydration"):
         return "strategy_only"
     return "support_image"
 
@@ -104,10 +112,8 @@ def allow_youtube_support_image(us: Optional[Mapping[str, Any]], *, apply_mode: 
         or (us or {}).get("thumbnail_apply_mode")
         or (us or {}).get("thumbnailApplyMode")
     )
-    if mode == "strategy_only":
-        return False
-    if mode == "pinned_cover":
-        return False  # pin replaces support-image recreate path for YT
+    if mode in ("strategy_only", "build_from_hydration", "pinned_cover"):
+        return False  # pin / strategy / from-scratch replace support-image recreate
     rpm = resolve_ref_persona_mode(us, apply_mode=mode)
     return rpm in ("recreate_style", "both")
 

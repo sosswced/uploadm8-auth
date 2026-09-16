@@ -110,21 +110,14 @@ def build_openai_edit_prompt(
         if re.search(r"\b\d{1,3}\s*mph\b", headline or "", re.IGNORECASE) and paint_policy == "hook_only":
             paint_headline = headline
 
-    if paint_headline:
-        lines.append(
-            f'Add only the short speed hook "{paint_headline}" in bold, high-contrast '
-            "sans-serif lettering with a subtle dark outline, positioned so it never "
-            "covers the main subject. No other text."
-        )
-    else:
-        lines.append(
-            "Do NOT add any on-image text, captions, LOCATION banners, business names, "
-            "filenames, or clickbait labels — pure photographic composition."
-        )
+    lines.append(
+        "Do NOT add any on-image text, captions, LOCATION banners, business names, "
+        "filenames, giant digits, or clickbait labels — pure photographic composition."
+    )
     if color_mood:
         lines.append(f"Color mood: {color_mood.replace('_', ' ')}.")
     dni = [str(d) for d in (ident.get("do_not_invent") or [])[:4]]
-    dni.append("do not add people, faces, watermarks, logos, or extra text beyond an earned speed hook")
+    dni.append("do not add people, faces, watermarks, logos, or any on-image text")
     dni.append("do not invent objects or scenery that are not in the frame")
     dni.append("do not paint city names, LOCATION labels, or business OCR")
     lines.append("STRICT RULES: " + "; ".join(dni) + ".")

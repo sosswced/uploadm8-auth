@@ -1930,7 +1930,14 @@ def build_studio_pikzels_prompt(
     ev = hp.get("evidence") if isinstance(hp, dict) and isinstance(hp.get("evidence"), dict) else {}
     has_evidence = any(isinstance(v, dict) and v for v in ev.values())
     if not has_evidence:
-        return clamp_pikzels_image_prompt(layout_notes)
+        from core.publish_pack import scrub_studio_layout_text
+
+        scrubbed = scrub_studio_layout_text(layout_notes)
+        if not scrubbed:
+            return clamp_pikzels_image_prompt(
+                "CREATIVE COMPOSITION MODE: edit this real frame, stay accurate, no typography."
+            )
+        return clamp_pikzels_image_prompt(scrubbed)
 
     brief_dict: Dict[str, Any] = {
         "selected_headline": str(variant.get("headline") or "").strip(),
@@ -1948,9 +1955,7 @@ def build_studio_pikzels_prompt(
         platform="youtube",
         hydration_payload=hp,
     )
-    if layout_notes and "Layout:" not in prompt:
-        prompt = f"{prompt} Layout: {layout_notes[:200]}".strip()
-    return clamp_pikzels_image_prompt(cap_pikzels_studio_render_prompt(prompt))
+    return clamp_pikzels_image_prompt(prompt)
 
 
 async def enrich_variants_with_uploadm8_engine(

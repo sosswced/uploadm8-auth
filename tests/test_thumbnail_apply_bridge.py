@@ -25,6 +25,10 @@ def test_normalize_apply_mode_aliases():
     assert normalize_apply_mode("cover_direct") == "pinned_cover"
     assert normalize_apply_mode("support_image") == "fresh_generate"
     assert normalize_apply_mode("pinned") == "pinned_cover"
+    assert normalize_apply_mode("build_from_hydration") == "build_from_hydration"
+    assert normalize_apply_mode("from_scratch") == "build_from_hydration"
+    assert normalize_apply_mode("dashcam") == "fresh_generate"
+    assert to_bridge_apply_mode("build_from_hydration") == "strategy_only"
     assert to_bridge_apply_mode("pinned_cover") == "cover_direct"
     assert to_bridge_apply_mode("strategy_only") == "strategy_only"
 

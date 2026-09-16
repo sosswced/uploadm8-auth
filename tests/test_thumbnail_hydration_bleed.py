@@ -134,8 +134,9 @@ def test_pikzels_prompt_keeps_real_headline_and_story():
     )
     assert "CREATIVE COMPOSITION MODE" in prompt or "STRICT NO-TEXT" in prompt
     assert 'reading "CAMP NOU TUNNEL"' not in prompt
-    assert "Story" in prompt
+    assert "Scene direction" in prompt
     assert "Camp Nou" in prompt
+    assert "Story:" not in prompt
     assert is_unusable_thumbnail_headline("IMG_5135.MOV")
 
 
